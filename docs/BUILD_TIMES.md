@@ -1,6 +1,6 @@
 # Build times
 
-This document records measured build, test and CI wall times on the development Mac and on GitHub's hosted runners, so contributors know what to expect and so regressions are visible. The local rows were measured on 2026-10-05 during the M0 build; CI rows marked `TBD (M0)` are filled from the first GitHub Actions run; later milestones append rows rather than overwrite. Numbers here are measurements, not gates, except where the design sets a budget (noted in the Notes column). The profile and feature setup that these numbers depend on is explained in [DEPENDENCIES.md](DEPENDENCIES.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
+This document records measured build, test and CI wall times on the development Mac and on GitHub's hosted runners, so contributors know what to expect and so regressions are visible. The local rows were measured on 2026-10-05 during the M0 build; CI rows were filled from the first GitHub Actions runs on 2026-10-06 (cold caches); warm figures are added after the first PR that follows a cached main run; later milestones append rows rather than overwrite. Numbers here are measurements, not gates, except where the design sets a budget (noted in the Notes column). The profile and feature setup that these numbers depend on is explained in [DEPENDENCIES.md](DEPENDENCIES.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Machine
 
@@ -34,10 +34,12 @@ This document records measured build, test and CI wall times on the development 
 
 | Job | Runner | Date | Cold (s) | Warm (s) | Notes |
 |---|---|---|---|---|---|
-| `check` | macos-26 (arm64, 3 cores, 7 GB) | TBD (M0) | TBD (M0) | TBD (M0) | Soft target under 25 min warm. Read from the Actions UI. |
-| `headless` | ubuntu-24.04 | TBD (M0) | TBD (M0) | TBD (M0) | |
-| `game-linux` | ubuntu-24.04 | TBD (M0) | TBD (M0) | TBD (M0) | Compile-only clippy. |
-| `release-check` | macos-26 | TBD (M0) | TBD (M0) | TBD (M0) | Release profile plus `bundle.sh`. |
+| `check` | macos-26 (arm64, 3 cores, 7 GB) | 2026-10-06 | 2483 (41 min 23 s) | TBD (first PR after a cached main run) | Run 37395557940. A parallel cold run on the same day (Dependabot PR) took 1569 s (26 min 9 s): macOS runner time varies a lot under capacity constraints. Soft target under 25 min warm. |
+| `headless` | ubuntu-24.04 | 2026-10-06 | 997 (16 min 37 s) | TBD | Includes the cold Bevy build for the 200-tick smoke; the engine-free tests alone finish in about a minute. Parallel PR run: 947 s. |
+| `game-linux` | ubuntu-24.04 | 2026-10-06 | 240 (4 min 0 s) | TBD | Compile-only clippy. Parallel PR run: 256 s. |
+| `release-check` | macos-26 | 2026-10-06 | 812 (13 min 32 s) | TBD | Run 37395557967. Release profile plus `bundle.sh`, plutil, codesign verify. |
+| `deny` | ubuntu-24.04 | 2026-10-06 | 54 | 43 | cargo-deny-action, advisory database fetch dominates. |
+| `hash-parity` | ubuntu-24.04 | 2026-10-06 | 5 | 6 | Artifact download plus `diff`. Needs `check` and `headless`. |
 
 ## Audio backend at M0
 

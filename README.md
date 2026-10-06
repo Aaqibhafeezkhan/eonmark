@@ -4,9 +4,7 @@ Eonmark is an open-source, Mac-native real-time strategy game written in Rust. T
 
 Eonmark is an original game inspired by Rise of Nations (Big Huge Games, 2003). It is not affiliated with or endorsed by Microsoft.
 
-<!-- CI badge. Uncomment once .github/workflows/ci.yml has run on main.
-[![CI](https://github.com/tonianev/eonmark/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tonianev/eonmark/actions/workflows/ci.yml)
--->
+[![CI](https://github.com/tonianev/eonmark/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tonianev/eonmark/actions/workflows/ci.yml) [![release-check](https://github.com/tonianev/eonmark/actions/workflows/release-check.yml/badge.svg?branch=main)](https://github.com/tonianev/eonmark/actions/workflows/release-check.yml)
 
 ## What you do
 
