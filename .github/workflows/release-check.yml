@@ -1,0 +1,78 @@
+# Proves the release path works without publishing anything: release build,
+# no dynamic linking, Eonmark.app assembled, Info.plist valid, ad-hoc signature
+# verifies. Runs on main, weekly, and by hand. Not on pull requests.
+name: release-check
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release-check:
+    name: release build + bundle (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: release
+          cache-on-failure: true
+          rustflags: ""
+          build-warnings: warn
+
+      - name: start timer
+        run: echo "START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: cargo build --release
+        run: cargo build --release --locked -p game
+
+      - name: no dynamic linking in release
+        run: |
+          if otool -L target/release/eonmark | grep -q bevy_dylib; then
+            echo "::error::dynamic linking leaked into release"
+            exit 1
+          fi
+
+      - name: bundle Eonmark.app
+        run: scripts/bundle.sh
+
+      - name: Info.plist is valid
+        run: plutil -lint dist/Eonmark.app/Contents/Info.plist
+
+      - name: signature verifies
+        run: codesign --verify --deep --strict --verbose=2 dist/Eonmark.app
+
+      - name: binary is arm64 only
+        run: |
+          lipo -archs dist/Eonmark.app/Contents/MacOS/eonmark
+          test "$(lipo -archs dist/Eonmark.app/Contents/MacOS/eonmark)" = "arm64"
+
+      - name: wall time
+        run: |
+          end=$(date +%s)
+          echo "release-check wall time: $((end - START_SECONDS)) s" | tee -a "$GITHUB_STEP_SUMMARY"
+          ls -la dist

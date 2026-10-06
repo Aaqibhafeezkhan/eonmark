@@ -1,0 +1,19 @@
+[package]
+name = "rules"
+description = "Eonmark rules data: RON schema, loader and validator (engine-free)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+ron.workspace = true
+postcard.workspace = true
+xxhash-rust.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+name: Balance change
+description: A number in data/rules should change
+labels: ["kind:balance", "area:rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Balance changes are data changes. Point at the file and the number, and show what the bots did before and after. `sim-cli play-bots` is available from M5b; until then describe the playtest.
+  - type: input
+    id: file
+    attributes:
+      label: Which RON file
+      description: Path under `data/`, for example `data/rules/rules.ron` or `data/rules/units.ron`.
+      placeholder: "data/rules/units.ron"
+    validations:
+      required: true
+  - type: input
+    id: field
+    attributes:
+      label: Which number
+      description: The field and its current value, for example `yeoman.gather_rate_per_s = 0.5`.
+    validations:
+      required: true
+  - type: input
+    id: proposed
+    attributes:
+      label: Proposed value
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What is wrong in play? Which unit, building or age is too strong or too weak, and at what time in the match?
+    validations:
+      required: true
+  - type: textarea
+    id: playbots
+    attributes:
+      label: play-bots result
+      description: Paste the `sim-cli play-bots` table before and after the change (M5b). Before M5b, describe the playtest matches instead.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: "`cargo run -p sim-cli -- data-check data` passes with the proposed value."
+        - label: The change does not require new code (if it does, file a feature request instead).

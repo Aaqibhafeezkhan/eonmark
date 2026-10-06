@@ -1,0 +1,4 @@
+# Keep this file minimal on purpose: no linker overrides, no nightly flags.
+# See docs/DEPENDENCIES.md and CONTRIBUTING.md before adding anything here.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"

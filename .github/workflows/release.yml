@@ -1,0 +1,139 @@
+# Publish a GitHub Release from a `v*` tag: arm64 release build, Eonmark.app,
+# zip (+ dSYM zip when produced) + SHA256SUMS, generated notes. Signing and notarization run
+# only when the Apple secrets exist (docs/design/macos-packaging.md); without
+# them the app is ad-hoc signed by scripts/bundle.sh.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: build, bundle, publish (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: release
+          cache-on-failure: true
+          rustflags: ""
+          build-warnings: warn
+
+      - name: version from tag
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      - name: detect signing secrets
+        # Secrets cannot be used in a step `if`, so expose a boolean via env.
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_PASSWORD" ] \
+             && [ -n "$MACOS_CERT_P12" ] && [ -n "$MACOS_CERT_PASSWORD" ]; then
+            echo "HAS_SIGNING=true" >> "$GITHUB_ENV"
+            echo "Developer ID signing and notarization enabled"
+          else
+            echo "HAS_SIGNING=false" >> "$GITHUB_ENV"
+            echo "No Apple secrets; the app will be ad-hoc signed"
+          fi
+
+      - name: build, bundle, zip, checksum (ad-hoc signed)
+        run: scripts/bundle.sh "$VERSION"
+
+      - name: import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          identity="$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')"
+          test -n "$identity"
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: sign with Developer ID, notarize, staple, re-zip
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          app=dist/Eonmark.app
+          zip="dist/Eonmark-${TAG}-macos-arm64.zip"
+          codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          rm -f "$zip"
+          ditto -c -k --keepParent "$app" "$zip"
+          xcrun notarytool submit "$zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$app"
+          rm -f "$zip"
+          ditto -c -k --keepParent "$app" "$zip"
+          (cd dist && rm -f SHA256SUMS && shasum -a 256 ./*.zip > SHA256SUMS)
+
+      - name: remove temporary keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: security delete-keychain "$KEYCHAIN" || true
+
+      - name: release notes header
+        # M1: add sim_version from `sim-cli --version` or a `version` subcommand.
+        run: |
+          {
+            echo "## Build"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| tag | \`$TAG\` |"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| rules check | \`$(cargo run -p sim-cli --locked -- data-check data)\` |"
+            echo "| signing | $([ "$HAS_SIGNING" = true ] && echo 'Developer ID, notarized' || echo 'ad-hoc (see README: Gatekeeper)') |"
+            echo
+            echo "Verify the download with \`shasum -a 256 -c SHA256SUMS\`."
+            echo
+          } > dist/RELEASE_NOTES_HEADER.md
+          cat dist/RELEASE_NOTES_HEADER.md
+
+      - name: publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          body_path: dist/RELEASE_NOTES_HEADER.md
+          fail_on_unmatched_files: true
+          # dist/Eonmark-*.zip matches the app zip and, when bundle.sh produced one,
+          # Eonmark-v<version>.dSYM.zip (none until [profile.release] emits debug info).
+          files: |
+            dist/Eonmark-*.zip
+            dist/SHA256SUMS

@@ -1,0 +1,77 @@
+# cargo-deny configuration (v2 format). Run locally with `cargo deny check`
+# (or `just ci`, which skips it with a hint when cargo-deny is missing).
+# CI runs it in the `deny` job of .github/workflows/ci.yml with --all-features.
+# Dependency policy: docs/DEPENDENCIES.md.
+
+[graph]
+all-features = true
+# The two platforms CI builds. Target-specific dependencies for other
+# platforms (Windows, Android, wasm) are not evaluated.
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+]
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Every entry needs a reason. Re-check this list when bumping Bevy (M9).
+ignore = [
+  # M2 (muda menu): muda pulls gtk3 -> proc-macro-error (RUSTSEC-2024-0370,
+  # unmaintained, Linux target only, never compiled on macOS). Add an ignore
+  # entry for it here when muda lands.
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained (not a vulnerability). Reached only through sctk-adwaita <- winit (Wayland client-side decorations) on the Linux target; a fix must come from winit/Bevy upstream." },
+]
+
+[licenses]
+# Permissive licenses only. Copyleft (GPL, LGPL, AGPL, CC-BY-SA) is not
+# allowed anywhere in the dependency graph of a MIT OR Apache-2.0 project.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+  "OFL-1.1",
+  "BSL-1.0",
+  "0BSD",
+  "OpenSSL",
+  # epaint_default_fonts (egui, `dev` feature only) bundles the Ubuntu font.
+  # Font licenses here cover dev-tool fonts, not assets/ (see scripts/check_assets.sh).
+  "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+# Some allowances above (OpenSSL, Unicode-DFS-2016) are not in today's graph
+# but are common in the Rust ecosystem; do not warn when they are unused.
+unused-allowed-license = "allow"
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

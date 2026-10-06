@@ -1,0 +1,37 @@
+// Eonmark match rules. Integers only: time in deciseconds (fields ending in
+// _ds), distance in tiles (fields ending in _tiles). Converted to ticks once
+// at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
+// (deny_unknown_fields). Authoring guide: data/rules/README.md
+(
+  rules_version: 1,
+  tick_rate_hz: 20,
+  cmd_delay_ticks: 2,
+  default_map: "plains_1v1",
+
+  // Economy (M3a). Yield Cap per resource per 30 s, indexed by Trade level.
+  yield_cap_table: [70, 100, 150, 200],
+  pop_cap_base: 25,
+  pop_cap_per_arms_level: 25,
+
+  // Towns and borders (M3a).
+  town_radius_tiles: 20,
+  town_radius_grown_tiles: 24,
+  town_growth_distinct_buildings: 5,
+  town_limit_base: 1,
+
+  // Attrition, supply and annexation (M5a). 32 ds = 3.2 s; 600 ds = 60 s.
+  supply_radius_tiles: 14,
+  attrition_interval_ds: 32,
+  annexation_ds: 600,
+
+  // Vision radii placeholder (M3a targeting, M7 fog of war).
+  vision: (
+    unit_tiles: 8,
+    building_tiles: 10,
+    town_tiles: 14,
+  ),
+
+  // Pathfinding (M1). Expansions shared by all requests per tick; cache entries.
+  path_budget_expansions: 4000,
+  path_cache_entries: 1024,
+)

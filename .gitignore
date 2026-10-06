@@ -1,0 +1,6 @@
+/target
+/dist
+*.dSYM
+.DS_Store
+*.profraw
+/replays

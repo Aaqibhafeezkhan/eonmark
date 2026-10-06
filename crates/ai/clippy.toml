@@ -1,0 +1,15 @@
+# Determinism guard: these types and functions must never appear in this crate.
+# Rationale and the full rule set live in docs/DETERMINISM.md.
+disallowed-types = [
+  { path = "f32", reason = "sim numerics are fixed-point (sim::Fx); floats are not deterministic across platforms" },
+  { path = "f64", reason = "sim numerics are fixed-point (sim::Fx); floats are not deterministic across platforms" },
+  { path = "std::collections::HashMap", reason = "iteration order is randomised; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order is randomised; use BTreeSet" },
+  { path = "std::time::Instant", reason = "wall clock is not simulation state" },
+  { path = "std::time::SystemTime", reason = "wall clock is not simulation state" },
+]
+disallowed-methods = [
+  { path = "rand::random", reason = "all randomness comes from the Pcg32 stored in Sim" },
+  { path = "rand::thread_rng", reason = "all randomness comes from the Pcg32 stored in Sim" },
+  { path = "rand::rng", reason = "all randomness comes from the Pcg32 stored in Sim" },
+]

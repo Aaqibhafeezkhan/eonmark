@@ -1,0 +1,75 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["kind:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A replay that shows the bug is the fastest route to a fix.
+        Replays are written to the directory printed on startup (M1 and later); attach the `.eonreplay` file by dragging it into the description. GitHub does not accept that extension directly, so zip it first.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: Apple menu > About This Mac, for example `26.0.1`. Write `Linux` or `Windows` with the distribution/version if you were compiling the game crate elsewhere.
+      placeholder: "26.0.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: chip
+    attributes:
+      label: Chip
+      options:
+        - Apple M1 family
+        - Apple M2 family
+        - Apple M3 family
+        - Apple M4 family
+        - Apple M5 or newer
+        - Not a Mac
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or release tag
+      description: Output of `git rev-parse --short HEAD`, or the release tag such as `v0.1.0`.
+      placeholder: "abc1234"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands and clicks, from `cargo run -p game --features dev` onwards.
+      placeholder: |
+        1. cargo run -p game --features dev
+        2. Select three Yeomen and right-click the Ore Pit
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include the panic message and backtrace if there is one (RUST_BACKTRACE=1 is set in the app bundle).
+    validations:
+      required: true
+  - type: textarea
+    id: replay
+    attributes:
+      label: Replay file
+      description: Zip the `.eonreplay` and drag it here. If `sim-cli verify` reports `RULES CHANGED since recording`, say so.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I ran `just ci` (or at least `cargo test -p sim`) on this commit, or I am reporting a release build.

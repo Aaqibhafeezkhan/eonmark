@@ -1,0 +1,40 @@
+// Eonmark resources. Schema: crates/rules/src/resources.rs (deny_unknown_fields).
+// gathered_from lists building ids; they are cross-checked against
+// buildings.ron from M3a. Yield-capped resources use yield_cap_table in
+// rules.ron; a resource with yield_capped: false must set stockpile_cap.
+(
+  resources: [
+    (
+      id: "grain",
+      name: "Grain",
+      gathered_from: ["town", "croft"],
+      role: "Primary unit cost and age advance cost.",
+      yield_capped: true,
+      stockpile_cap: None,
+    ),
+    (
+      id: "lumber",
+      name: "Lumber",
+      gathered_from: ["town", "lumber_yard"],
+      role: "Building cost; Bowman, Mangonel and Supply Wain cost.",
+      yield_capped: true,
+      stockpile_cap: None,
+    ),
+    (
+      id: "ore",
+      name: "Ore",
+      gathered_from: ["ore_pit"],
+      role: "Shieldbearer, Outrider, Watchtower and Arms-line techs; the scarce military resource.",
+      yield_capped: true,
+      stockpile_cap: None,
+    ),
+    (
+      id: "lore",
+      name: "Lore",
+      gathered_from: ["scriptorium"],
+      role: "Research and age advance currency; exempt from the Yield Cap; not tradeable.",
+      yield_capped: false,
+      stockpile_cap: Some(999),
+    ),
+  ],
+)

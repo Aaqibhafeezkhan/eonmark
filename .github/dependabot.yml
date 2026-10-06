@@ -1,0 +1,51 @@
+# Dependabot: weekly grouped updates for Cargo and GitHub Actions.
+# Bevy and its dev-tool companions are pinned with `=` in Cargo.toml and are
+# bumped by hand in M9 (docs/adr/0002-bevy-0-20-migration.md), so Dependabot
+# only proposes patch updates for them.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - area:infra
+    groups:
+      rust-deps:
+        patterns:
+          - "*"
+    ignore:
+      - dependency-name: bevy
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: bevy_egui
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: bevy-inspector-egui
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    labels:
+      - area:infra
+    groups:
+      github-actions:
+        patterns:
+          - "*"

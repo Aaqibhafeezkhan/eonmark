@@ -1,0 +1,40 @@
+[package]
+name = "game"
+description = "Eonmark: the Bevy presentation layer and the `eonmark` binary (the only engine-dependent crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "eonmark"
+path = "src/main.rs"
+
+[features]
+default = []
+# Fast iteration + inspector panels. Never ship a build with this feature.
+dev = [
+  "bevy/dynamic_linking",
+  "bevy/bevy_dev_tools",
+  "dep:bevy_egui",
+  "dep:bevy-inspector-egui",
+]
+# Owner-side screenshot capture via Bevy's CI testing plugin; not used in CI.
+ci_testing = ["bevy/bevy_ci_testing"]
+
+[dependencies]
+sim.workspace = true
+rules.workspace = true
+ai.workspace = true
+bevy = { workspace = true, features = ["gestures"] }
+bevy_egui = { workspace = true, optional = true }
+bevy-inspector-egui = { workspace = true, optional = true }
+
+# `muda` (native macOS menu, Cmd-Q routing) arrives in M2; `directories`
+# (replay directory) arrives with the replay writer thread, also in M2. Neither is used
+# at M0, so neither is listed here (cargo-machete must stay clean).
+
+[lints]
+workspace = true

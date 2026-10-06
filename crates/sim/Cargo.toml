@@ -1,0 +1,31 @@
+[package]
+name = "sim"
+description = "Eonmark deterministic fixed-point simulation (engine-free)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rules.workspace = true
+fixed.workspace = true
+serde.workspace = true
+postcard.workspace = true
+xxhash-rust.workspace = true
+rand_pcg.workspace = true
+rand_core.workspace = true
+ron.workspace = true
+
+[dev-dependencies]
+pathfinding.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+# `ron` (map tables), `pathfinding` (A* oracle) and `proptest` are listed by
+# the design and first used in M1. Ignored by cargo-machete until then.
+[package.metadata.cargo-machete]
+ignored = ["ron", "pathfinding", "proptest"]

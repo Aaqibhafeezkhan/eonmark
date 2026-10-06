@@ -1,0 +1,49 @@
+name: Feature request
+description: A new capability or a change in scope
+labels: ["kind:feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check docs/ROADMAP.md first: features already planned have a milestone id (M1 to M9) and do not need a new issue. Anything that changes a design document gets the `needs-design` label and a short discussion before code.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard, slow or impossible today? Describe the play situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change? If it touches numbers, say which `data/rules/*.ron` file. If it touches a system, name the docs/design file.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - sim (deterministic simulation)
+        - rules (RON data and validation)
+        - ai (skirmish opponents)
+        - game (Bevy presentation, macOS)
+        - ui
+        - art
+        - docs
+        - infra
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: This is not already listed in docs/ROADMAP.md.
+          required: true
+        - label: I am willing to implement this (optional).

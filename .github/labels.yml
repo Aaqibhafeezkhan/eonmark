@@ -1,0 +1,60 @@
+# Issue and PR labels for tonianev/eonmark. Apply with scripts/sync_labels.sh
+# (which hardcodes the same list; keep both in sync). Colors are 6-digit hex
+# without the leading '#'.
+- name: good first issue
+  color: 7057ff
+  description: Small, self-contained, verifiable with `cargo test -p sim` or sim-cli on any OS
+- name: help wanted
+  color: 008672
+  description: Open for anyone; usually needs a Mac or hands-on playtesting
+- name: needs-design
+  color: d4c5f9
+  description: Needs a docs/design or ADR decision before code
+- name: status:claimed
+  color: fbca04
+  description: Someone has commented to claim this; unclaimed again after 14 days of silence
+- name: status:blocked
+  color: b60205
+  description: Waiting on another issue, PR or an owner decision
+- name: platform:macos
+  color: 0e8a16
+  description: Needs an Apple Silicon Mac to work on or verify
+- name: area:sim
+  color: 1d76db
+  description: crates/sim, deterministic simulation
+- name: area:rules
+  color: 1d76db
+  description: crates/rules and data/rules RON schema and validation
+- name: area:ai
+  color: 1d76db
+  description: crates/ai, scripted skirmish opponents
+- name: area:game
+  color: 1d76db
+  description: crates/game, Bevy presentation layer and macOS integration
+- name: area:ui
+  color: 1d76db
+  description: In-game UI, command card, menus, HUD
+- name: area:art
+  color: 1d76db
+  description: Models, textures, audio, fonts under assets/
+- name: area:docs
+  color: 1d76db
+  description: README, CONTRIBUTING, docs/ and data/*/README.md
+- name: area:infra
+  color: 1d76db
+  description: CI, scripts, justfile, packaging, dependencies
+- name: kind:bug
+  color: d73a4a
+  description: Something does not work as documented
+- name: kind:feature
+  color: a2eeef
+  description: New capability or change in scope
+- name: kind:balance
+  color: e99695
+  description: A number in data/rules should change
+- name: kind:docs
+  color: 0075ca
+  description: Documentation only
+- name: kind:question
+  color: cfd3d7
+  description: Converted from a question; usually moves to Discussions

@@ -1,0 +1,211 @@
+# Per-PR and main-branch CI. `just ci` runs the same steps locally.
+# Every Bevy compile in the `check` job uses the single `ci` Cargo profile so one
+# target directory is cached. The release profile is built only in
+# release-check.yml and release.yml.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTDOCFLAGS: -D warnings
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    # Explicit bash gives `set -eo pipefail`, so `cmd | tee` fails when cmd fails.
+    shell: bash
+
+jobs:
+  check:
+    name: check (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: check
+          cache-on-failure: true
+          # Keep RUSTFLAGS empty so cache keys match local builds; -D warnings is
+          # passed to clippy explicitly below and to rustdoc via RUSTDOCFLAGS.
+          rustflags: ""
+          build-warnings: warn
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          # Pinned to the versions of the M0 local pass (docs/DEPENDENCIES.md);
+          # bump here and there together.
+          tool: cargo-nextest@0.9.146,cargo-machete@0.9.2,typos-cli@1.50.3,just@1.58.0
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets --locked --profile ci -- -D warnings
+
+      - name: clippy (game, dev feature)
+        run: cargo clippy -p game --features dev --locked --profile ci -- -D warnings
+
+      - name: nextest
+        run: cargo nextest run --workspace --locked --cargo-profile ci --profile ci
+
+      - name: doctests
+        run: cargo test --doc --workspace --locked --profile ci
+
+      - name: rustdoc
+        run: cargo doc --workspace --no-deps --locked --profile ci
+
+      - name: unused dependencies
+        run: cargo machete
+
+      - name: spelling
+        run: typos
+
+      - name: asset policy
+        run: scripts/check_assets.sh
+
+      - name: naming policy
+        run: scripts/check_trademark.sh
+
+      - name: exactly one Bevy in the graph
+        run: test "$(cargo tree -i bevy_ecs --depth 0 | wc -l | tr -d ' ')" -eq 1
+
+      - name: headless smoke (200 ticks)
+        # M1: switch to fixture (crates/sim/tests/fixtures/smoke.eonreplay).
+        # Only the `tick=... hash=...` line is kept so hash-parity diffs cleanly.
+        run: |
+          cargo run -p game --locked --profile ci -- --headless-run 200 | grep '^tick=' | tee hash-macos.txt
+          test -s hash-macos.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hash-macos
+          path: hash-macos.txt
+          if-no-files-found: error
+
+  headless:
+    name: headless (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    # 30 minutes once the cache is warm; the first cold Bevy build for the
+    # Linux hash needs more.
+    timeout-minutes: 45
+    env:
+      PROPTEST_CASES: "256"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system libraries for the game crate
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: headless
+          cache-on-failure: true
+          rustflags: ""
+          build-warnings: warn
+
+      - name: engine-free crate tests
+        run: cargo test -p sim -p rules -p ai -p sim-cli --locked
+
+      - name: data-check
+        run: cargo run -p sim-cli --locked -- data-check data
+
+      - name: selftest
+        run: cargo run -p sim-cli --locked -- selftest
+
+      # M1: `cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/*.eonreplay`
+      # M5b: `cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --jobs 2`
+
+      - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
+        run: |
+          for crate in sim rules ai sim-cli; do
+            if cargo tree -p "$crate" -e normal --locked | grep -E 'bevy|glam|wgpu|winit'; then
+              echo "::error::crate $crate depends on an engine crate"
+              exit 1
+            fi
+          done
+
+      - name: headless smoke (200 ticks)
+        # M1: switch to fixture. Same command as the macOS job; the two outputs
+        # must be byte-identical (hash-parity job).
+        run: |
+          cargo run -p game --locked --profile ci -- --headless-run 200 | grep '^tick=' | tee hash-linux.txt
+          test -s hash-linux.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hash-linux
+          path: hash-linux.txt
+          if-no-files-found: error
+
+  game-linux:
+    name: game compiles on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system libraries for the game crate
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: game-linux
+          cache-on-failure: true
+          rustflags: ""
+          build-warnings: warn
+
+      - name: clippy (game, Linux)
+        run: cargo clippy -p game --all-targets --locked --profile ci -- -D warnings
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  hash-parity:
+    name: hash parity (macOS vs Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [check, headless]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: hash-macos
+          path: hashes/macos
+      - uses: actions/download-artifact@v8
+        with:
+          name: hash-linux
+          path: hashes/linux
+      - name: compare
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos.txt
+          echo "Linux:"; cat hashes/linux/hash-linux.txt
+          diff hashes/macos/hash-macos.txt hashes/linux/hash-linux.txt

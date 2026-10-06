@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tonianev/eonmark"
+homepage = "https://github.com/tonianev/eonmark"
+authors = ["Toni Anev", "Eonmark contributors"]
+publish = false
+
+[workspace.dependencies]
+# workspace crates
+sim = { path = "crates/sim" }
+rules = { path = "crates/rules" }
+ai = { path = "crates/ai" }
+
+# engine (crates/game only). Pinned exactly; see docs/DEPENDENCIES.md before bumping.
+bevy = "=0.19.1"
+bevy_egui = "=0.40.1"
+bevy-inspector-egui = "=0.37.0"
+muda = "0.21"
+directories = "6"
+
+# simulation (no engine deps allowed here; CI greps `cargo tree`)
+fixed = { version = "1.31", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rand_pcg = { version = "0.10", features = ["serde"] }
+rand_core = "0.10"
+ron = "0.12"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive"] }
+
+# dev-dependencies
+pathfinding = "4.16"
+proptest = "1.11"
+criterion = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+doc_markdown = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+type_complexity = "allow"
+
+# --- profiles -----------------------------------------------------------
+# Bevy's recommended fast-compile setup: light optimisation for our code,
+# full optimisation for dependencies. The "*" glob does NOT cover workspace
+# members, so `sim` gets its own override to keep `cargo test -p sim` fast.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.sim]
+opt-level = 3
+
+# Single profile used for every Bevy compile in the per-PR CI job so one
+# target dir is cached (clippy, nextest --cargo-profile ci, doc, headless-run).
+[profile.ci]
+inherits = "dev"
+incremental = false
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Integer/fixed-point overflow must panic deterministically, never wrap.
+[profile.release.package.sim]
+overflow-checks = true

@@ -1,0 +1,22 @@
+[package]
+name = "sim-cli"
+description = "Headless Eonmark tooling: selftest, data-check, hash-dump, verify, bench, fuzz, play-bots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sim-cli"
+path = "src/main.rs"
+
+[dependencies]
+sim.workspace = true
+rules.workspace = true
+ai.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

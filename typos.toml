@@ -1,0 +1,43 @@
+# typos-cli configuration: spelling only. Trademark and naming rules live in
+# scripts/check_trademark.sh, not here. Run `typos` from the repo root.
+
+[default]
+# Hex hashes, replay ids and RON identifiers like `0x1f3a...` are not words.
+extend-ignore-re = ["0x[0-9a-fA-F]{8,}"]
+
+[default.extend-words]
+# Project nouns that are not in the dictionary. Keys are lowercase; mapping a
+# word to itself tells typos the spelling is intentional.
+eonmark = "eonmark"
+eonreplay = "eonreplay"
+freeholders = "freeholders"
+freeholder = "freeholder"
+yeoman = "yeoman"
+yeomen = "yeomen"
+croft = "croft"
+crofts = "crofts"
+mangonel = "mangonel"
+mangonels = "mangonels"
+outrider = "outrider"
+outriders = "outriders"
+scriptorium = "scriptorium"
+harrying = "harrying"
+shieldbearer = "shieldbearer"
+wain = "wain"
+
+[default.extend-identifiers]
+# Exact identifiers in crates/sim tests that typos reads as misspellings.
+# Remove an entry when the identifier is renamed.
+thr_a = "thr_a"
+thr_b = "thr_b"
+ba = "ba"
+
+[files]
+extend-exclude = [
+  "target/",
+  "dist/",
+  "Cargo.lock",
+  "assets/**",
+  "*.eonreplay",
+  "data/maps/*.ron",
+]

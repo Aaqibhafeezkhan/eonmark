@@ -1,0 +1,11 @@
+# cargo-nextest configuration. Select with `--profile ci` (nextest profile);
+# the Cargo profile is a different flag (`--cargo-profile ci`).
+
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 2 }
+failure-output = "immediate-final"
