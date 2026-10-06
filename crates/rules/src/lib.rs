@@ -186,6 +186,7 @@ impl Rules {
                 Ok(())
             }
         };
+        positive("rules_version", self.rules_version)?;
         positive("tick_rate_hz", self.tick_rate_hz)?;
         if self.tick_rate_hz > 1000 {
             return Err(Error::invalid(path, "tick_rate_hz", "must be <= 1000"));
@@ -209,6 +210,7 @@ impl Rules {
             ));
         }
         positive("pop_cap_base", self.pop_cap_base)?;
+        positive("pop_cap_per_arms_level", self.pop_cap_per_arms_level)?;
         positive("town_radius_tiles", self.town_radius_tiles)?;
         if self.town_radius_grown_tiles < self.town_radius_tiles {
             return Err(Error::invalid(
@@ -349,6 +351,63 @@ mod tests {
         r.town_radius_grown_tiles = 1;
         let err = r.validate_match_rules(Path::new("x.ron")).unwrap_err();
         assert!(err.to_string().contains("town_radius_grown_tiles"), "{err}");
+    }
+
+    fn copy_dir(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if src_path.is_dir() {
+                copy_dir(&src_path, &dst_path);
+            } else {
+                std::fs::copy(src_path, dst_path).unwrap();
+            }
+        }
+    }
+
+    fn copied_data_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eonmark-rules-test-{}-{}",
+            name,
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy_dir(&data_dir(), &dir);
+        dir
+    }
+
+    #[test]
+    fn rejects_zero_rules_version() {
+        let dir = copied_data_dir("rules-version-zero");
+        let path = dir.join("rules/rules.ron");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replacen("rules_version: 1,", "rules_version: 0,", 1);
+        std::fs::write(&path, text).unwrap();
+        let err = Rules::load(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rules.ron"), "{msg}");
+        assert!(msg.contains("rules_version"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_zero_pop_cap_per_arms_level() {
+        let dir = copied_data_dir("pop-cap-per-arms-zero");
+        let path = dir.join("rules/rules.ron");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replacen(
+            "pop_cap_per_arms_level: 25,",
+            "pop_cap_per_arms_level: 0,",
+            1,
+        );
+        std::fs::write(&path, text).unwrap();
+        let err = Rules::load(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rules.ron"), "{msg}");
+        assert!(msg.contains("pop_cap_per_arms_level"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
