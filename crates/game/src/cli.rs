@@ -28,6 +28,9 @@ Options:
   --hash-every-tick            Record a hash checkpoint every tick instead of every 20.
   --screenshot <PATH>          Dev builds: save a PNG of the window about one second
                                before --exit-after-seconds fires.
+  --screenshot-at <TICK>:<PATH>
+                               Save a PNG of the window once the sim has reached TICK
+                               (repeatable; scripted scenarios' beats, M3b proxies).
   --quit-via-menu-after-seconds <S>
                                Dev builds, macOS: after S seconds feed the `Quit Eonmark`
                                menu id through the same path a real Cmd-Q takes
@@ -37,6 +40,9 @@ Options:
                                close, the path the red close button takes (bevy_window
                                despawns it, exit_on_all_closed writes AppExit::Success).
   --exit-after-seconds <S>     Send AppExit::Success after S seconds (smoke tests).
+  --camera <X>,<Y>,<ZOOM>      Start the camera over sim tile (X, Y) at ZOOM metres
+                               (15 to 60) instead of jumping to the first units
+                               (screenshots, stream framing).
   --background                 Automated runs: open the window unfocused, below other
                                windows, in the top-left corner of the primary monitor,
                                and (macOS) hand focus back to the app that had it. Also
@@ -76,6 +82,43 @@ impl HeadlessRun {
     }
 }
 
+/// Where `--camera` starts the camera: over sim tile `(x, y)` (fractional
+/// tiles allowed) at `zoom` metres from the ground.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraStart {
+    /// Sim tile x.
+    pub x: f32,
+    /// Sim tile y (world z).
+    pub y: f32,
+    /// Distance from the focus, metres.
+    pub zoom: f32,
+}
+
+impl CameraStart {
+    /// Parse `<x>,<y>,<zoom>`: three finite numbers, `x` and `y` inside the
+    /// 128-tile map, `zoom` within the camera's range.
+    pub fn parse(value: &str) -> Result<CameraStart, String> {
+        let parts: Vec<f32> = value
+            .split(',')
+            .map(|p| p.trim().parse::<f32>().map_err(|e| format!("`{p}`: {e}")))
+            .collect::<Result<_, _>>()?;
+        let [x, y, zoom] = parts[..] else {
+            return Err(format!("expected <x>,<y>,<zoom>, got `{value}`"));
+        };
+        if !(0.0..=128.0).contains(&x) || !(0.0..=128.0).contains(&y) {
+            return Err(format!("({x}, {y}) is outside the 128-tile map"));
+        }
+        if !(crate::camera::ZOOM_MIN..=crate::camera::ZOOM_MAX).contains(&zoom) {
+            return Err(format!(
+                "zoom {zoom} is outside {}..={}",
+                crate::camera::ZOOM_MIN,
+                crate::camera::ZOOM_MAX
+            ));
+        }
+        Ok(CameraStart { x, y, zoom })
+    }
+}
+
 /// Parsed flags.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cli {
@@ -109,6 +152,10 @@ pub struct Cli {
     /// (`crate::background`). [`Cli::background_mode`] also honours
     /// `EONMARK_BACKGROUND`.
     pub background: bool,
+    /// `--camera <x>,<y>,<zoom>`.
+    pub camera: Option<CameraStart>,
+    /// `--screenshot-at <tick>:<path>`, in the order given.
+    pub screenshot_at: Vec<(u32, PathBuf)>,
 }
 
 impl Default for Cli {
@@ -126,12 +173,16 @@ impl Default for Cli {
             quit_via_menu_after_seconds: None,
             close_window_after_seconds: None,
             background: false,
+            camera: None,
+            screenshot_at: Vec::new(),
         }
     }
 }
 
-/// Outcome of parsing: run the game, or print usage.
+/// Outcome of parsing: run the game, or print usage. Built once at start-up,
+/// so the size of the `Run` variant does not matter.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Parsed {
     /// Run with these flags.
     Run(Cli),
@@ -196,6 +247,24 @@ impl Cli {
                     cli.close_window_after_seconds = Some(secs);
                 }
                 "--background" => cli.background = true,
+                "--screenshot-at" => {
+                    let value = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
+                    let (tick, path) = value
+                        .split_once(':')
+                        .ok_or_else(|| format!("{arg}: expected <tick>:<path>, got `{value}`"))?;
+                    let tick: u32 = tick
+                        .parse()
+                        .map_err(|e| format!("{arg}: tick `{tick}`: {e}"))?;
+                    if path.is_empty() {
+                        return Err(format!("{arg}: missing path after `{tick}:`"));
+                    }
+                    cli.screenshot_at.push((tick, PathBuf::from(path)));
+                }
+                "--camera" => {
+                    let value = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
+                    cli.camera =
+                        Some(CameraStart::parse(&value).map_err(|e| format!("{arg}: {e}"))?);
+                }
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -205,6 +274,12 @@ impl Cli {
             }
             if cli.screenshot.is_some() {
                 return Err("--screenshot needs a window; drop --headless-run".into());
+            }
+            if cli.camera.is_some() {
+                return Err("--camera needs a window; drop --headless-run".into());
+            }
+            if !cli.screenshot_at.is_empty() {
+                return Err("--screenshot-at needs a window; drop --headless-run".into());
             }
             if cli.quit_via_menu_after_seconds.is_some() {
                 return Err(
@@ -303,6 +378,51 @@ mod tests {
     }
 
     #[test]
+    fn camera_takes_a_tile_and_a_zoom_inside_the_map() {
+        let Ok(Parsed::Run(cli)) = parse(&["--camera", "24,64,60"]) else {
+            panic!("--camera parses");
+        };
+        assert_eq!(
+            cli.camera,
+            Some(CameraStart {
+                x: 24.0,
+                y: 64.0,
+                zoom: 60.0
+            })
+        );
+        assert!(parse(&["--camera", "24,64"]).is_err(), "three values");
+        assert!(parse(&["--camera", "24,200,40"]).is_err(), "inside the map");
+        assert!(parse(&["--camera", "24,64,5"]).is_err(), "zoom range");
+        assert!(parse(&["--camera", "a,64,40"]).is_err(), "numbers");
+        assert!(
+            parse(&["--headless-run", "10", "--camera", "24,64,40"]).is_err(),
+            "needs a window"
+        );
+    }
+
+    #[test]
+    fn screenshot_at_takes_tick_path_pairs_in_order() {
+        let Ok(Parsed::Run(cli)) = parse(&[
+            "--screenshot-at",
+            "20:/tmp/a.png",
+            "--screenshot-at",
+            "2100:/tmp/b.png",
+        ]) else {
+            panic!("--screenshot-at parses");
+        };
+        assert_eq!(
+            cli.screenshot_at,
+            vec![
+                (20, PathBuf::from("/tmp/a.png")),
+                (2100, PathBuf::from("/tmp/b.png"))
+            ]
+        );
+        assert!(parse(&["--screenshot-at", "x:/tmp/a.png"]).is_err());
+        assert!(parse(&["--screenshot-at", "/tmp/a.png"]).is_err());
+        assert!(parse(&["--screenshot-at", "20:"]).is_err());
+    }
+
+    #[test]
     fn defaults_when_no_args() {
         assert_eq!(parse(&[]), Ok(Parsed::Run(Cli::default())));
         assert_eq!(Cli::default().hash_every(), 20);
@@ -341,6 +461,8 @@ mod tests {
                 quit_via_menu_after_seconds: None,
                 close_window_after_seconds: None,
                 background: false,
+                camera: None,
+                screenshot_at: Vec::new(),
             })
         );
         let Parsed::Run(cli) = parsed else {

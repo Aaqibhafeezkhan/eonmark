@@ -335,10 +335,11 @@ pub fn sync_transforms(
 /// the camera; a skirmish with no units leaves it at the map centre.
 pub fn focus_camera_on_first_units(
     sim: NonSend<SimHandle>,
+    framing: Option<Res<crate::camera::StartFraming>>,
     mut cameras: Query<&mut RtsCamera>,
     mut done: Local<bool>,
 ) {
-    if *done {
+    if *done || framing.is_some() {
         return;
     }
     let view = sim.view();

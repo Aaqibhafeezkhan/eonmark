@@ -75,7 +75,7 @@ Cross-reference checks run after parsing. Implemented as of M3a: every cost, yie
 cargo run -p sim-cli -- data-check data/
 ```
 
-Exit code 0 prints one line such as `OK rules_version=12 rules_hash=0x<16 hex> resources=4 units=3 buildings=8 maps=plains_1v1` (the hash changes whenever any loaded file changes; M1 added `units.ron` to it, M2 `visuals.ron`, M3a `buildings.ron`). Exit code 1 prints one line starting with `error:` in one of three shapes, from `rules::Error`:
+Exit code 0 prints one line such as `OK rules_version=12 rules_hash=0x<16 hex> resources=4 units=3 buildings=8 maps=plains_1v1 strings=en` (the hash changes whenever any loaded file changes; M1 added `units.ron` to it, M2 `visuals.ron`, M3a `buildings.ron`; the M3b UI strings are checked but not hashed). Exit code 1 prints one line starting with `error:` in one of three shapes, from `rules::Error`:
 
 | Variant | Format | Example cause |
 |---|---|---|
@@ -96,7 +96,7 @@ The same loader runs at game start, so a broken file is caught before a window o
 | `data/rules/techs.ron` | Twelve techs as `Modifier` lists across four lines | M4a |
 | `data/rules/ages.ron` | Hearth, Masonry, Charter: tech-count gates and costs | M4a |
 | `data/rules/factions.ron` | Freeholders with an empty `Modifier` list; second faction as pure data | M4a, M9 |
-| `data/rules/strings/en.ron` | UI strings | M3b |
+| `data/rules/strings/en.ron` | UI strings (`reject` per `RejectReason`, `hud` labels). Not part of `rules_hash`: the sim never reads them, so editing them needs no `rules_version` bump; `data-check` validates keys and placeholders | M3b |
 | `data/rules/README.md` | Authoritative schema and worked example | M0 |
 | `data/README.md` | Layout, conventions and the license statement for `data/` (MIT OR Apache-2.0) | M0 |
 | `data/maps/README.md`, `data/ai/README.md` | Per-directory schema in plain English | M0 |

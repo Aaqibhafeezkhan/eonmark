@@ -1,6 +1,6 @@
 # Territory
 
-This document specifies the `TerritoryField`, the structure that turns Towns and Watchtowers into borders. Borders decide where a player may build, where attrition applies, and who wins a 45-minute tiebreak, so the field must be exact, cheap to update and a pure function of its sources. Every number here is a starting value in `data/rules/rules.ron` or `data/rules/buildings.ron` and may move during M6 tuning. The sim code is `crates/sim/src/territory.rs`; the visual is `crates/game/src/ground.rs`. For the design lineage see [prior-art.md](prior-art.md).
+This document specifies the `TerritoryField`, the structure that turns Towns and Watchtowers into borders. Borders decide where a player may build, where attrition applies, and who wins a 45-minute tiebreak, so the field must be exact, cheap to update and a pure function of its sources. Every number here is a starting value in `data/rules/rules.ron` or `data/rules/buildings.ron` and may move during M6 tuning. The sim code is `crates/sim/src/territory.rs`; the visual is `crates/game/src/field.rs` and its shader `field.wgsl` (the ground mesh they draw on is `crates/game/src/ground.rs`). For the design lineage see [prior-art.md](prior-art.md).
 
 | Field | Value |
 | --- | --- |
@@ -111,7 +111,7 @@ With the adopted rule nobody can build on the contested line, which is a reasona
 
 ## Rendering handoff
 
-The game mirrors the field into a 128 x 128 RGBA8 texture each tick that changed it (`sync_field_texture`):
+The game mirrors the field into a map-sized RGBA8 texture (128 x 128 on `plains_1v1`) after a stepped tick in which the field's sources changed (`field::sync_field`):
 
 | Channel | Content | Written by |
 | --- | --- | --- |
@@ -120,7 +120,7 @@ The game mirrors the field into a 128 x 128 RGBA8 texture each tick that changed
 | B | fog state 0 / 1 / 2 (see [fog.md](fog.md)) | visibility, M7 |
 | A | supply coverage (see [attrition.md](attrition.md)) | supply grid, M5a |
 
-M3b ships a vertex-colored overlay mesh first (tint plus border line). The `FieldExt` material that samples this texture replaces it within M3b if time allows and is required by M7. The shader tints owned tiles about 12% toward the team colour and draws a 1-tile soft isoline where R changes. The CPU-painted minimap (M7) reads the same field. See [ui.md](ui.md) and `docs/ART_STYLE.md`.
+M3b drew a vertex-colored version first (tint plus a hard border band) and replaced it within the milestone with the `FieldExt` material that reads this texture (`crates/game/src/field.rs`, `field.wgsl`; required by M7 in any case). The shader tints owned land about 12% toward the team colour and draws a 1-tile soft isoline where R changes: each owner's membership is interpolated between the four nearest tile centres with smoothstep weights, and the line peaks where it crosses one half. The texture is rewritten after a stepped tick only when the field's sources change, since the sources determine every layer and owner. The CPU-painted minimap (M7) reads the same field. See [ui.md](ui.md) and `docs/ART_STYLE.md`.
 
 ## Interactions
 
@@ -165,5 +165,5 @@ Since the Town loop (`SIM_VERSION` 6) the field is part of the hashed `State` an
 2. Watchtower as an own source of radius 2 versus adding 2 to the nearest Town's radius. The own-source model rewards placing towers at the frontier, which matches the AI plan; confirm.
 3. Town radii 20 and 24 on a 128-tile map leave a neutral band between distant Towns. Is that the intended early-game feel, or should tier 1 be larger?
 4. Should the G channel carry the owner's strength or the margin over the runner-up? Margin would make the isoline softer.
-5. Owner encoding (0 neutral, player index + 1) is proposed here for the R channel; confirm before M3b writes the shader.
+5. Resolved in M3b: the R channel is 0 neutral, else player index + 1 (`field::field_texels`; `owner_code` in `field.wgsl`).
 6. Watchtower radius: R = 2 (`border_radius_tiles` in `buildings.ron`) claims a 3x3 block, about one tile of push, while [ai.md](ai.md) says the Watchtower pushes the border two tiles. The owner is to confirm R against that wording (R = 3 would claim a 5x5 block, about two tiles of push); the data keeps 2 until then.

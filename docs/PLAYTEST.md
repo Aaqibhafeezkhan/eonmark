@@ -35,6 +35,26 @@ Run `cargo run -p game --features dev -- --scenario units200` from `main` (200 Y
 
 Every windowed session records a replay. The directory is `~/Library/Application Support/com.tonianev.Eonmark/replays/` unless `--replay-dir <dir>` was passed, and the file is `<yyyymmdd-hhmmss>-<seed>.eonreplay` (UTC wall clock, then the match seed). The exact path is the `replay: <path>` line on stdout at startup, so a run started from a terminal tells you which file to verify.
 
+## Economy controls checklist (M3b)
+
+Run `cargo run -p game --features dev` from `main` (the standard start: a Seat, five Yeomen, 150 Grain and 150 Lumber, against the Passive bot). Sign rows as in the M2 table. The walkthrough proxy is `--scenario economy_walkthrough` with the `--screenshot-at` beats under [Screenshots](#screenshots-m2).
+
+| Control | Expected | Proxy | Pass/Fail | Date | Commit | Signed | Notes |
+|---|---|---|---|---|---|---|---|
+| Select Yeomen | The bottom bar shows a Build button per building kind with its cost; unaffordable ones are greyed and their tooltip names the missing resource | `command_card` unit tests | | | | | |
+| Click Croft, hover outside the border | A red ghost and red footprint outline; the message line says "Outside your borders"; a click sends nothing | `economy_walkthrough` tick 20 screenshot; sim `m3b.rs` | | | | | |
+| Hover inside the border, click | The ghost turns green; the click places the site and the nearest selected Yeoman not already building walks over and builds it; the mode ends (Shift keeps it) | owner | | | | | |
+| Right-click an own unfinished site with Yeomen selected | The nearest selected Yeoman resumes building it | owner | | | | | |
+| Right-click an own Croft, Lumber Yard or Ore Pit with Yeomen selected | They go and work it | owner | | | | | |
+| Click the Seat | The panel reads "Town / Seat, tier 1"; a Train Yeoman button with its cost | `command_card` unit tests | | | | | |
+| Click Train twice | Two Yeomen queue (the panel shows progress); Grain drops by the ramped cost | owner | | | | | |
+| Right-click the ground with the Seat selected | Sets the rally point; trained Yeomen walk there | owner | | | | | |
+| Found a second Town | The tinted territory and its soft border line grow around it; "Town complete" on the message line | `economy_walkthrough` tick 1400 screenshot | | | | | |
+| Grain income above the Yield Cap | The Grain readout turns amber with ", capped at 70" | `economy_hud` walkthrough test; tick 2100 screenshot | | | | | |
+| At 25 / 25 pop | Train is greyed; its tooltip says "Population cap reached" | `command_card` walkthrough test; tick 2262 screenshot | | | | | |
+| Period (.) | Selects the next idle Yeoman, cycling by id, and centres the camera on it | `selection` unit test | | | | | |
+| Esc in placement mode | Leaves the mode, keeps the selection | owner | | | | | |
+
 ## Cmd-Q (M2)
 
 What the menu item does. `crates/game/src/macos_menu.rs` replaces winit's default application menu with a muda menu whose Quit item is a custom `MenuItem` (id `quit`, label `Quit Eonmark`, accelerator Cmd+Q). Activating it only emits a `MenuEvent`; the `drain_menu_events` system reads it on the AppKit main thread and writes `AppExit::Success`. On that same frame `finish_recorder_on_exit` (in `Last`) records a final hash checkpoint, sends `Finish` to the replay writer thread and joins it, so the file ends with the `EONRDONE` trailer and `sim-cli verify` prints `OK` without a `warning:`. The red close button takes the same `AppExit` route (`bevy_window::exit_on_all_closed`, also in `Last`).
@@ -91,6 +111,22 @@ Captured on 2026-10-06 from the M2 integration build with `--screenshot` (dev bu
 | [screenshots/m2-units200.png](screenshots/m2-units200.png) | `cargo run -p game --features dev -- --scenario units200 --exit-after-seconds 6 --screenshot m2-units200.png` | 200 matte slate-blue capsules at the west start, nothing selected; dark top bar, bottom bar with the Stop button; no glow, no bloom |
 | [screenshots/m2-selection.png](screenshots/m2-selection.png) | `cargo run -p game --features dev -- --scenario units200_auto --exit-after-seconds 6 --screenshot m2-selection.png` | `selection: 200` on stdout; every unit carries a thin flat ring on the ground (separate entities, see the inspector); the group is under way east after the tick-20 scripted Move |
 | [screenshots/m2-hud.png](screenshots/m2-hud.png) | `cargo run -p game --features dev -- --scenario hud_click --exit-after-seconds 3 --screenshot m2-hud.png` | `hud_click: ok` on stdout; 20 units still selected after the synthetic clicks on the bottom bar and on the Stop button; the HUD bars anchored top and bottom |
+
+`--camera <x>,<y>,<zoom>` frames a shot: it starts the camera over sim tile (x, y) at zoom metres (15 to 60) and skips the jump to the first units. `--camera 36,64,60` shows the whole west start with its border. Since M3b the windowed game also runs on Linux under Xvfb with the lavapipe software Vulkan driver, slowly but faithfully enough for screenshots: `xvfb-run -a -s "-screen 0 1280x800x24" env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json target/ci/eonmark --camera 36,64,60 --exit-after-seconds 14 --screenshot shot.png` (the `ci` profile binary takes `--screenshot` too; build it with `cargo build -p game --profile ci`).
+
+`--screenshot-at <TICK>:<PATH>` (repeatable) captures the window once the sim reaches a tick instead of after a wall-clock delay, so a scripted scenario's beats land in the picture however slowly the renderer runs. The M3b walkthrough: `target/ci/eonmark --scenario economy_walkthrough --camera 38,64,60 --exit-after-seconds 145 --screenshot-at 20:outside.png --screenshot-at 1400:expanded.png --screenshot-at 2100:amber.png --screenshot-at 2262:popcap.png` shows "Outside your borders" on the message line, the border grown around the second Town with "Town complete", the Grain readout in amber with "capped at 70", and Pop 25 / 25 with "Population cap reached" (`--exit-after-seconds` must outlast tick 2262 at the renderer's speed; 145 s is enough under lavapipe). CI's game-linux job runs the same walkthrough for 60 s in background mode with `scripts/render_smoke.sh` (`just render-smoke` locally), captures the window at tick 100, fails on any ERROR line in the log (a WGSL shader that does not compile is only logged by Bevy; a pipeline that never becomes ready, such as one with an unresolvable `#import`, is logged by `render_watchdog.rs`), and uploads the PNG, log and replay as the `render-smoke` artifact.
+
+## Screenshots (M3b)
+
+Captured on 2026-10-21 from the M3b branch (f3dabf6) on Linux under Xvfb with Mesa's lavapipe (the `ci` profile binary, background mode, a 1280x800 window), not on the dev Mac: the same pipelines and shaders, rendered in software. Recompressed losslessly. They are the owner proxies for the M3b acceptance lines: the walkthrough beats and the border against `docs/ART_STYLE.md`. Both windowed runs' replays verify (`OK final_hash=0xe6ad2978b1a587b4 ticks=3000` and `OK final_hash=0xdc5fe5e6d4edc476 ticks=2000`; they run past the scenario's 2400 ticks, so their hashes differ from the fixture's). Retake them on the Mac for the owner sign-off.
+
+| File | Command (prefix `xvfb-run ... env VK_ICD_FILENAMES=...` on Linux) | What to look for |
+|---|---|---|
+| [screenshots/m3b-outside.png](screenshots/m3b-outside.png) | `target/ci/eonmark --scenario economy_walkthrough --camera 38,64,60 --exit-after-seconds 150 --screenshot-at 20:m3b-outside.png --screenshot-at 1400:m3b-second-town.png --screenshot-at 2100:m3b-amber.png --screenshot-at 2262:m3b-popcap.png` | "Outside your borders" on the message line; the Seat's territory tinted with a soft blue border line; the second Town's site (larger) and a Croft site inside it |
+| [screenshots/m3b-second-town.png](screenshots/m3b-second-town.png) | (same run) | "Town complete"; the territory and its border line grown east around the second Town |
+| [screenshots/m3b-amber.png](screenshots/m3b-amber.png) | (same run) | The Grain readout amber, "+70 / 30 s, capped at 70"; Lumber and the others in the normal colour |
+| [screenshots/m3b-popcap.png](screenshots/m3b-popcap.png) | (same run) | "Pop 25 / 25" and "Population cap reached"; the spawned Yeomen grouped south of the Seat |
+| [screenshots/m3b-border-40m.png](screenshots/m3b-border-40m.png) | `target/ci/eonmark --scenario economy_walkthrough --camera 46,56,40 --exit-after-seconds 100 --screenshot-at 1500:m3b-border-40m.png` | The border at 40 m: a soft line about a tile wide with rounded steps along the tile edges, the 12% tint inside, matte, crossing a forest patch; check it against the ART_STYLE checklist (the window is 1280x800, the checklist's frame 1280x720) |
 
 ## Match log (M6)
 

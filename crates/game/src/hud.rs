@@ -258,8 +258,9 @@ fn hud_text(text: &str) -> impl Bundle {
 /// (`HudRoot`), an absolute-positioned bottom bar (`BottomBar`,
 /// `BackgroundColor(palette::HUD_PANEL)`, height [`BOTTOM_BAR_HEIGHT_PX`])
 /// holding one `Button` (`StopButton`, [`BUTTON_SIZE_PX`], text "Stop"),
-/// and a top bar (`TopBar`, height [`TOP_BAR_HEIGHT_PX`]) with a
-/// placeholder label. Panels and the button keep `Pickable::default()`.
+/// and a top bar (`TopBar`, height [`TOP_BAR_HEIGHT_PX`]) that
+/// `economy_hud` fills with the resource bar and pop readout. Panels and
+/// the button keep `Pickable::default()`.
 pub fn spawn_hud(mut commands: Commands) {
     commands
         .spawn((
@@ -284,15 +285,12 @@ pub fn spawn_hud(mut commands: Commands) {
                     width: Val::Percent(100.0),
                     height: Val::Px(TOP_BAR_HEIGHT_PX),
                     align_items: AlignItems::Center,
-                    justify_content: JustifyContent::Center,
+                    justify_content: JustifyContent::SpaceBetween,
                     padding: UiRect::horizontal(Val::Px(PADDING_PX)),
                     ..default()
                 },
                 BackgroundColor(palette::HUD_PANEL),
-            ))
-            .with_children(|bar| {
-                bar.spawn(hud_text("Eonmark"));
-            });
+            ));
             root.spawn((
                 Name::new("Bottom bar"),
                 BottomBar,

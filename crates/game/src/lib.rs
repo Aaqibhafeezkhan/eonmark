@@ -27,10 +27,14 @@
 
 pub mod app;
 pub mod background;
+pub mod buildings;
 pub mod camera;
 pub mod cli;
+pub mod command_card;
 #[cfg(feature = "dev")]
 pub mod dev_tools;
+pub mod economy_hud;
+pub mod field;
 pub mod frame_stats;
 pub mod ground;
 pub mod headless;
@@ -40,6 +44,8 @@ pub mod macos_menu;
 pub mod monitor_loss;
 pub mod orders;
 pub mod palette;
+pub mod placement;
 pub mod present;
+pub mod render_watchdog;
 pub mod selection;
 pub mod sim_driver;

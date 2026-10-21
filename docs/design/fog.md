@@ -12,8 +12,8 @@ Area: `area:sim` (grid, `SimView`) and `area:game` (shader channel, visibility t
 | States | 0 unexplored, 1 explored, 2 visible | `visibility.rs` |
 | Stamp cadence | every tick, inside `Sim::step` | `visibility.rs` |
 | Vision radii | per kind, `vision_tiles`: every unit kind 8 (Yeoman, Scribe, Skirmisher); Town 14; Watchtower 12; Scriptorium, Muster Hall and Engine Yard 8; Croft, Lumber Yard and Ore Pit 6 | `data/rules/units.ron` and `data/rules/buildings.ron`; they replaced the M0 `rules.ron` placeholder at M3a (`rules_version` 6) |
-| Albedo multiplier | 0.0 unexplored, 0.45 explored, 1.0 visible | `assets/shaders/field.wgsl` (`FieldExt`) |
-| Texture channel | B of the 128 x 128 RGBA8 field texture (R owner, G strength, B fog, A supply) | `crates/game/src/ground.rs` |
+| Albedo multiplier | 0.0 unexplored, 0.45 explored, 1.0 visible | `crates/game/src/field.wgsl` (`FieldExt`, embedded in the binary) |
+| Texture channel | B of the 128 x 128 RGBA8 field texture (R owner, G strength, B fog, A supply) | `crates/game/src/field.rs` |
 | Enemy units | hidden unless their tile is state 2 for the viewing player | `present.rs` |
 | Enemy buildings | shown with current state when their tile is state 1 or 2; no ghosting | `present.rs` |
 | Minimap | same grid, same multipliers, repainted every frame | `hud/minimap.rs` |
@@ -53,9 +53,9 @@ Human orders are not filtered. The player may order units into unexplored or exp
 
 ## Rendering
 
-The game crate uploads the field texture through `sync_field_texture` each frame. The B channel carries the human player's visibility state per tile. The `FieldExt` material extension (`ExtendedMaterial<StandardMaterial, FieldExt>`) reads the texture in the fragment shader and multiplies the ground albedo by 0.0 for unexplored, 0.45 for explored and 1.0 for visible, after the territory tint and border isoline from [territory.md](territory.md) are applied. The exact byte encoding of the three states in the channel is the implementer's choice; the shader maps whatever encoding is chosen to the three multipliers.
+The game crate rewrites the field texture in `field::sync_field` after a stepped tick; since M3b it does so only when the territory sources change, so M7 widens that test to the human player's visibility grid. The B channel carries the human player's visibility state per tile. The `FieldExt` material extension (`ExtendedMaterial<StandardMaterial, FieldExt>`) reads the texture in the fragment shader and multiplies the ground albedo by 0.0 for unexplored, 0.45 for explored and 1.0 for visible, after the territory tint and border isoline from [territory.md](territory.md) are applied. The exact byte encoding of the three states in the channel is the implementer's choice; the shader maps whatever encoding is chosen to the three multipliers.
 
-The FieldExt shader is optional in M3b (a vertex-coloured overlay mesh may ship first) and mandatory from M7, because fog rides the same texture. There is no separate fog pass and no post-processing.
+The FieldExt shader shipped in M3b, after a vertex-coloured first version, and fog rides the same texture. There is no separate fog pass and no post-processing.
 
 Enemy units. `present.rs` mirrors `UnitId` to `Entity`. Each frame it sets `Visibility::Hidden` on enemy unit entities whose tile is not state 2 for the human player and `Visibility::Inherited` otherwise. Health bars and selection rings are separate entities keyed by `UnitId` (see [ui.md](ui.md)) and follow the same toggle.
 

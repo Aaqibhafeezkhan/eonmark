@@ -39,22 +39,42 @@ const PINCH_ZOOM_GAIN: f32 = 1.0;
 /// Zoom smoothing rate, 1/s (higher snaps faster).
 const ZOOM_SMOOTHING: f32 = 12.0;
 
+/// `--camera`: where the camera starts. While present, the presenter does
+/// not jump the camera to the local player's first units.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct StartFraming(pub crate::cli::CameraStart);
+
 /// Spawns the camera and the sun, and runs the control systems.
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera_and_sun).add_systems(
-            Update,
-            (
-                pan_keyboard,
-                pan_edge_scroll,
-                scroll_pan_and_zoom,
-                pinch_zoom,
-                apply_camera,
-            )
-                .chain(),
-        );
+        app.add_systems(Startup, (spawn_camera_and_sun, apply_start_framing).chain())
+            .add_systems(
+                Update,
+                (
+                    pan_keyboard,
+                    pan_edge_scroll,
+                    scroll_pan_and_zoom,
+                    pinch_zoom,
+                    apply_camera,
+                )
+                    .chain(),
+            );
+    }
+}
+
+/// Put the camera where `--camera` asked, focus and zoom both, with no
+/// smoothing.
+fn apply_start_framing(framing: Option<Res<StartFraming>>, mut cameras: Query<&mut RtsCamera>) {
+    let Some(framing) = framing else {
+        return;
+    };
+    let start = framing.0;
+    for mut cam in &mut cameras {
+        cam.focus = Vec3::new(start.x - HALF_EXTENT, 0.0, start.y - HALF_EXTENT);
+        cam.zoom = start.zoom;
+        cam.zoom_target = start.zoom;
     }
 }
 

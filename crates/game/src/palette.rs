@@ -5,6 +5,20 @@
 
 use bevy::prelude::*;
 
+/// Forest floor tiles (`docs/ART_STYLE.md`, #5C7A4A); impassable Lumber
+/// sources.
+pub const FOREST_FLOOR: Color = Color::srgb(0.361, 0.478, 0.290);
+
+/// Mountain tiles (`docs/ART_STYLE.md` rock, #8C8578); impassable Ore
+/// sources.
+pub const ROCK: Color = Color::srgb(0.549, 0.522, 0.471);
+
+/// Water tiles (`docs/ART_STYLE.md`, #5B7C8F); impassable.
+pub const WATER: Color = Color::srgb(0.357, 0.486, 0.561);
+
+/// Stone (`docs/ART_STYLE.md`, #B5AFA3): construction sites blend toward it.
+pub const STONE: Color = Color::srgb(0.710, 0.686, 0.639);
+
 /// Three close-valued matte greens for grass tiles. Index 0 is the base.
 pub const GRASS: [Color; 3] = [
     Color::srgb(0.455, 0.600, 0.396),
@@ -61,6 +75,15 @@ pub const HUD_BUTTON_HOVER: Color = Color::srgb(0.33, 0.37, 0.41);
 pub const HUD_BUTTON_PRESSED: Color = Color::srgb(0.21, 0.24, 0.27);
 /// HUD text.
 pub const HUD_TEXT: Color = Color::srgb(0.93, 0.92, 0.88);
+/// Yield Cap amber (`docs/ART_STYLE.md`, #D29B3B): a rate readout while
+/// production is discarded at the cap.
+pub const HUD_AMBER: Color = Color::srgb(0.824, 0.608, 0.231);
+/// Disabled HUD text and buttons (`docs/ART_STYLE.md`, #6B6B70).
+pub const HUD_DISABLED: Color = Color::srgb(0.420, 0.420, 0.439);
+/// Affordable or valid placement (`docs/ART_STYLE.md`, #6FA06A).
+pub const VALID: Color = Color::srgb(0.435, 0.627, 0.416);
+/// Unaffordable or invalid placement (`docs/ART_STYLE.md`, #B04A3F).
+pub const INVALID: Color = Color::srgb(0.690, 0.290, 0.247);
 
 #[cfg(test)]
 mod tests {

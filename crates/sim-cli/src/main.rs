@@ -271,10 +271,12 @@ fn selftest(data: &Path, ticks: u32, seed: u64) -> ExitCode {
 }
 
 fn data_check(dir: &Path) -> ExitCode {
-    match Rules::load(dir) {
-        Ok(r) => {
+    // UI strings are presentation data outside `Rules` (and `rules_hash`),
+    // checked here so a broken string file fails CI like any rules file.
+    match Rules::load(dir).and_then(|r| Ok((r, rules::strings::Strings::load(dir, "en")?))) {
+        Ok((r, _strings)) => {
             println!(
-                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} maps={}",
+                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} maps={} strings=en",
                 r.rules_version,
                 r.rules_hash(),
                 r.resources.resources.len(),

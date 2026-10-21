@@ -1,0 +1,60 @@
+// UI strings, English (M3b). Presentation only: the sim never reads this
+// file, it is not part of rules_hash, and editing it needs no rules_version
+// bump. Schema: crates/rules/src/strings.rs (deny_unknown_fields).
+// Placeholders: {resource} {unit} {building} {cost} {used} {cap} {count}
+// {rate} {name} {key}; any other brace fails `sim-cli data-check`.
+(
+  // Message line, one entry per sim RejectReason in snake case.
+  reject: {
+    "unknown_player": "Unknown player",
+    "surrendered": "You have surrendered",
+    "no_valid_units": "No selected unit can do that",
+    "debug_commands_disabled": "Debug commands are off in this match",
+    "unknown_unit_kind": "Unknown unit",
+    "unreachable": "Cannot get there",
+    "not_implemented": "Not available yet",
+    "outside_borders": "Outside your borders",
+    "cannot_afford": "Not enough {resource}",
+    "town_limit_reached": "Town limit reached",
+    "per_town_limit_reached": "This Town already has its limit of those",
+    "unknown_building_kind": "Unknown building",
+    "unknown_building": "That building is gone",
+    "unknown_resource": "Unknown resource",
+    "not_a_builder": "That unit cannot build",
+    "site_out_of_bounds": "Off the map",
+    "site_blocked": "Something is in the way",
+    "site_occupied": "Units are standing there",
+    "no_adjacent_resource": "Must be built beside its resource",
+    "invalid_slot": "Nothing to cancel there",
+    "under_construction": "Still under construction",
+    "not_a_gather_node": "Nothing to gather there",
+    "pop_cap_reached": "Population cap reached",
+    "cannot_train_here": "Cannot be trained here",
+    "queue_full": "Queue full",
+    "no_free_slot": "No free work slot",
+  },
+  // HUD labels and tooltips.
+  hud: {
+    "pop": "Pop {used} / {cap}",
+    "rate": "+{rate} / 30 s",
+    "rate.capped": "+{rate} / 30 s, capped at {cap}",
+    "stockpile.capped": "{count} / {cap}",
+    "button.stop": "Stop",
+    "button.build": "Build",
+    "button.back": "Back",
+    "button.train": "{unit}",
+    "button.building": "{building}",
+    "button.cancel": "Cancel",
+    "tooltip.cost": "Costs {cost}",
+    "tooltip.place": "Place {building}: left click inside your borders, right click or Esc to cancel",
+    "tooltip.cancel_site": "Cancel construction and refund what was paid",
+    "info.units": "{name} x{count}",
+    "info.site": "Under construction, {count}%",
+    "info.seat": "Seat, tier {count}",
+    "info.town": "Town, tier {count}",
+    "info.workers": "Workers {count} / {cap}",
+    "info.queue": "Training: {name}",
+    "notice.placed": "{building} placed",
+    "notice.completed": "{building} complete",
+  },
+)

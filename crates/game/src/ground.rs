@@ -1,14 +1,22 @@
 //! The flat ground: a 128 x 128 m grid of 1 m quads with flat normals and
 //! per-tile vertex colours, plus a gizmo grid every 8 tiles. No heightmap
-//! in v0.1; forest/rock/water tile colours arrive with the map data (M1).
+//! in v0.1. Tiles take their colour from the match's map: grass in three
+//! close greens, forest floor, rock and water (`docs/ART_STYLE.md`).
+//!
+//! Territory (M3b) is not in the mesh: the ground's material is
+//! [`GroundMaterial`], whose shader lays the tint and the soft border line
+//! over these colours from the field texture (`crate::field`).
 
 use std::f32::consts::FRAC_PI_2;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use rules::{MapDef, Terrain};
 
+use crate::field::{GroundMaterial, ground_material};
 use crate::palette;
+use crate::sim_driver::SimHandle;
 
 /// Ground edge length in tiles (and metres).
 pub const GROUND_SIZE_TILES: u32 = 128;
@@ -48,20 +56,55 @@ fn tile_palette_index(x: u32, z: u32) -> usize {
     }
 }
 
+/// The colour of tile `(x, z)`: its terrain from `map`, all grass without a
+/// map. Grass varies between three close greens.
+fn tile_color(map: Option<&MapDef>, x: u32, z: u32) -> Color {
+    let terrain = map
+        .filter(|m| x < u32::from(m.width) && z < u32::from(m.height))
+        .map_or(Terrain::Grass, |m| {
+            m.tile(
+                u16::try_from(x).expect("map width fits u16"),
+                u16::try_from(z).expect("map height fits u16"),
+            )
+        });
+    match terrain {
+        Terrain::Grass => palette::GRASS[tile_palette_index(x, z)],
+        Terrain::Forest => palette::FOREST_FLOOR,
+        Terrain::Mountain => palette::ROCK,
+        Terrain::Water => palette::WATER,
+    }
+}
+
+/// Each ground tile's colour, row-major.
+pub fn base_colors(map: Option<&MapDef>) -> Vec<Color> {
+    let n = GROUND_SIZE_TILES;
+    (0..n)
+        .flat_map(|z| (0..n).map(move |x| (x, z)))
+        .map(|(x, z)| tile_color(map, x, z))
+        .collect()
+}
+
+/// Per-vertex colours for the ground mesh from per-tile colours (four
+/// vertices per tile, in mesh order).
+fn vertex_colors(tiles: &[Color]) -> Vec<[f32; 4]> {
+    tiles
+        .iter()
+        .flat_map(|c| [c.to_linear().to_f32_array(); 4])
+        .collect()
+}
+
 /// Build the ground mesh: four unique vertices per tile so normals and
-/// colours are flat per tile. 65 536 vertices, 98 304 indices (u32).
-pub fn build_ground_mesh() -> Mesh {
+/// colours are flat per tile. 65 536 vertices, 98 304 indices (u32). Tile
+/// colours follow `map`'s terrain (sim tile `(x, y)` is world tile
+/// `(x, z)`); without a map every tile is grass. The terrain never changes
+/// and the ground is not a picking target, so the mesh lives in the render
+/// world only.
+pub fn build_ground_mesh(map: Option<&MapDef>) -> Mesh {
     let n = GROUND_SIZE_TILES;
     let tiles = (n * n) as usize;
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(tiles * 4);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(tiles * 4);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(tiles * 4);
     let mut indices: Vec<u32> = Vec::with_capacity(tiles * 6);
-
-    let greens: Vec<[f32; 4]> = palette::GRASS
-        .iter()
-        .map(|c| c.to_linear().to_f32_array())
-        .collect();
 
     for z in 0..n {
         for x in 0..n {
@@ -77,8 +120,6 @@ pub fn build_ground_mesh() -> Mesh {
                 [x0, 0.0, z1],
             ]);
             normals.extend_from_slice(&[[0.0, 1.0, 0.0]; 4]);
-            let color = greens[tile_palette_index(x, z)];
-            colors.extend_from_slice(&[color; 4]);
             // Counter-clockwise seen from +Y.
             indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
         }
@@ -90,27 +131,35 @@ pub fn build_ground_mesh() -> Mesh {
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, vertex_colors(&base_colors(map)))
     .with_inserted_indices(Indices::U32(indices))
 }
 
 fn spawn_ground(
     mut commands: Commands,
+    sim: Option<NonSend<SimHandle>>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<GroundMaterial>>,
 ) {
-    let material = materials.add(StandardMaterial {
+    let map = sim.as_ref().and_then(|s| s.rules().map(&s.setup().map));
+    let mesh = meshes.add(build_ground_mesh(map));
+    let view = sim.as_ref().map(|s| s.view());
+    let base = StandardMaterial {
         base_color: Color::WHITE,
         perceptual_roughness: 0.95,
         reflectance: 0.2,
         metallic: 0.0,
         ..default()
-    });
+    };
+    let (material, texture) =
+        ground_material(base, view.as_ref().map(|v| v.territory()), &mut images);
+    commands.insert_resource(texture);
     commands.spawn((
         Name::new("Ground"),
         Ground,
-        Mesh3d(meshes.add(build_ground_mesh())),
-        MeshMaterial3d(material),
+        Mesh3d(mesh),
+        MeshMaterial3d(materials.add(material)),
         Transform::IDENTITY,
     ));
 }
@@ -139,13 +188,39 @@ mod tests {
 
     #[test]
     fn mesh_has_four_vertices_and_six_indices_per_tile() {
-        let mesh = build_ground_mesh();
+        let mesh = build_ground_mesh(None);
         let tiles = (GROUND_SIZE_TILES * GROUND_SIZE_TILES) as usize;
         assert_eq!(mesh.count_vertices(), tiles * 4);
         let Some(Indices::U32(indices)) = mesh.indices() else {
             panic!("expected u32 indices");
         };
         assert_eq!(indices.len(), tiles * 6);
+    }
+
+    #[test]
+    fn tiles_take_their_terrain_colour_from_the_map() {
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let rules = rules::Rules::load(&data).expect("data loads");
+        let map = rules.map("plains_1v1").expect("default map");
+        let mut seen = [false; 4];
+        for z in 0..u32::from(map.height) {
+            for x in 0..u32::from(map.width) {
+                let terrain = map.tile(x as u16, z as u16);
+                let want = match terrain {
+                    Terrain::Grass => None,
+                    Terrain::Forest => Some(palette::FOREST_FLOOR),
+                    Terrain::Mountain => Some(palette::ROCK),
+                    Terrain::Water => Some(palette::WATER),
+                };
+                seen[terrain as usize] = true;
+                let got = tile_color(Some(map), x, z);
+                match want {
+                    Some(c) => assert_eq!(got, c, "({x}, {z})"),
+                    None => assert!(palette::GRASS.contains(&got), "({x}, {z})"),
+                }
+            }
+        }
+        assert_eq!(seen, [true; 4], "plains_1v1 has every terrain");
     }
 
     #[test]

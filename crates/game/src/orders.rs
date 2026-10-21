@@ -9,20 +9,34 @@
 //! Every order goes through `PendingCommands::push_local`, which stamps the
 //! seq; nothing here touches the sim.
 //!
+//! A right click is contextual (M3b): with units selected, on one of the
+//! player's construction sites it is `Build` on that site (the nearest
+//! selected builder takes it over), on one of their buildings that has
+//! gather slots it is `Gather`; with a building selected it is `SetRally`
+//! at the ground point; otherwise it is `Move`.
+//! The sim validates every one of them, so a wrong guess comes back as a
+//! rejection on the message line, never as a silent change.
+//!
+//! [`OrderMode::Place`] is the build-placement mode the command card enters;
+//! `placement.rs` owns its left click, a right click or Esc cancels it.
+//!
 //! Keys: S = Stop, A = attack-move mode (when something is selected), Esc
 //! or a right click cancels the mode. The camera also pans on A and S
 //! (`camera.rs`, WASD): the keybinding table in `docs/PLAYTEST.md` is the
 //! place to settle that, not this file.
 
+use bevy::picking::hover::HoverMap;
+use bevy::picking::pointer::PointerId;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use sim::{Command, FxVec2};
+use sim::{BuildingId, BuildingKindId, Command, FxVec2};
 
+use crate::buildings::BuildingRef;
 use crate::camera::RtsCamera;
 use crate::hud::{PointerOverUi, WorldInputSet};
 use crate::present::sim_from_world;
 use crate::selection::{RingAssets, Selection, spawn_move_marker};
-use crate::sim_driver::PendingCommands;
+use crate::sim_driver::{LOCAL_PLAYER, PendingCommands, SimHandle};
 
 /// What the next left click on the ground means.
 #[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +47,10 @@ pub enum OrderMode {
     /// After A: the next left click on the ground is an `AttackMove`; Esc or
     /// a right click cancels back to `Normal`.
     AttackMove,
+    /// Placing a building of this kind: a ghost follows the cursor and a
+    /// left click on the ground issues `Build` (`placement.rs`); Esc or a
+    /// right click cancels back to `Normal`.
+    Place(BuildingKindId),
 }
 
 /// Where the cursor ray meets the ground plane y = 0, in world metres, or
@@ -91,6 +109,31 @@ pub fn issue_attack_move(
     }))
 }
 
+/// Queue a Gather for the selected units onto `node`.
+pub fn issue_gather(
+    pending: &mut PendingCommands,
+    selection: &Selection,
+    node: BuildingId,
+) -> Option<u32> {
+    if selection.is_empty() {
+        return None;
+    }
+    Some(pending.push_local(Command::Gather {
+        units: selection.units.iter().copied().collect(),
+        node,
+    }))
+}
+
+/// Queue a `SetRally` for the selected building.
+pub fn issue_rally(
+    pending: &mut PendingCommands,
+    selection: &Selection,
+    target: FxVec2,
+) -> Option<u32> {
+    let building = selection.building?;
+    Some(pending.push_local(Command::SetRally { building, target }))
+}
+
 /// Right click, S and A handling.
 pub struct OrdersPlugin;
 
@@ -134,6 +177,9 @@ pub fn order_mode_keys(
 /// `Normal`. A right click in `AttackMove` mode only cancels the mode.
 #[allow(clippy::too_many_arguments)] // Bevy system: each parameter is one resource or query
 pub fn issue_pointer_orders(
+    sim: NonSend<SimHandle>,
+    hover: Res<HoverMap>,
+    buildings: Query<&BuildingRef>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -151,7 +197,7 @@ pub fn issue_pointer_orders(
     if !(right || left) {
         return;
     }
-    if *mode == OrderMode::AttackMove && right {
+    if matches!(*mode, OrderMode::AttackMove | OrderMode::Place(_)) && right {
         *mode = OrderMode::Normal;
         return;
     }
@@ -169,10 +215,17 @@ pub fn issue_pointer_orders(
     };
     let target = sim_from_world(hit);
     let issued = match *mode {
-        OrderMode::Normal if right => {
-            let queue = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-            issue_move(&mut pending, &selection, target, queue)
+        OrderMode::Normal if right && selection.building.is_some() => {
+            issue_rally(&mut pending, &selection, target)
         }
+        OrderMode::Normal if right => match context_target(&sim, &hover, &buildings) {
+            Some(Context::Site(site)) => issue_resume(&sim, &mut pending, &selection, site),
+            Some(Context::Gather(node)) => issue_gather(&mut pending, &selection, node),
+            None => {
+                let queue = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+                issue_move(&mut pending, &selection, target, queue)
+            }
+        },
         OrderMode::AttackMove if left => {
             *mode = OrderMode::Normal;
             issue_attack_move(&mut pending, &selection, target)
@@ -184,6 +237,60 @@ pub fn issue_pointer_orders(
     {
         spawn_move_marker(&mut commands, assets, hit, time.elapsed_secs());
     }
+}
+
+/// What a right click on one of the local player's buildings means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Context {
+    /// A construction site: a selected builder takes it over.
+    Site(BuildingId),
+    /// A complete building with gather slots: the units work it.
+    Gather(BuildingId),
+}
+
+/// The local player's building under the mouse pointer, when a right click
+/// on it means something other than a move.
+fn context_target(
+    sim: &SimHandle,
+    hover: &HoverMap,
+    buildings: &Query<&BuildingRef>,
+) -> Option<Context> {
+    let view = sim.view();
+    let rules = sim.rules();
+    hover
+        .get(&PointerId::Mouse)?
+        .keys()
+        .filter_map(|e| buildings.get(*e).ok())
+        .filter_map(|r| view.building(r.0))
+        .filter(|b| b.owner == LOCAL_PLAYER)
+        .find_map(|b| match b.construction {
+            sim::Construction::Site { .. } => Some(Context::Site(b.id)),
+            sim::Construction::Complete => rules
+                .building_kind(b.kind.0)
+                .is_some_and(|k| k.gather.is_some())
+                .then_some(Context::Gather(b.id)),
+        })
+}
+
+/// Queue a `Build` that hands `site` to the selected builder nearest it
+/// (a resume: no cost). `None` when no selected unit can build.
+fn issue_resume(
+    sim: &SimHandle,
+    pending: &mut PendingCommands,
+    selection: &Selection,
+    site: BuildingId,
+) -> Option<u32> {
+    let view = sim.view();
+    let rules = sim.rules();
+    let b = view.building(site)?;
+    let kind = rules.building_kind(b.kind.0)?;
+    let centre = sim::construction::centre_fx(kind, b.tile);
+    let unit = crate::placement::nearest_builder(&view, rules, selection, centre)?;
+    Some(pending.push_local(Command::Build {
+        unit,
+        kind: b.kind,
+        tile: b.tile,
+    }))
 }
 
 #[cfg(test)]

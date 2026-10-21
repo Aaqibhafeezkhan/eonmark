@@ -156,6 +156,7 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/group_spiral.eonreplay | tee verify-group-spiral.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/snapshot_restore.eonreplay | tee verify-snapshot-restore.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/economy_second_town.eonreplay | tee verify-economy-second-town.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/economy_walkthrough.eonreplay | tee verify-economy-walkthrough.txt
 
       - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
         run: |
@@ -212,13 +213,35 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          cache-shared-key: game-linux
+          # Bumped when the job started building the binary (render smoke):
+          # rust-cache saves only under a new key, so the old clippy-only
+          # cache would leave every run building the game cold.
+          cache-shared-key: game-linux-build
           cache-on-failure: true
           rustflags: ""
           build-warnings: warn
 
       - name: clippy (game, Linux)
         run: cargo clippy -p game --all-targets --locked --profile ci -- -D warnings
+
+      # Bevy compiles WGSL only when it builds a pipeline, and a shader that
+      # fails is logged while the game runs on and exits 0; this renders the
+      # walkthrough on lavapipe and fails on any ERROR line (render_watchdog.rs
+      # adds one for a pipeline that never becomes ready). winit loads
+      # libxkbcommon-x11 and the X libraries at run time; the runner image
+      # lacks the first. The screenshot is uploaded for review.
+      - name: Render smoke test (Xvfb, lavapipe)
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxi6 libxrandr2
+          cargo build -p game --locked --profile ci
+          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: render-smoke
+          path: ${{ runner.temp }}/render-smoke/
+          if-no-files-found: warn
 
   deny:
     name: cargo-deny

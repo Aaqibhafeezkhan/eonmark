@@ -150,8 +150,8 @@ impl SimHandle {
     }
 
     /// Events since the last drain (`UnitSpawned`, `UnitArrived`,
-    /// `CommandRejected`, ...). The presenter does not need them in M2 (it
-    /// diffs ids), the HUD message line will from M3b.
+    /// `CommandRejected`, ...). The fixed-step driver drains them every tick
+    /// and forwards them as [`SimEventMsg`].
     pub fn drain_events(&mut self) -> Vec<sim::SimEvent> {
         self.sim.drain_events()
     }
@@ -763,6 +763,17 @@ fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
+/// One sim event, forwarded from `step_sim` after the tick that raised it
+/// (the HUD message line reads `CommandRejected`; the presenter needs none
+/// of them, it diffs ids). `tick` is `sim.tick()` after that step.
+#[derive(Message, Debug, Clone, PartialEq)]
+pub struct SimEventMsg {
+    /// The completed tick the event belongs to.
+    pub tick: u32,
+    /// The event.
+    pub event: sim::SimEvent,
+}
+
 /// System set for the fixed-step sim tick; presentation syncs run
 /// `.after(SimSystems::Step)` in `FixedUpdate` or in `FixedPostUpdate`.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -874,6 +885,7 @@ impl Plugin for SimPlugin {
             .init_resource::<FrameBudget>()
             .init_resource::<SimStepped>()
             .add_message::<ReplayFinished>()
+            .add_message::<SimEventMsg>()
             .add_systems(Startup, configure_virtual_time)
             .add_systems(PreUpdate, reset_frame_budget)
             .add_systems(FixedUpdate, step_sim.in_set(SimSystems::Step))
@@ -969,6 +981,7 @@ fn step_sim(
     mut budget: ResMut<FrameBudget>,
     mut fixed: ResMut<Time<Fixed>>,
     mut finished: MessageWriter<ReplayFinished>,
+    mut events: MessageWriter<SimEventMsg>,
     mut stepped: ResMut<SimStepped>,
 ) {
     stepped.0 = false;
@@ -990,16 +1003,17 @@ fn step_sim(
         *cadence,
         &mut stats,
     ) {
-        TickOutcome::Stepped { .. } => {
+        TickOutcome::Stepped { tick } => {
             stepped.0 = true;
-            // Events are not hashed state and nothing reads them yet (the
-            // HUD message line arrives in M3b); drain them so the buffer
-            // never grows for the length of a session, and count them.
+            // Events are not hashed state: drain them every tick so the
+            // buffer never grows, count them, and forward them as
+            // `SimEventMsg` for the HUD.
             for event in sim.drain_events() {
                 stats.events_seen += 1;
                 if matches!(event, sim::SimEvent::CommandRejected { .. }) {
                     stats.commands_rejected += 1;
                 }
+                events.write(SimEventMsg { tick, event });
             }
         }
         TickOutcome::Stalled => {}

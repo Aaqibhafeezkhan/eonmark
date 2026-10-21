@@ -51,7 +51,7 @@ One `StandardMaterial` per kind and team, shared by every instance of that kind.
 | `reflectance` | 0.2 |
 | `metallic` | 0.0 |
 | `emissive` | black; never used for gameplay signalling |
-| Alpha | opaque, except the territory overlay and HUD panels |
+| Alpha | opaque, except HUD panels; territory is drawn inside the opaque ground material by `FieldExt`, not as a separate overlay |
 
 ## Lighting and post-processing
 
@@ -89,12 +89,12 @@ Motion is procedural (bob, swing, scale pulse), not animation clips, in v0.1.
 |---|---|
 | Owned-land tint | about 12% team colour over the ground |
 | Border | a 1-tile soft isoline where ownership changes |
-| Neutral or tied tiles | no tint |
+| Neutral or tied tiles | no tint, except within half a tile of owned land, where the owner's tint fades from about half of the 12% at the edge to nothing at the tile centre, under the border line |
 | Fog, explored | ground and buildings darkened to 0.45 |
 | Fog, unexplored | 0.0 (hidden) |
 | Supply coverage | subtle hatching from the same field texture (M5a) |
 
-M3b ships the border as a vertex-coloured overlay mesh first and upgrades to the `FieldExt` extended material sampling a 128x128 RGBA8 field texture (R owner, G strength, B fog, A supply). The shader is mandatory by M7 because fog rides the same texture.
+The ground's material is the `FieldExt` extended material (`crates/game/src/field.rs`, shader `field.wgsl` embedded in the binary) reading an RGBA8 field texture with one texel per tile, 128x128 on the current maps (R owner, G strength, B fog, A supply). Each owner's membership is interpolated between tile centres with smoothstep weights; the tint follows it and the border is the isoline where it crosses one half, fading to nothing at the tile centres on either side, so the line follows the buildable tiles with rounded corners. M3b drew a vertex-coloured version first and replaced it within the milestone. The shader is mandatory by M7 because fog rides the same texture.
 
 ## HUD
 

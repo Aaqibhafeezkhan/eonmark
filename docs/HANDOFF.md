@@ -17,8 +17,10 @@ in a game that runs and a command that proves it.
 ## State of the repository
 
 The repository was planned and scaffolded on 2026-10-05 with AI assistance.
-M0, M1 and M2 are merged. M3a is implemented on PR #26 (all six slices,
-training last) and awaits merge; M3b is next. A milestone is done when every
+M0, M1, M2 and M3a are merged (M3a as PR #26). M3b, the game side of the
+economy, is on PR #31: its automated acceptance line is ticked and the rest
+wait on the owner's Mac (60 fps, draw calls, the border review, the controls
+checklists). A milestone is done when every
 acceptance checkbox in `docs/ROADMAP.md` is ticked with pasted command
 output in a merged PR.
 
@@ -30,7 +32,7 @@ output in a merged PR.
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
 | Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M2 merged; M3a (economy, Towns, territory, construction, gathering, training) on PR #26; `crates/ai` holds the M0 bots until M5b |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b on PR #31: buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders |
 | CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order

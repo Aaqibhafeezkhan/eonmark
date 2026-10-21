@@ -17,7 +17,7 @@ reads these files; it never defines gameplay constants of its own.
 | `rules/buildings.ron` | The eight building kinds: footprint, cost, build time, hit points, vision, base yield, gather slots, per-Town limit, border radius | `crates/rules/src/buildings.rs` (`Buildings`) | M3a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
 | `rules/ages.ron`, `techs.ron`, `factions.ron` | Content tables | not yet written | M4a |
-| `rules/strings/en.ron` | UI strings | not yet written | M3b |
+| `rules/strings/en.ron` | UI strings: the message line's text for every command rejection, HUD labels and tooltips. Presentation only, outside `rules_hash` (see `crates/rules/src/strings.rs`) | written | M3b |
 | `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear | `crates/rules/src/visuals.rs` (`Visuals`) | M2 |
 | `ai/` | Build orders, personalities, difficulty table | not yet written | M5b |
 

@@ -17,7 +17,8 @@
 //! only when fed to a fresh sim from tick 0.
 //!
 //! Scenarios start empty ([`StartKind::Empty`]) except
-//! [`economy_second_town`], which starts from the standard start. On
+//! [`economy_second_town`] and [`economy_walkthrough`], which start from
+//! the standard start. On
 //! `plains_1v1` that start creates the Seats `BuildingId(1)` (P0) and
 //! `BuildingId(2)` (P1), P0's Yeomen `UnitId(1..=5)` and P1's
 //! `UnitId(6..=10)`, so a stream's own buildings begin at `BuildingId(3)`.
@@ -72,11 +73,48 @@ pub const HUD_CLICK_TICKS: u32 = 200;
 /// acceptance bound for founding a second Town.
 pub const ECONOMY_SECOND_TOWN_TICKS: u32 = 3600;
 
+/// The Croft tile of [`economy_walkthrough`] that is outside P0's border
+/// during tick 0 (`OutsideBorders`) and inside the second Town's once that
+/// is complete (placed during [`ECONOMY_WALKTHROUGH_EXPAND_TICK`]).
+pub const ECONOMY_WALKTHROUGH_OUTSIDE_CROFT: Tile = Tile::new(50, 60);
+/// Where [`economy_walkthrough`] founds P0's second Town (north-west tile).
+pub const ECONOMY_WALKTHROUGH_TOWN: Tile = Tile::new(40, 63);
+/// Tick by which [`economy_walkthrough`]'s tick-0 commands have been
+/// applied: the `OutsideBorders` rejection is on the message line, the Town
+/// and Croft sites are placed and the Seat is training.
+pub const ECONOMY_WALKTHROUGH_OUTSIDE_TICK: u32 = 20;
+/// Tick during which [`economy_walkthrough`] grants P0 the Lumber for its
+/// five later Crofts, before the second Town completes.
+pub const ECONOMY_WALKTHROUGH_GRANT_TICK: u32 = 1200;
+/// Tick during which [`economy_walkthrough`] places the five later Crofts,
+/// the first at [`ECONOMY_WALKTHROUGH_OUTSIDE_CROFT`] again. The second
+/// Town is complete and its border drawn by then (it completes at tick 1346).
+pub const ECONOMY_WALKTHROUGH_EXPAND_TICK: u32 = 1400;
+/// Tick by which [`economy_walkthrough`]'s six Crofts are complete and
+/// worked: P0's raw Grain income is over the Yield Cap (the amber readout).
+pub const ECONOMY_WALKTHROUGH_AMBER_TICK: u32 = 2100;
+/// Tick during which [`economy_walkthrough`] spawns Yeomen up to one below
+/// P0's pop cap and grants the Grain for one more.
+pub const ECONOMY_WALKTHROUGH_SPAWN_TICK: u32 = 2160;
+/// Tick during which [`economy_walkthrough`]'s Seat queues the Yeoman that
+/// fills the pop cap (25/25).
+pub const ECONOMY_WALKTHROUGH_TRAIN_TICK: u32 = 2200;
+/// Tick during which [`economy_walkthrough`]'s Seat is told to train once
+/// more and the sim rejects it with `PopCapReached`.
+pub const ECONOMY_WALKTHROUGH_REJECT_TICK: u32 = 2240;
+/// Tick by which [`economy_walkthrough`]'s pop is 25/25 and the
+/// `PopCapReached` rejection is on the message line.
+pub const ECONOMY_WALKTHROUGH_POPCAP_TICK: u32 = 2260;
+/// Length of [`economy_walkthrough`]: a little after the last beat, and
+/// short enough (at most 5000 ticks) for its golden to run in `cargo test`.
+pub const ECONOMY_WALKTHROUGH_TICKS: u32 = 2400;
+
 /// Scenario names accepted by [`by_name`], `sim-cli record --scenario` and
 /// the game's `--scenario`. The first four are the M1 golden fixtures; the
 /// M2 names are windowed scenarios (they may be recorded too);
-/// `economy_second_town` is the M3a golden fixture.
-pub const NAMES: [&str; 9] = [
+/// `economy_second_town` is the M3a golden fixture and
+/// `economy_walkthrough` the M3b one.
+pub const NAMES: [&str; 10] = [
     "move_500",
     "move_500_short",
     "group_spiral",
@@ -86,6 +124,7 @@ pub const NAMES: [&str; 9] = [
     "scripted_moves",
     "hud_click",
     "economy_second_town",
+    "economy_walkthrough",
 ];
 
 /// Spawn rows of [`bench_cross`]: a band along the west side from the
@@ -373,6 +412,174 @@ pub fn economy_second_town(rules: &Rules) -> (MatchSetup, Stream) {
     (setup, stream)
 }
 
+/// A building kind's id by its `buildings.ron` id.
+fn building_kind(rules: &Rules, id: &str) -> BuildingKindId {
+    BuildingKindId(
+        rules
+            .building_kind_by_id(id)
+            .unwrap_or_else(|| panic!("buildings.ron has {id}"))
+            .0,
+    )
+}
+
+/// A unit kind's id by its `units.ron` id.
+fn unit_kind(rules: &Rules, id: &str) -> UnitKindId {
+    let i = rules
+        .units
+        .iter()
+        .position(|u| u.id == id)
+        .unwrap_or_else(|| panic!("units.ron has {id}"));
+    UnitKindId(u16::try_from(i).expect("validated unit count"))
+}
+
+/// A resource's index by its `resources.ron` id.
+fn resource(rules: &Rules, id: &str) -> u8 {
+    let i = rules
+        .resource_index(id)
+        .unwrap_or_else(|| panic!("resources.ron has {id}"));
+    u8::try_from(i).expect("resource count fits u8")
+}
+
+fn train(owner: u8, seq: u32, building: u32, kind: UnitKindId) -> PlayerCommand {
+    PlayerCommand::new(
+        PlayerId(owner),
+        seq,
+        Command::Train {
+            building: crate::ids::BuildingId(building),
+            kind,
+        },
+    )
+}
+
+fn grant(owner: u8, seq: u32, resource: u8, amount: i64) -> PlayerCommand {
+    PlayerCommand::new(
+        PlayerId(owner),
+        seq,
+        Command::DebugGrant {
+            owner: PlayerId(owner),
+            resource,
+            amount: u32::try_from(amount).expect("grant fits u32"),
+        },
+    )
+}
+
+/// The M3b owner-proxy walkthrough (`--scenario economy_walkthrough`), from
+/// the standard start on `plains_1v1`. Only P0 acts (P1 keeps its Seat and
+/// five idle Yeomen); its Seat is `BuildingId(1)`, its Yeomen `UnitId(1..=5)`,
+/// and the Yeoman it trains first is `UnitId(11)` (P1's are `6..=10`).
+///
+/// - Place outside, place inside, second Town (during tick 0): Yeoman 3
+///   tries a Croft at [`ECONOMY_WALKTHROUGH_OUTSIDE_CROFT`], east of the
+///   Seat's border radius (`OutsideBorders`);
+///   Yeoman 1 founds a Town at [`ECONOMY_WALKTHROUGH_TOWN`] and Yeoman 2
+///   places a Croft at (28, 60), spending exactly the 150 starting Lumber
+///   (as in [`economy_second_town`]); the Seat queues a Yeoman.
+/// - During [`ECONOMY_WALKTHROUGH_GRANT_TICK`] P0 is granted the Lumber for
+///   five more Crofts at their ramped costs. The second Town completes
+///   before [`ECONOMY_WALKTHROUGH_EXPAND_TICK`], during which Yeoman 3
+///   places the Croft at [`ECONOMY_WALKTHROUGH_OUTSIDE_CROFT`] again, now
+///   inside the new Town's border, and Yeomen 1, 4, 5 and 11 place four
+///   more: three Crofts per Town, under `max_per_town`.
+/// - Yield Cap: each builder takes its Croft's slot when it completes, so
+///   by [`ECONOMY_WALKTHROUGH_AMBER_TICK`] P0 earns two Towns' base Grain
+///   plus six worked Crofts, over the Yield Cap (raw > credited, amber).
+/// - Pop cap: during [`ECONOMY_WALKTHROUGH_SPAWN_TICK`] P0 spawns Yeomen up
+///   to one Yeoman below the pop cap and is granted the Grain for one more;
+///   during [`ECONOMY_WALKTHROUGH_TRAIN_TICK`] the Seat queues it (pop at
+///   the cap, the queue nearly empty); during
+///   [`ECONOMY_WALKTHROUGH_REJECT_TICK`] the next `Train` is rejected with
+///   `PopCapReached`.
+///
+/// Seed 12. Length [`ECONOMY_WALKTHROUGH_TICKS`].
+pub fn economy_walkthrough(rules: &Rules) -> (MatchSetup, Stream) {
+    let mut setup = MatchSetup::scenario(rules, 12);
+    setup.start = StartKind::Standard;
+    let (town, croft) = (building_kind(rules, "town"), building_kind(rules, "croft"));
+    let yeoman = unit_kind(rules, "yeoman");
+    let yeoman_def = rules.unit_kind(yeoman.0).expect("yeoman kind");
+    let croft_def = rules.building_kind(croft.0).expect("croft kind");
+    let (lumber, grain) = (resource(rules, "lumber"), resource(rules, "grain"));
+    let seat = 1;
+    let outside = ECONOMY_WALKTHROUGH_OUTSIDE_CROFT;
+    // (builder, north-west tile) of the Crofts placed after the second Town:
+    // the retried one and two more by the new Town, two by the Seat.
+    let late_crofts: [(u32, u16, u16); 5] = [
+        (3, outside.x, outside.y),
+        (1, 44, 60),
+        (4, 44, 66),
+        (5, 20, 60),
+        (11, 28, 67),
+    ];
+    // Every later Croft pays the ramp for the Crofts placed before it (the
+    // tick-0 one included).
+    let late_lumber: i64 = (1..=u32::try_from(late_crofts.len()).expect("five"))
+        .map(|n| rules.building_cost(croft_def, n)[usize::from(lumber)])
+        .sum();
+    // Pop: the standard start's Yeomen plus the one trained during tick 0;
+    // spawn up to one Yeoman below the cap, then train that one, whose
+    // ramped cost counts every Yeoman alive before it.
+    let cap = rules.pop_cap(0);
+    let pop = yeoman_def.pop;
+    let alive = (rules.standard_start.units["yeoman"] + 1) * pop;
+    let to_spawn = (cap - pop - alive) / pop;
+    let last_yeoman = rules.unit_cost(yeoman_def, (cap - pop) / pop, 1);
+    let late = (5..)
+        .zip(late_crofts)
+        .map(|(seq, (unit, x, y))| build(0, seq, unit, croft, x, y))
+        .collect();
+    // South of the Seat, clear of every footprint; every Croft slot is taken
+    // by then, so the spawned Yeomen stay idle there.
+    let spawn_at = FxVec2::from_ints(24, 71);
+    let stream = vec![
+        (
+            0,
+            vec![
+                build(0, 0, 3, croft, outside.x, outside.y),
+                build(
+                    0,
+                    1,
+                    1,
+                    town,
+                    ECONOMY_WALKTHROUGH_TOWN.x,
+                    ECONOMY_WALKTHROUGH_TOWN.y,
+                ),
+                build(0, 2, 2, croft, 28, 60),
+                train(0, 3, seat, yeoman),
+            ],
+        ),
+        (
+            ECONOMY_WALKTHROUGH_GRANT_TICK,
+            vec![grant(0, 4, lumber, late_lumber)],
+        ),
+        (ECONOMY_WALKTHROUGH_EXPAND_TICK, late),
+        (
+            ECONOMY_WALKTHROUGH_SPAWN_TICK,
+            vec![
+                PlayerCommand::new(
+                    PlayerId(0),
+                    10,
+                    Command::DebugSpawn {
+                        owner: PlayerId(0),
+                        kind: yeoman,
+                        at: spawn_at,
+                        count: u16::try_from(to_spawn).expect("spawn count fits u16"),
+                    },
+                ),
+                grant(0, 11, grain, last_yeoman[usize::from(grain)]),
+            ],
+        ),
+        (
+            ECONOMY_WALKTHROUGH_TRAIN_TICK,
+            vec![train(0, 12, seat, yeoman)],
+        ),
+        (
+            ECONOMY_WALKTHROUGH_REJECT_TICK,
+            vec![train(0, 13, seat, yeoman)],
+        ),
+    ];
+    (setup, stream)
+}
+
 /// The `sim-cli bench --units n` crossing: `n` Yeomen spawned during tick 0
 /// in one group per row of [`BENCH_CROSS_ROWS`], of (as near as possible)
 /// equal size, at `(BENCH_CROSS_WEST_X, row)` in
@@ -457,6 +664,10 @@ pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
             let (s, c) = economy_second_town(rules);
             (s, c, ECONOMY_SECOND_TOWN_TICKS)
         }
+        "economy_walkthrough" => {
+            let (s, c) = economy_walkthrough(rules);
+            (s, c, ECONOMY_WALKTHROUGH_TICKS)
+        }
         _ => return None,
     };
     Some((setup, stream, ticks))
@@ -513,6 +724,15 @@ mod tests {
             assert!(stream.last().is_some_and(|(t, _)| *t < ticks), "{name}");
             assert!(!commands_at(&stream, 0).is_empty(), "{name} spawns at 0");
             assert!(commands_at(&stream, 1).is_empty(), "{name}");
+            // Seq numbers are unique per player.
+            let mut keys: Vec<(PlayerId, u32)> = stream
+                .iter()
+                .flat_map(|(_, cmds)| cmds.iter().map(|c| (c.player, c.seq)))
+                .collect();
+            let n = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), n, "{name}");
         }
         assert!(by_name("nope", &rules).is_none());
     }

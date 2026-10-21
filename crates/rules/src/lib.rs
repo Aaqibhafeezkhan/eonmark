@@ -28,6 +28,7 @@ pub mod buildings;
 pub mod costs;
 pub mod map;
 pub mod resources;
+pub mod strings;
 pub mod units;
 pub mod visuals;
 
