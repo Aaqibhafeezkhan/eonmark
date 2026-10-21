@@ -15,15 +15,33 @@
 //!    completed paths are stored on the units' orders.
 //! 5. Movement: rebuild the spatial grid, then `movement::step`; units that
 //!    need a repath get a new `PathRequest`.
-//! 6. `tick += 1`.
+//! 6. Economy and Towns, each in id order:
+//!    - 6a construction: sites whose builder is at work gain progress; a
+//!      finished site completes (a Town or Watchtower adds its border, its
+//!      Town may grow a tier) and its builder may take a slot there;
+//!    - 6b training: every complete building's queue head gains a tick; a
+//!      finished unit appears beside the building and walks to its rally
+//!      point or takes a slot there;
+//!    - 6c jobs: a job whose target is gone, or whose worker stopped
+//!      somewhere it cannot work, is dropped; then idle workers past their
+//!      timer take the nearest free slot;
+//!    - 6d income: every player's base yields and worked slots go through
+//!      the Yield Cap into the accumulators and stockpiles.
+//! 7. `tick += 1`.
 
 use crate::ai_hook::{AiController, SimView};
 use crate::command::{Command, PlayerCommand, sort_commands};
+use crate::construction::{self, BuildPlan};
+use crate::economy::{self, Economy};
 use crate::fx::{Fx, FxVec2};
+use crate::gather;
 use crate::ids::{BuildingId, BuildingKindId, IdGen, PlayerId, Tile, UnitId, UnitKindId};
 use crate::map::Map;
 use crate::movement::{self, SpatialGrid};
 use crate::pathing::{PathRequest, Pathing};
+use crate::territory::TerritoryField;
+use crate::town;
+use crate::training;
 use rand_core::{Rng, SeedableRng};
 use rules::{Rules, UnitKind};
 use serde::{Deserialize, Serialize};
@@ -41,7 +59,46 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 4: `Command::AttackMove` is applied exactly like `Command::Move` (M2
 /// placeholder until combat in M4a) instead of being rejected with
 /// `NotImplemented` and drawing from the RNG.
-pub const SIM_VERSION: u32 = 4;
+///
+/// 5: a search suspended on an older cost grid is not resumed: `Pathing`
+/// requeues its request at the head and searches the current grid
+/// (`AStarSearch::generation`, new hashed state).
+///
+/// 6: M3a Town loop. New hashed state: stockpiles and accumulators
+/// (`economy`), the territory field and the M3a building and unit fields.
+/// The replay header (`MatchSetup`) grew by `start`; the reader peeks
+/// `sim_version` first. The standard start (`StartKind::Standard`, the
+/// skirmish default), `Build`, construction, site `Cancel`, the town limit,
+/// borders on Town completion, base-yield income, `DebugPlaceBuilding` and
+/// `DebugGrant`; `Build` and `Cancel` no longer draw from the RNG.
+///
+/// 7: a `Build` builder walks to the nearest ring tile it can reach with
+/// the footprint blocked (`Unreachable` when there is none) instead of the
+/// nearest passable one, which could be sealed off; resuming a site checks
+/// the same, so it can no longer panic on an enclosed site. Standard-start
+/// units spawn after every Seat is placed, on tiles not already taken.
+///
+/// 8: gathering. `Gather` assigns slots (it no longer draws from the RNG),
+/// worked slots earn income, idle workers set `Unit::seek_at` and take free
+/// slots on their own, a finished builder takes a slot at its building, and
+/// a Town grows to tier 2 at enough distinct attributed kinds.
+///
+/// 9: training. `Train` queues units (cost and pop charged at queue time,
+/// the Yeoman's per-unit ramp and the shared military ramp), the queue head
+/// progresses in step 6b, `Cancel` refunds a queue entry, `SetRally` sets
+/// where trained units walk. `Train` and `SetRally` no longer draw from the
+/// RNG.
+///
+/// 10: a trained unit spawns in the component of the rally goal, or else of
+/// the largest component touching the building's ring, instead of on the
+/// first passable spiral tile, which could lie in a pocket sealed off by
+/// neighbouring buildings.
+///
+/// 11: the spawn component is the rally point's only when the rally point's
+/// own tile is passable (a rally on a building names no side), and with
+/// every ring tile blocked the candidates are every component, not just the
+/// first passable spiral tile's.
+pub const SIM_VERSION: u32 = 11;
 
 /// Who drives a player slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +107,17 @@ pub struct PlayerSlot {
     pub id: PlayerId,
     /// `true` when the injected [`AiController`] drives this slot.
     pub is_ai: bool,
+}
+
+/// What each player has at tick 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartKind {
+    /// Nothing: no buildings, no units, empty stockpiles. Scripted
+    /// scenarios and fixtures spawn what they need with debug commands.
+    Empty,
+    /// The standard start from `rules.ron` (`standard_start`): the Seat
+    /// centred on each player's map start, the start units and stockpiles.
+    Standard,
 }
 
 /// Everything needed to reproduce a match from tick 0. Doubles as the replay
@@ -77,11 +145,15 @@ pub struct MatchSetup {
     /// Accept [`Command::DebugSpawn`]. `false` for real matches; `true` for
     /// fixtures, benches, tests and scenarios ([`MatchSetup::scenario`]).
     pub debug_commands: bool,
+    /// What each player starts with. Last field: the header only grows at
+    /// the end, and the replay reader checks `sim_version` before decoding.
+    pub start: StartKind,
 }
 
 impl MatchSetup {
-    /// A two-player skirmish on the rules' default map: slot 0 is human,
-    /// slot 1 is driven by the AI controller. Debug commands are rejected.
+    /// A two-player skirmish on the rules' default map from the standard
+    /// start: slot 0 is human, slot 1 is driven by the AI controller. Debug
+    /// commands are rejected.
     pub fn skirmish(rules: &Rules, seed: u64) -> Self {
         Self {
             sim_version: SIM_VERSION,
@@ -103,11 +175,14 @@ impl MatchSetup {
                 },
             ],
             debug_commands: false,
+            start: StartKind::Standard,
         }
     }
 
-    /// A scripted scenario on the default map: two human slots (no AI), with
-    /// debug commands accepted so tests, benches and fixtures can spawn units.
+    /// A scripted scenario on the default map: two human slots (no AI), an
+    /// empty start, with debug commands accepted so tests, benches and
+    /// fixtures can spawn units and place buildings. Set `start` to
+    /// [`StartKind::Standard`] for a scenario from the standard start.
     pub fn scenario(rules: &Rules, seed: u64) -> Self {
         let mut s = MatchSetup::skirmish(rules, seed);
         s.players = vec![
@@ -121,6 +196,7 @@ impl MatchSetup {
             },
         ];
         s.debug_commands = true;
+        s.start = StartKind::Empty;
         s
     }
 }
@@ -189,19 +265,128 @@ pub struct Unit {
     /// The spot an arrived unit holds, if any (`None` while it has an order
     /// or after a Stop).
     pub post: Option<Post>,
+    /// What the unit works on, if anything. The single source of truth for
+    /// who builds a site and who works a slot.
+    pub job: Option<Job>,
+    /// Tick at which an idle worker next looks for work; `None` while busy
+    /// or not yet idle for a tick.
+    pub seek_at: Option<u32>,
 }
 
-/// A building. M0 placeholder: fields are filled by M3a (construction).
+impl Unit {
+    /// A new unit of `kind` standing at the centre of `tile`, facing east,
+    /// with no order and no job; speed and radius are converted from the
+    /// kind once, here.
+    pub fn spawn(
+        id: UnitId,
+        owner: PlayerId,
+        kind_id: UnitKindId,
+        tile: Tile,
+        kind: &UnitKind,
+        map: &Map,
+        tick_rate_hz: u32,
+    ) -> Unit {
+        Unit {
+            id,
+            owner,
+            kind: kind_id,
+            pos: map.center_of(tile),
+            facing: FxVec2::from_ints(1, 0),
+            radius: fx_from_x100(kind.radius_tiles_x100),
+            speed: speed_per_tick(kind, tick_rate_hz),
+            order: None,
+            post: None,
+            job: None,
+            seek_at: None,
+        }
+    }
+}
+
+/// A unit's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Job {
+    /// Construct a site.
+    Build {
+        /// The site.
+        site: BuildingId,
+    },
+    /// Work a gather slot.
+    Gather {
+        /// The gathering building.
+        node: BuildingId,
+        /// The slot, which fixes the worker's stand tile.
+        slot: u8,
+    },
+}
+
+/// Whether a building is still being built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Construction {
+    /// A site: blocks its footprint, yields nothing, projects no border.
+    Site {
+        /// Ticks of work done; complete at the kind's build time.
+        progress: u32,
+    },
+    /// Finished.
+    Complete,
+}
+
+/// What only a Town has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TownState {
+    /// The player's first Town, placed by the standard start. Never moves.
+    pub seat: bool,
+    /// Border tier: 1 when founded, 2 once grown.
+    pub tier: u8,
+}
+
+/// One entry of a training (later also research) queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    /// What is being made.
+    pub item: QueueItem,
+    /// What was deducted when it was queued; `Cancel` refunds exactly this.
+    pub paid: Vec<i64>,
+    /// Ticks of work done (only the head progresses).
+    pub progress: u32,
+}
+
+/// Something a building can queue. Research joins in M4a.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueItem {
+    /// A unit of this kind.
+    Unit(UnitKindId),
+}
+
+/// A building or a construction site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Building {
     /// Id.
     pub id: BuildingId,
     /// Owner.
     pub owner: PlayerId,
-    /// Kind (index into `buildings.ron`, M3a).
+    /// Kind (index into `buildings.ron`).
     pub kind: BuildingKindId,
     /// North-west footprint tile.
     pub tile: Tile,
+    /// Hit points (damage arrives in M4a).
+    pub hp: i32,
+    /// Site or complete.
+    pub construction: Construction,
+    /// What placing it cost, `resources.ron` order; a site `Cancel` refunds
+    /// it. Zeros for the Seat and debug placement.
+    pub paid: Vec<i64>,
+    /// The Town it is attributed to, fixed at placement; `None` for Towns
+    /// and when the owner had no complete Town.
+    pub town: Option<BuildingId>,
+    /// `Some` once a Town is complete.
+    pub town_state: Option<TownState>,
+    /// Worker slots, fixed at placement (0 for non-gatherers).
+    pub slots: u8,
+    /// Training queue, head first.
+    pub queue: Vec<QueueEntry>,
+    /// Where trained units walk, if set.
+    pub rally: Option<FxVec2>,
 }
 
 /// Why a command was rejected.
@@ -217,10 +402,59 @@ pub enum RejectReason {
     DebugCommandsDisabled,
     /// `UnitKindId` not in `units.ron`.
     UnknownUnitKind,
-    /// The goal has no reachable tile (defensive; pathing step 1 prevents it).
+    /// The goal has no reachable tile: for `Build`, no tile around the
+    /// footprint can be walked to by the builder (for a move, defensive;
+    /// pathing step 1 prevents it).
     Unreachable,
     /// The command's handler arrives in a later milestone.
     NotImplemented,
+    /// A footprint tile is not the player's territory.
+    OutsideBorders,
+    /// The player cannot pay; `resource` is the first short one, by index
+    /// in `resources.ron`.
+    CannotAfford {
+        /// Index of the first resource the stockpile lacks.
+        resource: u8,
+    },
+    /// The player already has as many Towns (sites included) as the town
+    /// limit allows.
+    TownLimitReached,
+    /// The kind's per-Town limit is reached at the Town the building would
+    /// belong to, or the player has no complete Town to attribute it to.
+    PerTownLimitReached,
+    /// `BuildingKindId` not in `buildings.ron`.
+    UnknownBuildingKind,
+    /// The building does not exist or is not the player's.
+    UnknownBuilding,
+    /// Resource index not in `resources.ron`.
+    UnknownResource,
+    /// The unit's kind cannot construct buildings.
+    NotABuilder,
+    /// The footprint leaves the map.
+    SiteOutOfBounds,
+    /// A footprint tile is impassable (terrain or another building), or no
+    /// tile around it is free for the builder.
+    SiteBlocked,
+    /// A unit stands on the footprint.
+    SiteOccupied,
+    /// A gatherer that needs adjacent resource tiles has none.
+    NoAdjacentResource,
+    /// The queue slot does not exist (a site has only slot 0).
+    InvalidSlot,
+    /// The building is still a construction site.
+    UnderConstruction,
+    /// The building has no gather slots.
+    NotAGatherNode,
+    /// The unit would take the player over the pop cap (alive plus queued).
+    PopCapReached,
+    /// This building's kind does not train that unit kind.
+    CannotTrainHere,
+    /// The building's training queue is full (`train_queue_max`).
+    QueueFull,
+    /// Every gather slot of the building is taken. (A worker that cannot
+    /// reach any tile beside the building is not a valid unit for it:
+    /// `NoValidUnits`.)
+    NoFreeSlot,
 }
 
 /// Something the presenter or a test may want to know about a tick. Events
@@ -236,7 +470,7 @@ pub enum SimEvent {
         /// Why.
         reason: RejectReason,
     },
-    /// A unit was created by `DebugSpawn` (training arrives in M3a).
+    /// A unit was created by training or by `DebugSpawn`.
     UnitSpawned {
         /// The unit.
         unit: UnitId,
@@ -251,6 +485,38 @@ pub enum SimEvent {
         /// The unit.
         unit: UnitId,
     },
+    /// A construction site was placed (or a building by debug placement).
+    BuildingPlaced {
+        /// The building.
+        building: BuildingId,
+    },
+    /// A site finished construction.
+    BuildingCompleted {
+        /// The building.
+        building: BuildingId,
+    },
+    /// A building or site was removed (a cancelled site).
+    BuildingRemoved {
+        /// The building.
+        building: BuildingId,
+    },
+    /// The territory field changed: a border source was added, moved or
+    /// removed.
+    TerritoryChanged,
+    /// A training queue entry was cancelled and refunded.
+    TrainingCancelled {
+        /// The building.
+        building: BuildingId,
+        /// The queue slot it held.
+        slot: u8,
+    },
+    /// A Town's border tier changed.
+    TownTierChanged {
+        /// The Town.
+        town: BuildingId,
+        /// Its new tier (1 or 2).
+        tier: u8,
+    },
 }
 
 /// Per-subsystem hashes for localising a divergence. Field order is the
@@ -262,9 +528,9 @@ pub struct SubHashes {
     pub units: u64,
     /// `BTreeMap<BuildingId, Building>`.
     pub buildings: u64,
-    /// Stockpiles and accumulators (M3a); placeholder.
+    /// Stockpiles and accumulators.
     pub economy: u64,
-    /// Territory field (M3a); placeholder.
+    /// Territory field.
     pub territory: u64,
     /// Researched techs and ages (M4a); placeholder.
     pub tech: u64,
@@ -336,6 +602,10 @@ pub(crate) struct State {
     pub(crate) map: Map,
     /// Path request queue and active search (derived cache inside is `serde(skip)`).
     pub(crate) pathing: Pathing,
+    /// Stockpiles and income accumulators.
+    pub(crate) economy: Economy,
+    /// Border strength per owner and the owner of every tile.
+    pub(crate) territory: TerritoryField,
 }
 
 /// Placeholder hashed for subsystems that do not exist yet.
@@ -388,9 +658,18 @@ pub struct Sim {
 impl Sim {
     /// Create a match. `ai` controls every slot with `is_ai == true`.
     /// Panics when `setup.map` is not in `rules` (the setup was built from
-    /// different rules).
+    /// different rules), or when the slots are not `PlayerId(0)`,
+    /// `PlayerId(1)`, ... in order (stockpiles and territory layers are
+    /// indexed by id).
     pub fn new(setup: MatchSetup, rules: Rules, ai: Box<dyn AiController>) -> Self {
-        let players = setup
+        for (i, slot) in setup.players.iter().enumerate() {
+            assert_eq!(
+                usize::from(slot.id.0),
+                i,
+                "player slots must be PlayerId(0), PlayerId(1), ... in order"
+            );
+        }
+        let players: Vec<Player> = setup
             .players
             .iter()
             .map(|s| Player {
@@ -404,8 +683,10 @@ impl Sim {
             .map(&setup.map)
             .unwrap_or_else(|| panic!("map {:?} is not in the loaded rules", setup.map));
         let map = Map::from_def(def);
-        let grid = SpatialGrid::new(&map);
-        let state = State {
+        let player_count = u8::try_from(players.len()).expect("at most 255 players");
+        let territory = TerritoryField::new(map.width(), map.height(), player_count);
+        let economy = Economy::new(players.len(), rules.resources.resources.len());
+        let mut state = State {
             tick: 0,
             seed: setup.seed,
             rng: rand_pcg::Pcg32::seed_from_u64(setup.seed),
@@ -417,7 +698,17 @@ impl Sim {
             commands_applied: 0,
             map,
             pathing: Pathing::new(rules.path_cache_entries, true),
+            economy,
+            territory,
         };
+        if setup.start == StartKind::Standard {
+            assert!(
+                setup.players.len() <= def.starts.len(),
+                "the map has a start for every player"
+            );
+            town::apply_standard_start(&mut state, &rules, def, rules.tick_rate_hz);
+        }
+        let grid = SpatialGrid::new(&state.map);
         Self {
             setup,
             rules,
@@ -450,7 +741,7 @@ impl Sim {
         // 2. Let the AI think over a read-only view, then queue its commands.
         let mut ai_batches: Vec<(PlayerId, Vec<Command>)> = Vec::new();
         {
-            let view = SimView::new(&self.state, &self.rules);
+            let view = SimView::new(&self.state, &self.rules, &self.setup);
             for player in &self.state.players {
                 if player.is_ai && !player.surrendered {
                     let out = self.ai.think(player.id, &view);
@@ -551,7 +842,12 @@ impl Sim {
             }
         }
 
-        // 6. Subsystems from M3a (economy, territory) tick here.
+        // 6. Economy and Towns: construction, training, jobs and idle
+        //    seeking, income.
+        construction::step(&mut self.state, &self.rules, tick, &mut self.events);
+        training::step(&mut self.state, &self.rules, tick, &mut self.events);
+        economy::jobs_step(&mut self.state, &self.rules, tick);
+        economy::income_step(&mut self.state, &self.rules);
 
         self.state.tick += 1;
     }
@@ -597,6 +893,8 @@ impl Sim {
                 repath_at,
             });
             u.post = None;
+            u.job = None;
+            u.seek_at = None;
             let from = self.state.map.tile_of(u.pos);
             let to = self.state.map.tile_of(goal);
             self.state.pathing.request(PathRequest {
@@ -647,6 +945,8 @@ impl Sim {
                     if let Some(u) = self.state.units.get_mut(&unit) {
                         u.order = None;
                         u.post = None;
+                        u.job = None;
+                        u.seek_at = None;
                     }
                     self.state.pathing.cancel(unit);
                 }
@@ -669,8 +969,6 @@ impl Sim {
                     self.reject(&pc, RejectReason::UnknownUnitKind);
                     return;
                 };
-                let speed = speed_per_tick(kind_def, self.rules.tick_rate_hz);
-                let radius = fx_from_x100(kind_def.radius_tiles_x100);
                 let center = self.state.map.tile_of(*at);
                 let tiles: Vec<Tile> = self
                     .state
@@ -683,36 +981,206 @@ impl Sim {
                 // remaining units are not spawned.
                 for tile in tiles {
                     let id = self.state.ids.unit();
-                    self.state.units.insert(
+                    let unit = Unit::spawn(
                         id,
-                        Unit {
-                            id,
-                            owner: *owner,
-                            kind: *kind,
-                            pos: self.state.map.center_of(tile),
-                            facing: FxVec2::from_ints(1, 0),
-                            radius,
-                            speed,
-                            order: None,
-                            post: None,
-                        },
+                        *owner,
+                        *kind,
+                        tile,
+                        kind_def,
+                        &self.state.map,
+                        self.rules.tick_rate_hz,
                     );
+                    self.state.units.insert(id, unit);
                     self.events.push(SimEvent::UnitSpawned { unit: id });
                 }
             }
-            Command::Attack { .. }
-            | Command::Gather { .. }
-            | Command::Build { .. }
-            | Command::Cancel { .. }
-            | Command::Train { .. }
-            | Command::Research { .. }
-            | Command::AdvanceAge { .. }
-            | Command::SetRally { .. } => {
-                // Handlers arrive in M3a/M4a. Until then the command is
-                // counted and advances the rng once, as in M0, so the hash
-                // keeps depending on the full command stream.
+            Command::Build { unit, kind, tile } => self.apply_build(&pc, *unit, *kind, *tile),
+            Command::Cancel { building, slot } => self.apply_cancel(&pc, *building, *slot),
+            Command::DebugPlaceBuilding {
+                owner,
+                kind,
+                tile,
+                complete,
+            } => self.apply_debug_place(&pc, *owner, *kind, *tile, *complete),
+            Command::DebugGrant {
+                owner,
+                resource,
+                amount,
+            } => {
+                if !self.setup.debug_commands {
+                    self.reject(&pc, RejectReason::DebugCommandsDisabled);
+                    return;
+                }
+                if !self.state.players.iter().any(|p| p.id == *owner) {
+                    self.reject(&pc, RejectReason::UnknownPlayer);
+                    return;
+                }
+                let r = usize::from(*resource);
+                if r >= self.rules.resources.resources.len() {
+                    self.reject(&pc, RejectReason::UnknownResource);
+                    return;
+                }
+                let mut amount_v = vec![0; self.rules.resources.resources.len()];
+                amount_v[r] = i64::from(*amount);
+                economy::refund(
+                    &self.rules,
+                    &mut self.state.economy.player_mut(*owner).stock,
+                    &amount_v,
+                );
+            }
+            Command::Gather { units, node } => {
+                match gather::validate_gather(&self.state, &self.rules, pc.player, units, *node) {
+                    Err(reason) => self.reject(&pc, reason),
+                    Ok(plan) => {
+                        let tick = self.state.tick;
+                        gather::apply_gather(&mut self.state, &self.rules, *node, &plan, tick);
+                    }
+                }
+            }
+            Command::Train { building, kind } => {
+                match training::validate_train(
+                    &self.state,
+                    &self.rules,
+                    pc.player,
+                    *building,
+                    *kind,
+                ) {
+                    Err(reason) => self.reject(&pc, reason),
+                    Ok(cost) => {
+                        training::enqueue(&mut self.state, pc.player, *building, *kind, cost)
+                    }
+                }
+            }
+            Command::SetRally { building, target } => {
+                match training::validate_rally(&self.state, pc.player, *building) {
+                    Err(reason) => self.reject(&pc, reason),
+                    Ok(()) => training::set_rally(&mut self.state, *building, *target),
+                }
+            }
+            Command::Attack { .. } | Command::Research { .. } | Command::AdvanceAge { .. } => {
+                // Handlers arrive in M4a. Until then the command is counted
+                // and advances the rng once, as in M0, so the hash keeps
+                // depending on the full command stream.
                 self.state.rng.next_u32();
                 self.reject(&pc, RejectReason::NotImplemented);
+            }
+        }
+    }
+
+    /// `Build`: validate (pure), then either resume an own site with this
+    /// builder or deduct the cost, place a new site and send the builder.
+    fn apply_build(&mut self, pc: &PlayerCommand, unit: UnitId, kind: BuildingKindId, tile: Tile) {
+        let tick = self.state.tick;
+        let def = self
+            .rules
+            .map(&self.setup.map)
+            .expect("setup map is in the rules");
+        match construction::validate_build(
+            &self.state,
+            &self.rules,
+            def,
+            pc.player,
+            unit,
+            kind,
+            tile,
+        ) {
+            Err(reason) => self.reject(pc, reason),
+            Ok(BuildPlan::Resume { site }) => {
+                construction::assign_builder(&mut self.state, &self.rules, unit, site, tick);
+            }
+            Ok(BuildPlan::New { cost, slots, town }) => {
+                economy::deduct(&mut self.state.economy.player_mut(pc.player).stock, &cost);
+                let id = construction::place(
+                    &mut self.state,
+                    &self.rules,
+                    pc.player,
+                    kind,
+                    tile,
+                    cost,
+                    slots,
+                    town,
+                );
+                self.events.push(SimEvent::BuildingPlaced { building: id });
+                construction::assign_builder(&mut self.state, &self.rules, unit, id, tick);
+            }
+        }
+    }
+
+    /// `Cancel`: slot 0 of an own site cancels it with a full refund; slot
+    /// `i` of an own complete building's training queue cancels that entry
+    /// and refunds what it paid. Anything else is `InvalidSlot`.
+    fn apply_cancel(&mut self, pc: &PlayerCommand, building: BuildingId, slot: u8) {
+        let Some(b) = self
+            .state
+            .buildings
+            .get(&building)
+            .filter(|b| b.owner == pc.player)
+        else {
+            self.reject(pc, RejectReason::UnknownBuilding);
+            return;
+        };
+        match b.construction {
+            Construction::Site { .. } if slot == 0 => {
+                construction::cancel_site(&mut self.state, &self.rules, building, &mut self.events);
+            }
+            Construction::Complete if usize::from(slot) < b.queue.len() => {
+                training::cancel_slot(
+                    &mut self.state,
+                    &self.rules,
+                    building,
+                    slot,
+                    &mut self.events,
+                );
+            }
+            _ => self.reject(pc, RejectReason::InvalidSlot),
+        }
+    }
+
+    /// `DebugPlaceBuilding`: gated like `DebugSpawn`; skips borders, limits
+    /// and cost, attributes like `Build`, and with `complete` finishes the
+    /// building at once.
+    fn apply_debug_place(
+        &mut self,
+        pc: &PlayerCommand,
+        owner: PlayerId,
+        kind: BuildingKindId,
+        tile: Tile,
+        complete: bool,
+    ) {
+        if !self.setup.debug_commands {
+            self.reject(pc, RejectReason::DebugCommandsDisabled);
+            return;
+        }
+        if !self.state.players.iter().any(|p| p.id == owner) {
+            self.reject(pc, RejectReason::UnknownPlayer);
+            return;
+        }
+        if self.rules.building_kind(kind.0).is_none() {
+            self.reject(pc, RejectReason::UnknownBuildingKind);
+            return;
+        }
+        let def = self
+            .rules
+            .map(&self.setup.map)
+            .expect("setup map is in the rules");
+        match construction::validate_debug_place(&self.state, &self.rules, def, owner, kind, tile) {
+            Err(reason) => self.reject(pc, reason),
+            Ok((slots, town)) => {
+                let paid = vec![0; self.rules.resources.resources.len()];
+                let id = construction::place(
+                    &mut self.state,
+                    &self.rules,
+                    owner,
+                    kind,
+                    tile,
+                    paid,
+                    slots,
+                    town,
+                );
+                self.events.push(SimEvent::BuildingPlaced { building: id });
+                if complete {
+                    construction::complete(&mut self.state, &self.rules, id, &mut self.events);
+                }
             }
         }
     }
@@ -733,8 +1201,8 @@ impl Sim {
         SubHashes {
             units: crate::hash::hash_value(&s.units),
             buildings: crate::hash::hash_value(&s.buildings),
-            economy: crate::hash::hash_value(&Empty),
-            territory: crate::hash::hash_value(&Empty),
+            economy: crate::hash::hash_value(&s.economy),
+            territory: crate::hash::hash_value(&s.territory),
             tech: crate::hash::hash_value(&Empty),
             pathing: crate::hash::hash_value(&(&s.pathing.queue, &s.pathing.active)),
             rng: crate::hash::hash_value(&s.rng),
@@ -798,7 +1266,7 @@ impl Sim {
 
     /// Read-only view of the current state.
     pub fn view(&self) -> SimView<'_> {
-        SimView::new(&self.state, &self.rules)
+        SimView::new(&self.state, &self.rules, &self.setup)
     }
 
     /// The match setup this sim was created from.

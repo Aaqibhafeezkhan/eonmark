@@ -14,7 +14,10 @@
 
 use rand_core::{Rng, SeedableRng};
 use sim::scenarios::{BENCH_CROSS_SEED, EAST, Stream, WEST};
-use sim::{Command, FxVec2, MatchSetup, PlayerCommand, PlayerId, Rules, Sim, UnitId, UnitKindId};
+use sim::{
+    BuildingId, BuildingKindId, Command, FxVec2, MatchSetup, PlayerCommand, PlayerId, Rules, Sim,
+    Tile, UnitId, UnitKindId,
+};
 
 /// A point in the river (impassable) north of the central ford. `bench
 /// --astar` searches towards it so the open set never reaches the goal and
@@ -206,7 +209,9 @@ fn selftest(tick: u32) -> Vec<PlayerCommand> {
 /// A seeded random command stream for `fuzz`: valid spawns, Moves and
 /// Stops for player 0, and invalid commands of every rejectable kind
 /// (unknown player, no valid units, unknown unit kind, not implemented,
-/// and everything player 1 issues after it surrenders). Returns the
+/// unknown building (`Cancel`, `Gather`, `Train`, `SetRally`), a `Build`
+/// by a unit that does not exist, and everything player 1 issues after it
+/// surrenders). Returns the
 /// per-tick commands and the `(player, seq)` keys the sim must reject.
 /// `movement` enables Move commands.
 pub fn random_commands(
@@ -327,6 +332,59 @@ pub fn random_commands(
             cmds.push(PlayerCommand::new(PlayerId(1), seq[1], Command::Surrender));
             seq[1] += 1;
             surrendered = true;
+        } else if (41..45).contains(&bad) {
+            // UnknownBuilding: BuildingId(0) is never allocated.
+            cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq[0],
+                Command::Cancel {
+                    building: BuildingId(0),
+                    slot: 0,
+                },
+            ));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
+        } else if (53..57).contains(&bad) {
+            // UnknownBuilding: a Train or a SetRally on BuildingId(0).
+            let cmd = if bad < 55 {
+                Command::Train {
+                    building: BuildingId(0),
+                    kind: UnitKindId(0),
+                }
+            } else {
+                Command::SetRally {
+                    building: BuildingId(0),
+                    target: FxVec2::from_ints(1, 1),
+                }
+            };
+            cmds.push(PlayerCommand::new(PlayerId(0), seq[0], cmd));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
+        } else if (49..53).contains(&bad) {
+            // UnknownBuilding: a Gather onto BuildingId(0).
+            cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq[0],
+                Command::Gather {
+                    units: vec![UnitId(1)],
+                    node: BuildingId(0),
+                },
+            ));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
+        } else if (45..49).contains(&bad) {
+            // NoValidUnits: a Build by UnitId(0).
+            cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq[0],
+                Command::Build {
+                    unit: UnitId(0),
+                    kind: BuildingKindId(0),
+                    tile: Tile::new(0, 0),
+                },
+            ));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
         }
         stream.push(cmds);
     }

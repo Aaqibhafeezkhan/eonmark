@@ -44,6 +44,9 @@
 //! start's component), completes trivially when start == goal, then consults
 //! the cache and finally runs or resumes the search. A `Suspended` result
 //! ends the tick's pathing work; the request stays at the head as `active`.
+//! If the cost grid changes while a search is suspended, the next service
+//! drops the search and requeues its request at the head, so the answer is
+//! always for the current grid (`SIM_VERSION` 5).
 //! The walk also stops as soon as the budget is spent, so the head request
 //! of a saturated tick stays queued instead of becoming an `active` search
 //! with zero expansions (`SIM_VERSION` 2).
@@ -162,6 +165,10 @@ pub struct AStarSearch {
     pub parent: Vec<u32>,
     /// Expansions performed so far across every `resume` call.
     pub expansions: u32,
+    /// `Map::cost_grid_generation` the search started on. A suspended search
+    /// whose grid has changed since is restarted by [`Pathing::service`]
+    /// rather than resumed (`SIM_VERSION` 5).
+    pub generation: u32,
 }
 
 impl PartialEq for AStarSearch {
@@ -169,6 +176,7 @@ impl PartialEq for AStarSearch {
         self.from == o.from
             && self.to == o.to
             && self.expansions == o.expansions
+            && self.generation == o.generation
             && self.closed == o.closed
             && self.g == o.g
             && self.parent == o.parent
@@ -201,6 +209,7 @@ impl AStarSearch {
             g,
             parent: vec![NO_PARENT; n],
             expansions: 0,
+            generation: map.cost_grid_generation(),
         }
     }
 
@@ -502,6 +511,19 @@ impl Pathing {
             self.cache.clear();
         }
         let mut done = Vec::new();
+
+        // 0. A search suspended on an older cost grid cannot be resumed: its
+        //    `closed`, `g` and `parent` arrays describe the old grid, so it
+        //    could return a path through a tile blocked since, and the cache
+        //    would store that path under the new generation. Put its request
+        //    back at the head of the queue (it is the oldest outstanding one)
+        //    so step 2 corrects start and goal and searches the new grid.
+        if let Some((req, _)) = self
+            .active
+            .take_if(|(_, search)| search.generation != generation)
+        {
+            self.request(req);
+        }
 
         // 1. The suspended search goes first; it already owns the queue head.
         if let Some((req, search)) = self.active.as_mut() {
@@ -1069,6 +1091,60 @@ mod tests {
         m.set_blocked(Tile::new(3, 4), true);
         assert!(p.service(&m, 100, 3).is_empty());
         assert!(p.cache.is_empty());
+    }
+
+    /// A search suspended on one cost grid and resumed after the grid
+    /// changed must answer for the new grid: the same path a fresh search
+    /// finds, cached under the new generation, never through a tile the
+    /// change blocked. Without the restart the resumed search keeps the
+    /// `closed` and `parent` arrays it built on the old grid.
+    #[test]
+    fn suspended_search_restarts_when_the_grid_changes() {
+        let mut m = Map::open(32, 32);
+        let from = Tile::new(0, 16);
+        let to = Tile::new(31, 16);
+        let mut p = Pathing::new(8, true);
+        p.request(req(0, 1, from, to));
+        // 25 expansions walk the straight row past column 16 and suspend.
+        assert!(
+            p.service(&m, 25, 0).is_empty(),
+            "suspends on a small budget"
+        );
+        assert!(
+            p.active
+                .as_ref()
+                .is_some_and(|(_, s)| s.closed[m.idx(Tile::new(20, 16))])
+        );
+
+        // A wall down column 16 with one gap at the top cuts the row the search
+        // already expanded through, so its parent chain crosses the wall.
+        for y in 1..32 {
+            m.set_blocked(Tile::new(16, y), true);
+        }
+        let done = p.service(&m, u32::MAX, 1);
+        let [(unit, Some(path))] = done.as_slice() else {
+            panic!("expected one completed path, got {done:?}");
+        };
+        assert_eq!(*unit, UnitId(1));
+        assert!(
+            path.iter().all(|t| m.passable(*t)),
+            "the resumed path crosses a tile the change blocked: {path:?}"
+        );
+        let (fresh, fresh_expansions) = run_full(&m, from, to);
+        assert_eq!(fresh, SearchStatus::Found(path.clone()));
+        let cached = p
+            .cache
+            .get((
+                tile_index(m.idx(from)),
+                tile_index(m.idx(to)),
+                m.cost_grid_generation(),
+            ))
+            .expect("cached under the new generation");
+        assert_eq!(&cached.path, path);
+        assert_eq!(
+            cached.expansions_used, fresh_expansions,
+            "a later cache hit charges what a fresh search on this grid costs"
+        );
     }
 
     #[test]

@@ -11,10 +11,12 @@ reads these files; it never defines gameplay constants of its own.
 
 | Path | Contents | Schema | Since |
 |------|----------|--------|-------|
-| `rules/rules.ron` | Match rules: tick rate, command delay, Yield Cap table, pop cap, town radii, attrition, annexation, path budget | `crates/rules/src/lib.rs` (`Rules`) | M0 |
+| `rules/rules.ron` | Match rules: tick rate, command delay, Yield Cap table, pop cap, cost ramps, training queue, idle-worker seeking, standard start, town radii and limit, attrition, annexation, path budget | `crates/rules/src/lib.rs` (`Rules`) | M0 |
 | `rules/resources.ron` | The four resources: Grain, Lumber, Ore, Lore | `crates/rules/src/resources.rs` | M0 |
+| `rules/units.ron` | Unit kinds (Yeoman, Scribe, Skirmisher): movement, class, cost and ramp, pop, training time, trainer, vision | `crates/rules/src/units.rs` (`Units`) | M1 (training fields M3a) |
+| `rules/buildings.ron` | The eight building kinds: footprint, cost, build time, hit points, vision, base yield, gather slots, per-Town limit, border radius | `crates/rules/src/buildings.rs` (`Buildings`) | M3a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
-| `rules/ages.ron`, `units.ron`, `buildings.ron`, `techs.ron`, `factions.ron` | Content tables | not yet written | M3a, M4a |
+| `rules/ages.ron`, `techs.ron`, `factions.ron` | Content tables | not yet written | M4a |
 | `rules/strings/en.ron` | UI strings | not yet written | M3b |
 | `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear | `crates/rules/src/visuals.rs` (`Visuals`) | M2 |
 | `ai/` | Build orders, personalities, difficulty table | not yet written | M5b |
@@ -65,6 +67,11 @@ exits 1 and prints the file path, the span and the field, for example:
 ```text
 error: data/rules/rules.ron: 7:3-7:18: Unexpected field named `tick_rate_hertz` in `Rules`, expected one of `rules_version`, `tick_rate_hz`, ... instead
 ```
+
+Every edit here changes `rules_hash`, so a change you keep also bumps
+`rules_version` in `rules/rules.ron` and re-records the golden fixtures
+with `just rerecord` before `cargo test -p sim`; the full data-only path is
+the worked example in [rules/README.md](rules/README.md).
 
 ## License
 

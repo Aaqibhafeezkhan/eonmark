@@ -2,7 +2,8 @@
 // crates/rules/src/visuals.rs (deny_unknown_fields). Keys are unit kind ids
 // from rules/units.ron; every kind listed there must appear here (the loader
 // rejects a missing or unknown key and names it). Loaded by rules::Rules::load,
-// so this file is part of rules_hash; the sim never reads it.
+// so this file is part of rules_hash; the sim never reads it. Building
+// kinds join in M3b.
 //
 // M2: Primitive(Capsule | Cuboid | Cylinder | Sphere), sized from the kind's
 //     radius_tiles_x100 and tinted with the owner's team colour.
@@ -11,5 +12,7 @@
 (
   units: {
     "yeoman": Primitive(Capsule),
+    "scribe": Primitive(Cylinder),
+    "skirmisher": Primitive(Cuboid),
   },
 )

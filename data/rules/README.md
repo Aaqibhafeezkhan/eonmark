@@ -1,13 +1,17 @@
 # data/rules/
 
 This directory is where every gameplay number lives. `rules.ron` holds the
-match-wide values, `resources.ron` describes the four resources and
-`units.ron` lists the unit kinds (how a kind is drawn is not a gameplay
-number and lives one level up, in `../visuals.ron`). All are
-loaded by `rules::Rules::load` and validated before the simulation starts;
-their content is part of `rules_hash`, so editing them without bumping
-`rules_version` makes `sim-cli verify` report `RULES CHANGED since recording`
-on older replays. Changing a number here needs no Rust.
+match-wide values, `resources.ron` describes the four resources,
+`units.ron` lists the unit kinds and `buildings.ron` the building kinds (how
+a kind is drawn is not a gameplay number and lives one level up, in
+`../visuals.ron`). All are loaded by `rules::Rules::load` in that order
+(`rules.ron`, `resources.ron`, `units.ron`, `buildings.ron`, then the checks
+that span files, `../visuals.ron` and `../maps/`) and validated before the
+simulation starts; their content is part of `rules_hash`, so editing them
+without bumping `rules_version` makes `sim-cli verify` report
+`RULES CHANGED since recording` on older replays. Changing a number here
+needs no Rust; see the worked example at the end for the full data-only
+path.
 
 ## Authoring convention: integers in deciseconds and tiles
 
@@ -38,33 +42,73 @@ when you can; the validator does not require it.
 
 | Field | Meaning | Value | Used from |
 |-------|---------|-------|-----------|
-| `rules_version` | Bump whenever golden replays are regenerated | 4 | M0 |
+| `rules_version` | Bump whenever golden replays are regenerated | 12 | M0 |
 | `tick_rate_hz` | Simulation ticks per second | 20 | M0 |
 | `cmd_delay_ticks` | A command issued at tick N applies at N + this | 2 | M0 |
 | `default_map` | Map for `MatchSetup::skirmish`; must exist under `data/maps/` | `"plains_1v1"` | M0 |
 | `yield_cap_table` | Income ceiling per resource per 30 s, by Trade level; strictly increasing | `[70, 100, 150, 200]` | M3a |
 | `pop_cap_base` | Population cap before Arms research | 25 | M3a |
 | `pop_cap_per_arms_level` | Added per Arms level | 25 | M4a |
+| `building_ramp_step_permille` | Building ramp: the `n`-th copy of a kind (0-based, counting the copies the player already owns, sites and the Seat included) costs `floor(base * (1000 + this * n) / 1000)` per resource. 200 makes the second Town 1.2x | 200 | M3a |
+| `military_ramp_step_permille` | Military ramp step: the multiplier is `1000 + this * T(k - 1)` permille, where `k = 1 + entries already queued at the player's buildings of the trainer kind` and `T(m) = m * (m + 1) / 2` | 100 | M3a |
+| `military_ramp_cap_permille` | Ceiling on the military multiplier (2250 = 2.25x base; with step 100 the 6th queued unit reaches it) | 2250 | M3a |
+| `train_queue_max` | Most entries one building's training queue holds | 5 | M3a |
+| `idle_seek_delay_ds` | An idle worker looks for a free gather slot on its own after this long (50 = 5 s = 100 ticks) | 50 | M3a |
+| `idle_seek_retry_ds` | An idle worker that found no free slot tries again after this long (50 = 100 ticks, equal to the delay) | 50 | M3a |
+| `standard_start` | What each player starts with besides the Seat (one Town of the `town: true` kind, centred on the map start): `units` per unit id and `stockpile` per resource id. The sim reads it in `Sim::new` when `MatchSetup.start` is `Standard`, the skirmish default; scenarios start `Empty` unless they set it | `units: {"yeoman": 5}`, `stockpile: {"grain": 150, "lumber": 150, "ore": 0, "lore": 0}` | M3a |
 | `town_radius_tiles` | Border radius of a new Town | 20 | M3a |
 | `town_radius_grown_tiles` | Radius once the Town has enough distinct building kinds | 24 | M3a |
 | `town_growth_distinct_buildings` | Distinct kinds needed to grow | 5 | M3a |
-| `town_limit_base` | Towns allowed before Statecraft research | 1 | M3a |
+| `town_limit_base` | Towns a player may own (sites included) before Statecraft research; the Seat counts. 2 is an owner decision so a second Town can be founded in M3a, before Statecraft exists; M4a adds 1 per Statecraft level (2, 3, 4, 5) | 2 | M3a |
 | `supply_radius_tiles` | A Supply Wain cancels attrition within this radius | 14 | M5a |
 | `attrition_interval_ds` | Deciseconds between 1 HP attrition pulses at Harrying I (32 = 3.2 s = 64 ticks) | 32 | M5a |
 | `annexation_ds` | Uncontested time before a Town at 0 HP flips | 600 | M5a |
-| `vision.unit_tiles`, `vision.building_tiles`, `vision.town_tiles` | Placeholder vision radii | 8, 10, 14 | M3a, M7 |
 | `path_budget_expansions` | A* expansions shared per tick | 4000 | M1 |
 | `path_cache_entries` | Bounded path cache size | 1024 | M1 |
 | `repath_interval_ds` | Deciseconds between periodic repaths while a unit is moving (30 = 3 s = 60 ticks) | 30 | M1 |
 | `separation_push_moving_div` | The separation push on a moving unit is capped at `speed / this` so steering keeps the upper hand | 2 | M1 |
 | `separation_push_idle_div` | The separation push on a unit without an order is capped at `speed / this`: parked units yield slowly to a passing crowd instead of jamming it | 8 | M1 |
 
-Validation: every count except `pop_cap_per_arms_level` and `rules_version` is > 0 (tightening those two is a listed good first issue), `yield_cap_table` is non-empty and strictly
-increasing, `town_radius_grown_tiles >= town_radius_tiles`, `default_map`
-resolves to a file, the three movement fields are > 0. Fields the design names for later milestones (ramping
-parameters, Harrying doubling, age-gap table, late-game pressure knobs,
-the 45-minute cap) are added when those milestones land, each with a
-validator rule.
+Of the M3a fields, the Town loop (the first M3a slice) reads
+`standard_start`, `building_ramp_step_permille`, `yield_cap_table` (at
+Trade level 0), `town_limit_base` and `town_radius_tiles`. Gathering
+(`rules_version` 9) adds `idle_seek_delay_ds`, `idle_seek_retry_ds`,
+`town_growth_distinct_buildings` and `town_radius_grown_tiles`. Training
+(`rules_version` 10) adds `pop_cap_base` (through `Rules::pop_cap` at Arms
+level 0), `train_queue_max`, `military_ramp_step_permille` and
+`military_ramp_cap_permille`, and the `standard_start` units count toward
+the Yeoman's per-unit ramp, so the first trained Yeoman costs 25 Grain.
+
+The M0 `vision` block (`unit_tiles`, `building_tiles`, `town_tiles`) was
+removed at `rules_version` 6: vision is now `vision_tiles` on every kind in
+`units.ron` and `buildings.ron`, so an old file that still has the block
+fails to load naming `vision`.
+
+Validation: every plain count, radius and timer in the table is > 0
+(`rules_version` and `pop_cap_per_arms_level` included) and `tick_rate_hz`
+is at most 1000; `yield_cap_table` is non-empty and strictly increasing;
+`town_radius_grown_tiles >= town_radius_tiles` and at most 60, so the
+radius plus three Statecraft levels stays within 64 tiles; `default_map`
+resolves to a file. The ramp, queue and idle-seek fields have ranges
+instead: `building_ramp_step_permille` and `military_ramp_step_permille` in
+`0..=10000`, `military_ramp_cap_permille` in `1000..=100000`,
+`train_queue_max` in `1..=255`, `idle_seek_delay_ds` and
+`idle_seek_retry_ds` in `1..=36000` (one hour).
+
+Checks that need the other files run once `buildings.ron` is loaded, and
+name `rules.ron` and the field:
+
+- `town_growth_distinct_buildings` is at most the number of non-Town kinds
+  in `buildings.ron` (7).
+- `standard_start.units`: every key is a unit id in `units.ron`, every
+  count is in `1..=255`, and the units' total `pop` fits `pop_cap_base`.
+- `standard_start.stockpile`: lists every resource id in `resources.ron`,
+  zeros included, and no other key; each value is at most the resource's
+  `stockpile_cap` (999 for Lore) and at most 1000000.
+
+Fields the design names for later milestones (Harrying doubling, age-gap
+table, late-game pressure knobs, the 45-minute cap) are added when those
+milestones land, each with a validator rule.
 
 ## resources.ron
 
@@ -74,7 +118,7 @@ A list of resources in display order. Each entry:
 |-------|---------|
 | `id` | Lowercase identifier other files use (`grain`, `lumber`, `ore`, `lore`) |
 | `name` | Display name |
-| `gathered_from` | Building ids that produce it; cross-checked against `buildings.ron` from M3a |
+| `gathered_from` | Building ids that produce it; non-empty. Cross-checked both ways against `buildings.ron`: as a set it must equal the kinds whose `base_yield` or `gather.resource` names this resource, so a missing id and an extra id both fail with `resources[i].gathered_from` |
 | `role` | One sentence on what it pays for |
 | `yield_capped` | `true` if income flatlines at `yield_cap_table` |
 | `stockpile_cap` | `Some(n)` hard ceiling; required when `yield_capped` is `false` |
@@ -84,50 +128,184 @@ not tradeable.
 
 ## units.ron
 
-A list of unit kinds; the list index is the sim's `UnitKindId`. M1 ships
-one kind, `yeoman` (index 0). Combat stats, costs and trainer buildings are
-added in M3a / M4a, each with a validator rule. How the movement fields are
-used is specified in `docs/design/pathing.md` ("Movement step"): speed is
-converted once at spawn to tiles per tick (`x100 / (100 * tick_rate_hz)`),
-the radius to fixed-point tiles; the arrive, separation and return-to-post
-radii are read per tick.
+A list of unit kinds; the list index is the sim's `UnitKindId`. M1 shipped
+one kind, `yeoman`, which stays at index 0 (scenarios and tests spawn
+`UnitKindId(0)`). M3a adds `scribe` and `skirmisher` and the training
+fields (`class` to `vision_tiles` below); combat stats are added in M4a,
+each with a validator rule. The Skirmisher is in the data from M3a by
+owner decision (the M3a military ramp test queues Skirmishers); until M4a
+gives it combat stats it moves like a Yeoman. M4a's count of 8 unit kinds
+still holds: Yeoman, Scribe and six military kinds, the Skirmisher among
+them.
 
-| Field | Meaning | Yeoman |
-|-------|---------|--------|
-| `id` | Lowercase identifier other files use | `"yeoman"` |
-| `name` | Display name | `"Yeoman"` |
-| `speed_tiles_per_s_x100` | Movement speed in tiles per second, times 100; converted once to tiles per tick at spawn | 180 (1.8 tiles/s, 0.09 tiles/tick at 20 Hz) |
-| `radius_tiles_x100` | Collision radius in tiles, times 100 | 35 |
-| `arrive_radius_tiles_x100` | The unit has arrived (order cleared, `UnitArrived` emitted) within this radius of its final waypoint | 25 |
-| `arrive_slowdown_radius_tiles_x100` | Arrival steering slows the unit linearly inside this radius of its final waypoint; at least the arrive radius | 50 |
-| `waypoint_radius_tiles_x100` | A non-final waypoint counts as reached within this radius (50 = half a tile) | 50 |
-| `separation_tiles_x100` | Margin added to the sum of two radii before separation pushes neighbours apart | 10 |
-| `return_to_post_radius_tiles_x100` | An arrived unit pushed farther than this from the tile centre it arrived at (its post) walks straight back to it and is parked again once within the arrive radius; at least the arrive radius; `100` (one tile) when the field is absent | 100 |
+How the movement fields are used is specified in
+`docs/design/pathing.md` ("Movement step"): speed is converted once at
+spawn to tiles per tick (`x100 / (100 * tick_rate_hz)`), the radius to
+fixed-point tiles; the arrive, separation and return-to-post radii are read
+per tick. Of the training fields the sim reads `builder` from the M3a Town
+loop (a `Build` by a kind without it is rejected with `NotABuilder`), and
+training (`rules_version` 10) reads `cost`, `ramp`, `pop`, `train_time_ds`
+and `trainer`. So far `class` is checked only by the validator (no
+`Military` ramp on a `Civilian`), and `vision_tiles` is read in M7.
+
+| Field | Meaning | Yeoman | Scribe | Skirmisher |
+|-------|---------|--------|--------|------------|
+| `id` | Lowercase identifier other files use | `"yeoman"` | `"scribe"` | `"skirmisher"` |
+| `name` | Display name | `"Yeoman"` | `"Scribe"` | `"Skirmisher"` |
+| `speed_tiles_per_s_x100` | Movement speed in tiles per second, times 100; converted once to tiles per tick at spawn | 180 (1.8 tiles/s, 0.09 tiles/tick at 20 Hz) | 180 | 180 |
+| `radius_tiles_x100` | Collision radius in tiles, times 100 | 35 | 35 | 35 |
+| `arrive_radius_tiles_x100` | The unit has arrived (order cleared, `UnitArrived` emitted) within this radius of its final waypoint | 25 | 25 | 25 |
+| `arrive_slowdown_radius_tiles_x100` | Arrival steering slows the unit linearly inside this radius of its final waypoint; at least the arrive radius | 50 | 50 | 50 |
+| `waypoint_radius_tiles_x100` | A non-final waypoint counts as reached within this radius (50 = half a tile) | 50 | 50 | 50 |
+| `separation_tiles_x100` | Margin added to the sum of two radii before separation pushes neighbours apart | 10 | 10 | 10 |
+| `return_to_post_radius_tiles_x100` | An arrived unit pushed farther than this from the tile centre it arrived at (its post) walks straight back to it and is parked again once within the arrive radius; at least the arrive radius; `100` (one tile) when the field is absent | 100 | 100 | 100 |
+| `class` | `Civilian`, `Infantry`, `Cavalry`, `Siege` or `Support`. Civilians gather and build; every other class is military and may use the `Military` ramp | `Civilian` | `Civilian` | `Infantry` |
+| `cost` | Base training cost per resource id; zero entries are omitted | `{"grain": 20}` | `{"grain": 30}` | `{"grain": 40}` |
+| `ramp` | How the cost grows. `Flat` (the default when absent) is always the base. `PerUnit({...})` adds these amounts per unit of this kind the player has alive or queued. `Military` multiplies the base by the military ramp of the trainer kind's shared queue (`military_ramp_*` in `rules.ron`) | `PerUnit({"grain": 1})` | absent (`Flat`) | `Military` |
+| `pop` | Population taken from the cap, charged when the unit is queued | 1 | 1 | 1 |
+| `train_time_ds` | Training time at the trainer | 120 (12 s) | 150 | 150 |
+| `trainer` | Building id in `buildings.ron` that trains the kind | `"town"` | `"scriptorium"` | `"muster_hall"` |
+| `builder` | Whether the kind can construct buildings; `false` when absent | `true` | absent | absent |
+| `vision_tiles` | Vision radius in tiles (fog of war, M7) | 8 | 8 | 8 |
+
+The costs come from the pure functions in `crates/rules/src/costs.rs`
+(`unit_cost`, `building_cost`), which the sim, the HUD and the bot share.
+The Yeoman's `n` counts every Yeoman the player has alive or queued, the
+five from the standard start included, so the first trained Yeoman costs
+20 + 5 = 25 Grain (the M3a reading of `docs/design/economy.md`).
 
 Validation: at least one kind, ids unique and lowercase, `speed_tiles_per_s_x100 > 0`,
 `radius_tiles_x100 > 0`, `waypoint_radius_tiles_x100 > 0`,
 `arrive_slowdown_radius_tiles_x100 >= arrive_radius_tiles_x100`,
 `return_to_post_radius_tiles_x100 > 0` and `>= arrive_radius_tiles_x100`, every `_x100`
-field at most 100000. Errors name the file and `units[i].<field>`.
+field at most 100000. Training fields: every `cost` and `PerUnit` key is a
+resource id in `resources.ron` with a value in `1..=100000`; `Military` is
+rejected on a `Civilian` kind; `pop` is in `0..=100`, `train_time_ds` in
+`1..=36000`, `vision_tiles` in `1..=64`; `trainer` must name a building
+kind in `buildings.ron` (checked once that file is loaded, but reported
+against `units.ron`). Every kind also needs an entry in `../visuals.ron`.
+Errors name the file and `units[i].<field>`.
 
-## Worked example: slower attrition
+## buildings.ron
 
-To make attrition tick every 4 seconds instead of 3.2:
+A list of building kinds, added in M3a; the list index is the sim's
+`BuildingKindId`, but code looks kinds up by `id`, never by index. Costs,
+yields and rates are integers per resource id; rates are per 30 s (600
+ticks at 20 Hz); footprints and radii are in tiles. A building's tile is
+the north-west corner of its footprint. The sim reads it from the M3a Town
+loop: `town`, the footprint, `cost` with the building ramp,
+`build_time_ds`, `hp`, `base_yield`, `max_per_town`, `gather.slots`
+(counted at placement) and `border_radius_tiles` (tests reach a complete
+Watchtower only through `DebugPlaceBuilding` until a `Build` of one is
+tested). Gathering (`rules_version` 9) reads the rest of `gather`:
+`resource`, `worker` (which unit kind may take the slots and seeks them
+when idle) and `rate_per_worker` (credited per worked slot). `vision_tiles`
+is read in M7.
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Lowercase identifier other files use (`town`, `croft`, ...) |
+| `name` | Display name |
+| `town` | `true` for exactly one kind, the Town: the border source every player starts with (the Seat) and founds more of, bounded by `town_limit_base` in `rules.ron`. `false` when absent |
+| `width_tiles`, `height_tiles` | Footprint in tiles, x and y |
+| `cost` | Base cost per resource id, before the building ramp (`building_ramp_step_permille` in `rules.ron`); zero entries are omitted |
+| `build_time_ds` | Construction time with one builder at work |
+| `hp` | Hit points of the complete building |
+| `vision_tiles` | Vision radius in tiles (fog of war, M7) |
+| `base_yield` | Income per resource id per 30 s with no worker, while complete; empty when absent |
+| `gather` | `Some((resource, worker, rate_per_worker, slots))` for a gathering building, `None` when absent. `resource` is the resource id the workers produce, `worker` the unit id that works the slots (`yeoman`, `scribe`), `rate_per_worker` the income per worked slot per 30 s |
+| `gather.slots` | `Fixed(n)`: always `n` slots. `Adjacent(terrain: Forest \| Mountain, max: n)`: one slot per tile of that terrain sharing an edge or a corner with the footprint, at most `n`, counted when the building is placed; a placement with none is rejected |
+| `max_per_town` | `Some(n)`: at most `n` of this kind per Town (each building counts for its nearest own Town), sites included. `None` when absent. The Croft limit lives here |
+| `border_radius_tiles` | `Some(r)`: the complete building is a border source of radius `r` (the Watchtower). `None` when absent. The Town's radius is `town_radius_tiles` in `rules.ron` instead |
+
+| Kind (`id`) | Footprint | Cost | `build_time_ds` | HP | Vision | Base yield per 30 s | Gather (resource, worker, rate, slots) | Other |
+|---|---|---|---|---|---|---|---|---|
+| Town (`town`) | 3x3 | 100 Lumber | 600 (60 s) | 2000 | 14 | 10 Grain, 10 Lumber | none | `town: true` |
+| Croft (`croft`) | 2x2 | 30 Lumber | 150 | 300 | 6 | none | Grain, Yeoman, 10, `Fixed(1)` | `max_per_town: Some(5)` |
+| Lumber Yard (`lumber_yard`) | 2x2 | 50 Lumber | 200 | 400 | 6 | none | Lumber, Yeoman, 10, `Adjacent(terrain: Forest, max: 6)` | |
+| Ore Pit (`ore_pit`) | 2x2 | 50 Lumber | 200 | 400 | 6 | none | Ore, Yeoman, 10, `Adjacent(terrain: Mountain, max: 6)` | |
+| Scriptorium (`scriptorium`) | 3x3 | 80 Lumber | 300 | 600 | 8 | 10 Lore | Lore, Scribe, 5, `Fixed(3)` | trains the Scribe |
+| Muster Hall (`muster_hall`) | 3x3 | 100 Lumber | 400 | 800 | 8 | none | none | trains the Skirmisher |
+| Watchtower (`watchtower`) | 1x1 | 40 Ore | 300 | 500 | 12 | none | none | `border_radius_tiles: Some(2)` |
+| Engine Yard (`engine_yard`) | 3x3 | 150 Lumber | 500 | 900 | 8 | none | none | |
+
+With the 200 permille building ramp the second Town costs 120 Lumber
+(100 * 1.2). That plus one 30 Lumber Croft is exactly the 150 starting
+Lumber, which the M3a economy fixture relies on, so a change to either cost
+or to the ramp step has to keep that sum within the starting Lumber or
+update the fixture's build order. A Watchtower radius of 2 claims a 3x3
+block around the tower; see `docs/design/territory.md` ("Sources and
+kernels").
+
+Validation (`Buildings::validate`, then the checks that span files):
+
+- At least one kind and at most 65535; exactly one kind has `town: true`.
+- Ids unique, non-empty, lowercase ascii with underscores; names non-empty.
+- `width_tiles` and `height_tiles` in `1..=8`, `build_time_ds` in
+  `1..=36000`, `hp` in `1..=1000000`, `vision_tiles` in `1..=64`.
+- Every `cost` and `base_yield` key is a resource id in `resources.ron`
+  with a value in `1..=100000` (omit zero entries).
+- `gather.resource` is a resource id, `gather.worker` a unit id in
+  `units.ron`, `rate_per_worker` in `1..=100000`; `Fixed(n)` and
+  `Adjacent` `max` in `1..=255`; `Adjacent` `terrain` is `Forest` or
+  `Mountain`.
+- `max_per_town` in `1..=255` and `border_radius_tiles` in `1..=64`;
+  neither is allowed on the Town kind, which the town limit and
+  `town_radius_tiles` in `rules.ron` cover instead.
+- A border source (the Town, or any kind with `border_radius_tiles`) has
+  odd width and height, so its centre is a tile.
+- Across files: every `resources.ron` `gathered_from` equals the kinds that
+  yield or gather that resource (both ways); every unit's `trainer` names a
+  kind here; `town_growth_distinct_buildings` is at most the number of
+  non-Town kinds; every start of every map fits the Town footprint centred
+  on it, in bounds and all grass (the error names `starts[i]` in the map's
+  file).
+
+Errors name the file and `buildings[i].<field>`, for example
+`buildings[1].cost["timber"]`.
+
+## Worked example: a data-only change (slower attrition)
+
+To make attrition tick every 4 seconds instead of 3.2, edit `rules.ron`:
 
 ```text
 attrition_interval_ds: 40,
 ```
 
-Then bump `rules_version` (replays recorded under the old value will report
-`RULES CHANGED since recording` from M1) and run:
+Any RON edit changes `rules_hash`, so without the next steps every golden
+fixture reports `RULES CHANGED since recording` and `cargo test -p sim`
+fails. The data-only path is the same for every RON file and touches no
+Rust:
+
+1. Edit the value, as above.
+2. Bump `rules_version` in `rules.ron` (12 to 13) and put the one-line reason
+   in the commit message.
+3. Check the data, re-record the golden fixtures and run the sim tests:
 
 ```bash
 cargo run -p sim-cli -- data-check data
+just rerecord
+cargo test -p sim
 ```
 
-Expected output starts with `OK rules_version=5` (the repository is at 4). A typo such as
-`attrition_interval_s` fails with the file path, the span and the field:
+`data-check` prints
+`OK rules_version=13 rules_hash=0x<16 hex> resources=4 units=3 buildings=8 maps=plains_1v1`
+(the repository is at 12; the hash is new because a file changed).
+`just rerecord` runs `scripts/rerecord_fixtures.sh`: it re-records every
+fixture under `crates/sim/tests/fixtures/` in release, writes each `.hash`
+from an independent `sim-cli verify` OK line, then fails if a fixture
+differs from the merge base with main while the working-tree
+`rules_version` is not larger than the base's (CI runs the same check,
+`scripts/check_fixture_policy.sh`, on the commits of every pull request).
+While the sim does not read the edited value yet (attrition arrives
+in M5a) every `.hash` stays the same and only the replay headers change;
+once it does, the `.hash` files change too, and the bump in the same commit
+is what makes that legal. `just rerecord move_500 group_spiral` re-records
+only the fixtures named.
+
+A typo such as `attrition_interval_s` fails `data-check` with the file
+path, the span and the field:
 
 ```text
-error: data/rules/rules.ron: 24:3-24:23: Unexpected field named `attrition_interval_s` in `Rules`, expected one of `rules_version`, ... instead
+error: data/rules/rules.ron: 44:3-44:23: Unexpected field named `attrition_interval_s` in `Rules`, expected one of `rules_version`, ... instead
 ```

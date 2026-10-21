@@ -565,6 +565,8 @@ mod tests {
             speed: Fx::from_ratio(9, 100),
             order: None,
             post: None,
+            job: None,
+            seek_at: None,
         }
     }
 

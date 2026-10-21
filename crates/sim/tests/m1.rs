@@ -235,10 +235,12 @@ fn return_to_post_converges_100_units_and_settles() {
     // ranks behind; return to post (`units.ron`,
     // `return_to_post_radius_tiles_x100`) walks them back. After 3000
     // ticks every unit is within 3 tiles of its own spiral target and the
-    // block holds still: the `units` sub-hash is constant over the last 100
-    // ticks (no perpetual motion between neighbours; the whole-state hash
-    // cannot be constant because it covers the tick counter) and pathing is
-    // idle (no returning unit is stuck asking for paths).
+    // block holds still: every unit's position, post and order are
+    // constant over the last 100 ticks (no perpetual motion between
+    // neighbours; neither the whole-state hash nor the `units` sub-hash can
+    // be constant, since they cover the tick counter and the idle workers'
+    // seek timers) and pathing is idle (no returning unit is stuck asking
+    // for paths).
     let click = FxVec2::from_ints(39, 64);
     let mut sim = scenario(21);
     let delay = sim.setup().cmd_delay;
@@ -264,7 +266,14 @@ fn return_to_post_converges_100_units_and_settles() {
     for t in sim.tick()..total {
         sim.step(&[]);
         if t >= total - settle {
-            hashes.push(sim.sub_hashes().units);
+            // Positions, posts and orders only: idle Yeomen rewrite their
+            // work-seeking timer (`seek_at`) every retry interval (M3a).
+            let still: Vec<_> = sim
+                .view()
+                .units()
+                .map(|u| (u.id, u.pos, u.post, u.order.clone()))
+                .collect();
+            hashes.push(sim::hash::hash_value(&still));
         }
     }
     assert_eq!(hashes.len(), settle as usize);
@@ -330,15 +339,74 @@ fn restore_rebuilds_caches() {
     assert_eq!(a.sub_hashes(), b.sub_hashes());
 }
 
-/// A random command stream over the scenario: spawns, moves, stops.
+/// A random command stream over the scenario: spawns, moves, stops, and
+/// (from M3a) Croft sites placed and cancelled around a complete P0 Town,
+/// so the cost grid changes while searches are suspended, plus Gathers
+/// onto three complete Crofts placed at tick 0 (idle Yeomen also take free
+/// slots there on their own), Yeomen trained at the Town and rally points
+/// set on it, so slots, stand-tile paths, worked income, training and
+/// rally walks run inside the determinism and cache-transparency
+/// proptests.
 fn random_commands(seed: u64, ticks: u32) -> Vec<Vec<PlayerCommand>> {
     use rand_core::{Rng, SeedableRng};
+    let rules = load_rules();
+    let (town, _) = rules.building_kind_by_id("town").unwrap();
+    let (croft, _) = rules.building_kind_by_id("croft").unwrap();
+    let lumber = u8::try_from(rules.resource_index("lumber").unwrap()).unwrap();
+    let grain = u8::try_from(rules.resource_index("grain").unwrap()).unwrap();
     let mut rng = rand_pcg::Pcg32::seed_from_u64(seed);
     let mut out = Vec::new();
     let mut seq = 0u32;
     let mut spawned: u32 = 0;
-    for _ in 0..ticks {
+    for t in 0..ticks {
         let mut tick_cmds = Vec::new();
+        if t == 0 {
+            // The scenario starts empty: a complete P0 Town centred on WEST
+            // gives P0 borders to build in, and Lumber pays for the sites.
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::DebugPlaceBuilding {
+                    owner: PlayerId(0),
+                    kind: sim::BuildingKindId(town),
+                    tile: Tile::new(23, 63),
+                    complete: true,
+                },
+            ));
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq + 1,
+                Command::DebugGrant {
+                    owner: PlayerId(0),
+                    resource: lumber,
+                    amount: 100_000,
+                },
+            ));
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq + 2,
+                Command::DebugGrant {
+                    owner: PlayerId(0),
+                    resource: grain,
+                    amount: 100_000,
+                },
+            ));
+            seq += 3;
+            // BuildingId(2..=4): complete Crofts inside the Town's border.
+            for x in [28, 31, 34] {
+                tick_cmds.push(PlayerCommand::new(
+                    PlayerId(0),
+                    seq,
+                    Command::DebugPlaceBuilding {
+                        owner: PlayerId(0),
+                        kind: sim::BuildingKindId(croft),
+                        tile: Tile::new(x, 58),
+                        complete: true,
+                    },
+                ));
+                seq += 1;
+            }
+        }
         let roll = rng.next_u32() % 100;
         if roll < 10 && spawned < 200 {
             let x = i32::try_from(rng.next_u32() % 128).unwrap();
@@ -372,10 +440,118 @@ fn random_commands(seed: u64, ticks: u32) -> Vec<Vec<PlayerCommand>> {
                 Command::Stop { units },
             ));
             seq += 1;
+        } else if roll < 55 && spawned > 0 {
+            let x = u16::try_from(24 - 18 + rng.next_u32() % 37).unwrap();
+            let y = u16::try_from(64 - 18 + rng.next_u32() % 37).unwrap();
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::Build {
+                    unit: UnitId(1 + rng.next_u32() % spawned.max(1)),
+                    kind: sim::BuildingKindId(croft),
+                    tile: Tile::new(x, y),
+                },
+            ));
+            seq += 1;
+        } else if roll < 58 {
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::Cancel {
+                    building: sim::BuildingId(1 + rng.next_u32() % 8),
+                    slot: 0,
+                },
+            ));
+            seq += 1;
+        } else if roll < 62 && spawned > 0 {
+            let n = 1 + rng.next_u32() % 3;
+            let units = (0..n)
+                .map(|_| UnitId(1 + rng.next_u32() % spawned.max(1)))
+                .collect();
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::Gather {
+                    units,
+                    node: sim::BuildingId(1 + rng.next_u32() % 8),
+                },
+            ));
+            seq += 1;
+        } else if roll < 65 {
+            // Train at the Town (BuildingId(1)); PopCapReached once the
+            // spawns pass the cap, which is a fine rejection too.
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::Train {
+                    building: sim::BuildingId(1),
+                    kind: UnitKindId(0),
+                },
+            ));
+            seq += 1;
+        } else if roll < 67 {
+            let x = i32::try_from(rng.next_u32() % 128).unwrap();
+            let y = i32::try_from(rng.next_u32() % 128).unwrap();
+            tick_cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq,
+                Command::SetRally {
+                    building: sim::BuildingId(1),
+                    target: FxVec2::from_ints(x, y),
+                },
+            ));
+            seq += 1;
         }
         out.push(tick_cmds);
     }
     out
+}
+
+/// The random stream really changes the cost grid, gathers and trains:
+/// over a few seeds it places sites (generation bumps) and cancels some,
+/// units take gather slots (by Gather or idle seeking) and work them, and
+/// the Town trains, so the two proptests below exercise those paths.
+#[test]
+fn random_commands_place_and_cancel_sites() {
+    let (mut placed, mut removed, mut gathering, mut worked, mut trained) = (0, 0, 0, 0, 0);
+    for seed in 0..8 {
+        let stream = random_commands(seed, 300);
+        let mut sim = scenario(seed);
+        for cmds in &stream {
+            sim.step(cmds);
+            for e in sim.drain_events() {
+                match e {
+                    sim::SimEvent::BuildingPlaced { .. } => placed += 1,
+                    sim::SimEvent::BuildingRemoved { .. } => removed += 1,
+                    _ => {}
+                }
+            }
+            let view = sim.view();
+            gathering += view
+                .units()
+                .filter(|u| matches!(u.job, Some(sim::Job::Gather { .. })))
+                .count();
+            worked += (2..=4)
+                .map(|b| {
+                    view.worked_slots(sim::BuildingId(b))
+                        .map_or(0, |(w, _, _)| u32::from(w))
+                })
+                .sum::<u32>();
+            if view
+                .building(sim::BuildingId(1))
+                .is_some_and(|b| b.queue.iter().any(|e| e.progress > 0))
+            {
+                trained += 1;
+            }
+        }
+    }
+    // Four placements per seed are the debug Town and Crofts. The other
+    // counts are summed over every tick of every seed.
+    assert!(placed > 8 * 4 + 4, "sites placed: {}", placed - 8 * 4);
+    assert!(removed > 0, "sites cancelled: {removed}");
+    assert!(gathering > 0, "unit-ticks with a gather job: {gathering}");
+    assert!(worked > 0, "worked slot-ticks: {worked}");
+    assert!(trained > 0, "ticks with training in progress: {trained}");
 }
 
 fn run_with(seed: u64, stream: &[Vec<PlayerCommand>], cache: bool) -> Vec<u64> {
@@ -524,6 +700,9 @@ proptest! {
     /// request stream through a cache-enabled and a cache-disabled `Pathing`
     /// completes the same requests with the same paths on every tick, leaves
     /// the same budget remainder, and serialises to the same hashed bytes.
+    /// The cost grid changes under both now and then (a short wall toggled
+    /// on or off, as buildings will from M3a), including while a search is
+    /// suspended.
     #[test]
     fn path_cache_is_transparent_at_the_pathing_level(
         seed in any::<u64>(),
@@ -531,7 +710,7 @@ proptest! {
         budget in 20u32..1500,
     ) {
         use rand_core::{Rng, SeedableRng};
-        let map = shared_plains();
+        let mut map = shared_plains().clone();
         let mut rng = rand_pcg::Pcg32::seed_from_u64(seed);
         let rnd_tile = |rng: &mut rand_pcg::Pcg32| {
             Tile::new(
@@ -573,10 +752,19 @@ proptest! {
             if !on.cache.is_empty() {
                 hits_possible += 1;
             }
+            if rng.next_u32() % 6 == 0 {
+                // Toggle a 1 x 5 wall; both runs see the same grid.
+                let t = rnd_tile(&mut rng);
+                let block = map.passable(t);
+                for dy in 0..5u16 {
+                    let w = Tile::new(t.x, t.y.saturating_add(dy).min(127));
+                    map.set_blocked(w, block);
+                }
+            }
             let mut ra = budget;
             let mut rb = budget;
-            let a = on.service_budgeted(map, &mut ra, tick);
-            let b = off.service_budgeted(map, &mut rb, tick);
+            let a = on.service_budgeted(&map, &mut ra, tick);
+            let b = off.service_budgeted(&map, &mut rb, tick);
             prop_assert_eq!(&a, &b, "completed requests differ at tick {}", tick);
             prop_assert_eq!(ra, rb, "budget remainder differs at tick {}", tick);
             prop_assert_eq!(
@@ -684,13 +872,17 @@ fn dist_sq_i64_map_corners() {
 #[test]
 fn debug_spawn_is_rejected_in_a_skirmish_and_accepted_in_a_scenario() {
     let rules = load_rules();
+    let start: u32 = rules.standard_start.units.values().sum();
     let mut skirmish = Sim::new(MatchSetup::skirmish(&rules, 1), rules, Box::new(NoAi));
     let delay = skirmish.setup().cmd_delay;
+    // A skirmish begins from the standard start: both players' start units.
+    let before = skirmish.view().unit_count();
+    assert_eq!(before, usize::try_from(2 * start).unwrap());
     skirmish.step(&[spawn(0, 0, WEST, 3)]);
     for _ in 0..delay {
         skirmish.step(&[]);
     }
-    assert_eq!(skirmish.view().unit_count(), 0);
+    assert_eq!(skirmish.view().unit_count(), before, "DebugSpawn adds none");
     let events = skirmish.drain_events();
     assert!(
         events.iter().any(|e| matches!(

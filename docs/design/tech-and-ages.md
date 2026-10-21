@@ -25,10 +25,12 @@ Resulting values by level:
 
 | Level | Pop cap (Arms) | Town limit (Statecraft) | Border push (Statecraft) | Yield Cap (Trade) | Research cost factor (Letters) |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 25 | 1 | +0 | 70 | 1.000 |
-| 1 | 50 | 2 | +1 | 100 | 0.900 |
-| 2 | 75 | 3 | +2 | 150 | 0.810 |
-| 3 | 100 | 4 | +3 | 200 | 0.729 |
+| 0 | 25 | 2 | +0 | 70 | 1.000 |
+| 1 | 50 | 3 | +1 | 100 | 0.900 |
+| 2 | 75 | 4 | +2 | 150 | 0.810 |
+| 3 | 100 | 5 | +3 | 200 | 0.729 |
+
+The Town limit starts at 2 (`town_limit_base` in `rules.ron`; the Seat counts), by owner decision, so a second Town needs no Statecraft research; each Statecraft level adds 1 (see [towns.md](towns.md)).
 
 Tech costs and research times are not fixed by the design; they are set in `techs.ron` at M4a. Every tech costs Lore; Arms techs also cost Ore (see [economy.md](economy.md)).
 
@@ -72,7 +74,7 @@ Worked examples:
 | yield_cap 70 | Trade I `Set 100`, faction `Mul 1250` | 100 * 1250 / 1000 = 125 |
 | pop_cap 25 | Arms I, II `Add 25` x2 | 75 |
 | research_cost 100 | Letters I, II, III `Mul 900` x3 | 100 -> 90 -> 81 -> 72 |
-| town_limit 1 | Statecraft I `Add 1` | 2 |
+| town_limit 2 | Statecraft I `Add 1` | 3 |
 
 The faction example is the M9 Tidewater League row (`yield_cap Mul 1250`, `lumber gather Mul 1100`, `Watchtower border push Add -1`) and the M4a acceptance test. Freeholders, the v0.1 faction, has an empty Modifier list.
 

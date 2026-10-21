@@ -1,10 +1,15 @@
 // Eonmark unit kinds. Schema: crates/rules/src/units.rs (deny_unknown_fields).
-// List index is the UnitKindId. Integers only: fields ending in _x100 are
-// scaled by 100 (180 = 1.80 tiles per second). The sim converts speed to
-// tiles per tick and radii to fixed-point exactly once, at spawn.
-// Combat stats, costs and trainer buildings arrive in M3a / M4a.
+// List index is the UnitKindId; yeoman stays at 0. Integers only: fields
+// ending in _x100 are scaled by 100 (180 = 1.80 tiles per second). The sim
+// converts speed to tiles per tick and radii to fixed-point exactly once,
+// at spawn.
 // return_to_post_radius_tiles_x100: an arrived unit pushed farther than this
 // from the tile centre it arrived at walks straight back (100 = one tile).
+// Training (M3a): class, cost per resource id, ramp (Flat when absent,
+// PerUnit({...}) per unit alive or queued, Military for the shared trainer
+// queue ramp in rules.ron), pop, train_time_ds, trainer (a buildings.ron
+// id), builder, vision_tiles. Combat stats arrive in M4a; the Skirmisher
+// moves like a Yeoman until then.
 (
   units: [
     (
@@ -17,6 +22,49 @@
       waypoint_radius_tiles_x100: 50,
       separation_tiles_x100: 10,
       return_to_post_radius_tiles_x100: 100,
+      class: Civilian,
+      cost: {"grain": 20},
+      ramp: PerUnit({"grain": 1}),
+      pop: 1,
+      train_time_ds: 120,
+      trainer: "town",
+      builder: true,
+      vision_tiles: 8,
+    ),
+    (
+      id: "scribe",
+      name: "Scribe",
+      speed_tiles_per_s_x100: 180,
+      radius_tiles_x100: 35,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Civilian,
+      cost: {"grain": 30},
+      pop: 1,
+      train_time_ds: 150,
+      trainer: "scriptorium",
+      vision_tiles: 8,
+    ),
+    (
+      id: "skirmisher",
+      name: "Skirmisher",
+      speed_tiles_per_s_x100: 180,
+      radius_tiles_x100: 35,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Infantry,
+      cost: {"grain": 40},
+      ramp: Military,
+      pop: 1,
+      train_time_ds: 150,
+      trainer: "muster_hall",
+      vision_tiles: 8,
     ),
   ],
 )

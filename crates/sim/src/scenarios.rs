@@ -15,12 +15,18 @@
 //! hands out `UnitId(1)` first and ids are monotonic, so a `DebugSpawn` of
 //! `n` units on an empty sim creates `UnitId(1..=n)`. Every stream is valid
 //! only when fed to a fresh sim from tick 0.
+//!
+//! Scenarios start empty ([`StartKind::Empty`]) except
+//! [`economy_second_town`], which starts from the standard start. On
+//! `plains_1v1` that start creates the Seats `BuildingId(1)` (P0) and
+//! `BuildingId(2)` (P1), P0's Yeomen `UnitId(1..=5)` and P1's
+//! `UnitId(6..=10)`, so a stream's own buildings begin at `BuildingId(3)`.
 
 use crate::ai_hook::{AiController, SimView};
 use crate::command::{Command, PlayerCommand};
 use crate::fx::FxVec2;
-use crate::ids::{PlayerId, UnitId, UnitKindId};
-use crate::state::{MatchSetup, Sim};
+use crate::ids::{BuildingKindId, PlayerId, Tile, UnitId, UnitKindId};
+use crate::state::{MatchSetup, Sim, StartKind};
 use rules::Rules;
 
 /// A tick-stamped command stream, sorted by tick.
@@ -62,11 +68,15 @@ pub const SCRIPTED_MOVES_TICKS: u32 = 600;
 /// Length of [`hud_click`]: the automated HUD check in the game crate
 /// finishes well inside it (10 s of game time).
 pub const HUD_CLICK_TICKS: u32 = 200;
+/// Length of [`economy_second_town`]: 3 minutes of game time, the M3a
+/// acceptance bound for founding a second Town.
+pub const ECONOMY_SECOND_TOWN_TICKS: u32 = 3600;
 
 /// Scenario names accepted by [`by_name`], `sim-cli record --scenario` and
 /// the game's `--scenario`. The first four are the M1 golden fixtures; the
-/// M2 names are windowed scenarios (they may be recorded too).
-pub const NAMES: [&str; 8] = [
+/// M2 names are windowed scenarios (they may be recorded too);
+/// `economy_second_town` is the M3a golden fixture.
+pub const NAMES: [&str; 9] = [
     "move_500",
     "move_500_short",
     "group_spiral",
@@ -75,6 +85,7 @@ pub const NAMES: [&str; 8] = [
     "units200_auto",
     "scripted_moves",
     "hud_click",
+    "economy_second_town",
 ];
 
 /// Spawn rows of [`bench_cross`]: a band along the west side from the
@@ -286,6 +297,82 @@ pub fn hud_click(rules: &Rules) -> (MatchSetup, Stream) {
     (setup, stream)
 }
 
+fn build(owner: u8, seq: u32, unit: u32, kind: BuildingKindId, x: u16, y: u16) -> PlayerCommand {
+    PlayerCommand::new(
+        PlayerId(owner),
+        seq,
+        Command::Build {
+            unit: UnitId(unit),
+            kind,
+            tile: Tile::new(x, y),
+        },
+    )
+}
+
+/// The M3a economy fixture, from the standard start on `plains_1v1`, with
+/// mirrored build orders for both players (P1's footprints are P0's
+/// mirrored across the map's `MirrorX` midline, its Yeomen are P0's ids
+/// plus 5):
+///
+/// - during tick 0: Yeoman 1 founds a Town at (40, 63), centred 17 tiles
+///   east of the Seat inside its border (the second Town costs 120 Lumber
+///   with the building ramp), Yeoman 2 places a Croft at (28, 60)
+///   (30 Lumber), spending exactly the 150 starting Lumber, and the Seat
+///   queues a sixth Yeoman (25 Grain: the five starting Yeomen count);
+/// - during tick 2400: Yeoman 3 places a Croft at (44, 60), attributed to
+///   the new Town, paid from both Towns' Lumber income.
+///
+/// Both second Towns complete well before tick 3600 and extend their
+/// owners' borders. Seed 11. Length [`ECONOMY_SECOND_TOWN_TICKS`].
+pub fn economy_second_town(rules: &Rules) -> (MatchSetup, Stream) {
+    let mut setup = MatchSetup::scenario(rules, 11);
+    setup.start = StartKind::Standard;
+    let kind = |id: &str| {
+        BuildingKindId(
+            rules
+                .building_kind_by_id(id)
+                .unwrap_or_else(|| panic!("buildings.ron has {id}"))
+                .0,
+        )
+    };
+    let (town, croft) = (kind("town"), kind("croft"));
+    let width = rules.map(&rules.default_map).expect("default map").width;
+    // NW corner of the mirror of a footprint `w` wide at column `x`.
+    let mirror = |x: u16, w: u16| width - x - w;
+    let yeoman = UnitKindId(0);
+    let train = |owner: u8, seq: u32, seat: u32| {
+        PlayerCommand::new(
+            PlayerId(owner),
+            seq,
+            Command::Train {
+                building: crate::ids::BuildingId(seat),
+                kind: yeoman,
+            },
+        )
+    };
+    let stream = vec![
+        (
+            0,
+            vec![
+                build(0, 0, 1, town, 40, 63),
+                build(0, 1, 2, croft, 28, 60),
+                train(0, 2, 1),
+                build(1, 0, 6, town, mirror(40, 3), 63),
+                build(1, 1, 7, croft, mirror(28, 2), 60),
+                train(1, 2, 2),
+            ],
+        ),
+        (
+            2400,
+            vec![
+                build(0, 3, 3, croft, 44, 60),
+                build(1, 3, 8, croft, mirror(44, 2), 60),
+            ],
+        ),
+    ];
+    (setup, stream)
+}
+
 /// The `sim-cli bench --units n` crossing: `n` Yeomen spawned during tick 0
 /// in one group per row of [`BENCH_CROSS_ROWS`], of (as near as possible)
 /// equal size, at `(BENCH_CROSS_WEST_X, row)` in
@@ -366,6 +453,10 @@ pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
             let (s, c) = hud_click(rules);
             (s, c, HUD_CLICK_TICKS)
         }
+        "economy_second_town" => {
+            let (s, c) = economy_second_town(rules);
+            (s, c, ECONOMY_SECOND_TOWN_TICKS)
+        }
         _ => return None,
     };
     Some((setup, stream, ticks))
@@ -424,6 +515,37 @@ mod tests {
             assert!(commands_at(&stream, 1).is_empty(), "{name}");
         }
         assert!(by_name("nope", &rules).is_none());
+    }
+
+    /// The economy fixture's ids follow from the standard start: its own
+    /// builders are the first three Yeomen of each player.
+    #[test]
+    fn economy_second_town_ids_match_the_standard_start() {
+        let rules = rules();
+        let (setup, stream) = economy_second_town(&rules);
+        let sim = Sim::new(setup, rules, Box::new(NoSlots));
+        let view = sim.view();
+        for (_, cmds) in &stream {
+            for c in cmds {
+                match c.cmd {
+                    Command::Build { unit, .. } => {
+                        assert_eq!(view.unit(unit).unwrap().owner, c.player, "{unit:?}");
+                    }
+                    Command::Train { building, .. } => {
+                        assert_eq!(view.building(building).unwrap().owner, c.player);
+                    }
+                    _ => panic!("only Builds and Trains"),
+                }
+            }
+        }
+        assert_eq!(
+            view.building(crate::ids::BuildingId(1)).unwrap().owner,
+            PlayerId(0)
+        );
+        assert_eq!(
+            view.building(crate::ids::BuildingId(2)).unwrap().owner,
+            PlayerId(1)
+        );
     }
 
     #[test]

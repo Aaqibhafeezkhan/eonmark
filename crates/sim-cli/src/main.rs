@@ -14,8 +14,9 @@ use clap::{Parser, Subcommand};
 use scenarios::Scenario;
 use sim::replay::DEFAULT_HASH_EVERY;
 use sim::{
-    AStarSearch, FxVec2, Map, MatchSetup, PlayerId, ReplayFile, ReplayReader, ReplayWriter, Rules,
-    SearchStatus, Sim, SimEvent, SimView, SubHashes, UnitId, VerifyOutcome,
+    AStarSearch, BuildingId, FxVec2, Map, MatchSetup, PlayerId, ReplayFile, ReplayReader,
+    ReplayWriter, Rules, SearchStatus, Sim, SimEvent, SimView, Source, SourceOwner, SubHashes,
+    TerritoryField, Tile, UnitId, VerifyOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -74,7 +75,8 @@ enum Cmd {
         /// Replay file (.eonreplay).
         replay: PathBuf,
     },
-    /// Measure step time: N units crossing the map, or one saturated A* budget.
+    /// Measure step time: N units crossing the map, one saturated A* budget,
+    /// or territory recompute.
     Bench {
         /// Units to spawn and move.
         #[arg(long, default_value_t = 500)]
@@ -83,8 +85,17 @@ enum Cmd {
         #[arg(long, default_value_t = 1200)]
         ticks: u32,
         /// Benchmark a saturated A* tick instead of the crossing.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "territory")]
         astar: bool,
+        /// Benchmark incremental territory recompute instead of the crossing.
+        #[arg(long)]
+        territory: bool,
+        /// Border sources placed before the timed edits (--territory).
+        #[arg(long, default_value_t = 16)]
+        sources: u32,
+        /// Timed source edits (--territory).
+        #[arg(long, default_value_t = 100)]
+        edits: u32,
         /// Expansion budget for --astar (defaults to rules.ron).
         #[arg(long)]
         budget: Option<u32>,
@@ -156,6 +167,13 @@ fn main() -> ExitCode {
         } => hash_dump_replay(&cli.data, &replay, every),
         Cmd::Verify { replay } => verify(&cli.data, &replay),
         Cmd::Bench {
+            territory: true,
+            sources,
+            edits,
+            seed,
+            ..
+        } => bench_territory(&cli.data, sources, edits, seed),
+        Cmd::Bench {
             units,
             ticks,
             astar,
@@ -163,6 +181,7 @@ fn main() -> ExitCode {
             seed,
             verbose,
             arrival_curve,
+            ..
         } => bench(
             &cli.data,
             units,
@@ -255,10 +274,12 @@ fn data_check(dir: &Path) -> ExitCode {
     match Rules::load(dir) {
         Ok(r) => {
             println!(
-                "OK rules_version={} rules_hash=0x{:016x} resources={} maps={}",
+                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} maps={}",
                 r.rules_version,
                 r.rules_hash(),
                 r.resources.resources.len(),
+                r.units.len(),
+                r.buildings.len(),
                 r.maps.keys().cloned().collect::<Vec<_>>().join(",")
             );
             ExitCode::SUCCESS
@@ -740,6 +761,159 @@ fn bench_astar(rules: &Rules, budget: u32) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What `bench --territory` measured.
+struct TerritoryBench {
+    /// Field size.
+    width: u16,
+    /// Field size.
+    height: u16,
+    /// Milliseconds per timed edit.
+    edit_ms: Vec<f64>,
+    /// Milliseconds for one full recompute of the final source set.
+    full_ms: f64,
+    /// The incrementally maintained field equals the full recompute.
+    matches: bool,
+}
+
+/// The territory workload, deterministic for a seed: `sources` border
+/// sources on the default map's field (owners alternate between the two
+/// players, every eighth on the neutral layer, centres uniform over the
+/// map), then `edits` timed edits. An edit is a tier change (40%), a move
+/// by up to 8 tiles (20%), an owner change including to and from the
+/// neutral layer (20%), or a removal plus an add under a new id (20%).
+/// Radii are the Town tiers from `rules.ron`, each plus 0 to 3 for
+/// Statecraft (M4a).
+fn run_territory_bench(rules: &Rules, sources: u32, edits: u32, seed: u64) -> TerritoryBench {
+    use rand_core::{Rng, SeedableRng};
+    let def = rules
+        .map(&rules.default_map)
+        .expect("default map is validated by Rules::load");
+    let (w, h) = (def.width, def.height);
+    let tier = |grown: bool, statecraft: u32| -> u16 {
+        let r = if grown {
+            rules.town_radius_grown_tiles
+        } else {
+            rules.town_radius_tiles
+        };
+        u16::try_from(r + statecraft).expect("radius fits u16")
+    };
+    let mut rng = rand_pcg::Pcg32::seed_from_u64(seed);
+    let mut below = |n: u32| rng.next_u32() % n;
+    let mut field = TerritoryField::new(w, h, 2);
+    let mut next = 1u32;
+    for i in 0..sources {
+        let owner = if i % 8 == 7 {
+            SourceOwner::Neutral
+        } else {
+            SourceOwner::Player(PlayerId(u8::try_from(i % 2).expect("0 or 1")))
+        };
+        let centre = Tile::new(
+            u16::try_from(below(u32::from(w))).expect("< width"),
+            u16::try_from(below(u32::from(h))).expect("< height"),
+        );
+        let radius = tier(below(2) == 1, below(4));
+        field.add_source(
+            BuildingId(next),
+            Source {
+                owner,
+                centre,
+                radius,
+            },
+        );
+        next += 1;
+    }
+    let mut edit_ms = Vec::with_capacity(edits as usize);
+    for _ in 0..edits {
+        let live: Vec<(BuildingId, Source)> =
+            field.sources().iter().map(|(&id, &s)| (id, s)).collect();
+        let (id, old) = live[below(u32::try_from(live.len()).expect("few sources")) as usize];
+        let kind = below(10);
+        let shift = |c: u16, size: u16, d: u32| -> u16 {
+            let v = i32::from(c) + i32::try_from(d).expect("small") - 8;
+            u16::try_from(v.clamp(0, i32::from(size) - 1)).expect("clamped")
+        };
+        let new = match kind {
+            0..=3 => Source {
+                radius: tier(below(2) == 1, below(4)),
+                ..old
+            },
+            4..=5 => Source {
+                centre: Tile::new(
+                    shift(old.centre.x, w, below(17)),
+                    shift(old.centre.y, h, below(17)),
+                ),
+                ..old
+            },
+            6..=7 => Source {
+                owner: match below(3) {
+                    2 => SourceOwner::Neutral,
+                    p => SourceOwner::Player(PlayerId(u8::try_from(p).expect("0 or 1"))),
+                },
+                ..old
+            },
+            _ => Source {
+                centre: Tile::new(
+                    u16::try_from(below(u32::from(w))).expect("< width"),
+                    u16::try_from(below(u32::from(h))).expect("< height"),
+                ),
+                ..old
+            },
+        };
+        let start = Instant::now();
+        if kind >= 8 {
+            field.remove_source(id);
+            field.add_source(BuildingId(next), new);
+        } else {
+            field.change_source(id, new);
+        }
+        edit_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        if kind >= 8 {
+            next += 1;
+        }
+    }
+    let mut full = field.clone();
+    let start = Instant::now();
+    full.full_recompute();
+    let full_ms = start.elapsed().as_secs_f64() * 1000.0;
+    TerritoryBench {
+        width: w,
+        height: h,
+        edit_ms,
+        full_ms,
+        matches: full == field,
+    }
+}
+
+/// `bench --territory`: time incremental recompute (docs/design/territory.md,
+/// budget: mean < 2 ms for 16 sources and 100 edits). Exits 1 when the
+/// incrementally maintained field differs from a full recompute.
+fn bench_territory(data: &Path, sources: u32, edits: u32, seed: u64) -> ExitCode {
+    let rules = match load_rules(data) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if sources == 0 {
+        eprintln!("error: --sources must be at least 1");
+        return ExitCode::from(2);
+    }
+    let b = run_territory_bench(&rules, sources, edits, seed);
+    let (mean, p95, max) = stats_ms(&b.edit_ms);
+    println!(
+        "bench territory sources={sources} edits={edits} seed={seed} map={}x{}",
+        b.width, b.height
+    );
+    println!("recompute_ms mean={mean:.4} p95={p95:.4} max={max:.4}");
+    println!(
+        "full_recompute_ms={:.4} incremental_matches_full={}",
+        b.full_ms, b.matches
+    );
+    if b.matches {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// What one fuzz case observed.
 struct FuzzCase {
     commands: usize,
@@ -1000,6 +1174,51 @@ mod tests {
         assert_eq!(arrived_pct(0, 0), 0.0);
         assert!((arrived_pct(495, 500) - 99.0).abs() < 1e-9);
         assert!(arrived_pct(494, 500) < ARRIVAL_GATE_PCT);
+    }
+
+    #[test]
+    fn cli_parses_bench_territory_flags() {
+        let cli = Cli::try_parse_from([
+            "sim-cli",
+            "bench",
+            "--territory",
+            "--sources",
+            "16",
+            "--edits",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Bench {
+                territory: true,
+                astar: false,
+                sources: 16,
+                edits: 100,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["sim-cli", "bench", "--territory"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Bench {
+                territory: true,
+                sources: 16,
+                edits: 100,
+                seed: 1,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["sim-cli", "bench", "--territory", "--astar"]).is_err());
+    }
+
+    #[test]
+    fn bench_territory_small_run_matches_full() {
+        let rules = load_rules(&data()).unwrap();
+        let b = run_territory_bench(&rules, 6, 40, 3);
+        assert_eq!(b.edit_ms.len(), 40);
+        assert!(b.matches);
+        assert_eq!((b.width, b.height), (128, 128));
     }
 
     #[test]

@@ -23,7 +23,7 @@ This document specifies combat: the eight unit kinds and their roles, the counte
 | Mangonel | siege | Masonry | Engine Yard | Beats buildings; brings Towns to 0 HP | Lumber | `units.ron` |
 | Supply Wain | support | Masonry | Engine Yard | No attack; cancels attrition within 14 tiles; immune to attrition | Lumber | `units.ron` |
 
-Classes drive other systems: infantry and cavalry adjacent to a Town at 0 HP start annexation, and every non-civilian kind counts as "defender military" (see [towns.md](towns.md)). Trainers for Scribe and Outrider are the M4a starting data and are open questions. The 8 kinds and 8 building kinds are counted by `sim-cli data-check`.
+Classes drive other systems: infantry and cavalry adjacent to a Town at 0 HP start annexation, and every non-civilian kind counts as "defender military" (see [towns.md](towns.md)). The Scribe's trainer is the Scriptorium in the M3a data; the Outrider's is M4a starting data and an open question. The Skirmisher is already in `units.ron` from M3a by owner decision (index 2, infantry, 40 Grain, `ramp: Military`, trained at the Muster Hall, Yeoman movement values; the M3a military ramp test queues Skirmishers); M4a adds its combat stats. The 8 kinds (Yeoman, Scribe and six military kinds) and 8 building kinds are counted by `sim-cli data-check`.
 
 ## Counter triangle
 
@@ -144,7 +144,7 @@ cargo run -p sim-cli --release -- bench --units 400 --ticks 1200 --combat
 ## Open tuning questions
 
 1. Counter multiplier values: the design fixes the pairs and the 18/20 bar, not the numbers.
-2. Trainer for Outrider (Muster Hall or Engine Yard) and for Scribe (Scriptorium or Town).
+2. Trainer for Outrider (Muster Hall or Engine Yard) and for Scribe (Scriptorium or Town). The M3a data trains the Scribe at the Scriptorium.
 3. Is Bowman an infantry class for annexation purposes? This doc says yes.
 4. Acquisition range versus weapon range: equal in the starting data, or a slightly larger acquisition range so units close in.
 5. Chase leash for `Attack` on a fleeing target.

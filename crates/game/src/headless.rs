@@ -24,7 +24,7 @@ use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::prelude::*;
 
 use sim::SIM_VERSION;
-use sim::replay::VerifyOutcome;
+use sim::replay::{ReplayError, VerifyOutcome};
 
 use crate::app::load_rules;
 use crate::cli::{Cli, HeadlessRun};
@@ -91,6 +91,17 @@ fn run_replay(cli: &Cli, path: &Path) -> AppExit {
     };
     let (setup, input) = match ReplayInput::open(path) {
         Ok(pair) => pair,
+        // A header from another sim version is the verify outcome, exit 1.
+        Err(ReplayError::SimVersion { found, .. }) => {
+            eprintln!(
+                "{}",
+                VerifyOutcome::SimVersionMismatch {
+                    replay: found,
+                    binary: SIM_VERSION,
+                }
+            );
+            return AppExit::error();
+        }
         Err(e) => {
             eprintln!("error: {e}");
             return AppExit::from_code(2);

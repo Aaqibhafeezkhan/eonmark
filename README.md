@@ -21,7 +21,7 @@ A match is meant to last 20 to 40 minutes. All numbers are starting values and w
 
 ## Status
 
-Pre-alpha. This is the M0 skeleton: toolchain, workspace, CI, a window on macOS, and the governance documents. Nothing is playable yet. The plan, with milestone ids M0 to M9, is in [docs/ROADMAP.md](docs/ROADMAP.md). The first playable skirmish is M5b. The first release, v0.1.0, is M8.
+Pre-alpha. M0 to M2 are merged: a deterministic fixed-point sim with pathing, movement, replays and a headless CLI, and a macOS window that shows units you can select and move. M3a (economy, Towns, the territory field, construction, gathering and training, all headless) is on PR #26. Nothing is playable as a game yet. The plan, with milestone ids M0 to M9, is in [docs/ROADMAP.md](docs/ROADMAP.md). The first playable skirmish is M5b. The first release, v0.1.0, is M8.
 
 ## Quick start for contributors
 

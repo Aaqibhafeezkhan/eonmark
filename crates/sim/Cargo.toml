@@ -31,6 +31,10 @@ harness = false
 name = "astar_budget"
 harness = false
 
+[[bench]]
+name = "territory_recompute"
+harness = false
+
 [lints]
 workspace = true
 

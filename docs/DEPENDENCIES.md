@@ -105,6 +105,7 @@ test "$(cargo tree -i cpal --depth 0 | wc -l)" -le 1
 | Advisory | Path | Reason | Review |
 |---|---|---|---|
 | RUSTSEC-2026-0192 | `ttf-parser` via `sctk-adwaita` via `winit` | Unmaintained notice, not a vulnerability. Linux-only client-side decorations; not compiled on macOS. | Drop when winit updates sctk-adwaita |
+| RUSTSEC-2026-0344 | `ruzstd` 0.8.3 via `bevy_image` 0.19.1 (Bevy's default `zstd_rust` feature) | Decompression bomb, denial of service only (no memory corruption). `bevy_image` 0.19.1 requires `ruzstd ^0.8`; the fix is 0.9.1, so no lockfile update reaches it. The game decodes zstd only inside KTX2 textures: Bevy's tonemapping LUTs embedded in the binary and repo-controlled files under `assets/`, never a file a player supplies (replays are postcard, not zstd). Switching to `zstd_c` would mean turning off Bevy's default features and relisting them. Advisory published 2026-10; ignored 2026-10-14. | Drop at the Bevy bump that takes `ruzstd` 0.9.1 or later (M9 at the latest) |
 | RUSTSEC-2024-0370 | `proc-macro-error` via `gtk3` via `muda` | Not in the graph and not ignored: M2 added `muda` with `default-features = false`, so its `gtk3` feature (the only path to `gtk` and `proc-macro-error`) is off and `cargo deny check` passes without an entry. Re-check if muda's features or defaults change. | Bevy bump (M9) |
 
 ## Upgrade policy

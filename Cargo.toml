@@ -81,3 +81,7 @@ strip = "debuginfo"
 # Integer/fixed-point overflow must panic deterministically, never wrap.
 [profile.release.package.sim]
 overflow-checks = true
+
+# Cost math in rules (read by sim, sim-cli and the game) must panic too.
+[profile.release.package.rules]
+overflow-checks = true

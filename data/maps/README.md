@@ -55,6 +55,9 @@ water.
 - `rows.len() == height` and every row has exactly `width` characters from
   the table above. Errors name the row: `rows[17]`.
 - Exactly 2 starts, inside the map, on grass, distinct, and mirror partners.
+- From M3a, the Town footprint from `rules/buildings.ron` (3x3) centred on
+  each start must be inside the map and all grass, because the Seat is
+  placed there. Errors name `starts[i]`.
 - Symmetry holds for every tile; the first mismatch names the row, column
   and partner.
 - `name` equals the file stem.

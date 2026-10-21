@@ -1,13 +1,13 @@
 # Economy
 
-This document specifies Eonmark's economy: the four resources, where they come from, the Yield Cap that flattens income, the integer micro-unit income algorithm, the three ramping-cost rules, the population cap, gather slots, idle-worker seeking and the standard start. Every number here is a starting value that lives in `data/rules/*.ron` and is expected to move during the M6 tuning iterations. The sim code that implements this is `crates/sim/src/economy.rs`; the pure cost functions live in `crates/rules`. For the design lineage see [prior-art.md](prior-art.md).
+This document specifies Eonmark's economy: the four resources, where they come from, the Yield Cap that flattens income, the integer micro-unit income algorithm, the three ramping-cost rules, the population cap, gather slots, idle-worker seeking and the standard start. Every number here is a starting value that lives in `data/rules/*.ron` and is expected to move during the M6 tuning iterations. The sim code that implements this is `crates/sim/src/economy.rs`, with gather slots and idle-worker seeking in `crates/sim/src/gather.rs` and training, unit costs and pop in `crates/sim/src/training.rs`; the pure cost functions live in `crates/rules`. For the design lineage see [prior-art.md](prior-art.md).
 
 | Field | Value |
 | --- | --- |
 | Milestone | M3a (sim), M3b (HUD readout) |
 | Labels | `area:sim`, `area:rules`, `kind:balance` for tuning |
-| Rules files | `data/rules/rules.ron` (Yield Cap table, pop cap, ramping params, late-game knobs), `data/rules/resources.ron`, `data/rules/buildings.ron` (gather rates, slots), `data/rules/units.ron` (Yeoman, Scribe) |
-| Sim module | `crates/sim/src/economy.rs` |
+| Rules files | `data/rules/rules.ron` (Yield Cap table, pop cap, building and military ramp params, `train_queue_max`, `idle_seek_delay_ds`, `idle_seek_retry_ds`, `standard_start`, late-game knobs), `data/rules/resources.ron`, `data/rules/buildings.ron` (costs, base yields, gather rates, slots, Croft limit `max_per_town`), `data/rules/units.ron` (Yeoman, Scribe, Skirmisher: cost, ramp, pop, training time, trainer) |
+| Sim module | `crates/sim/src/economy.rs`, `crates/sim/src/gather.rs`, `crates/sim/src/training.rs` |
 | Sub-hash | `economy` |
 
 ## Resources
@@ -28,7 +28,7 @@ Rates are authored per 30 seconds in `data/rules/buildings.ron`. At 20 Hz, 30 s 
 | Building | Resource | Slots | Rate per worker per 30 s | Base rate per 30 s with no worker |
 | --- | --- | --- | --- | --- |
 | Town | Grain, Lumber | none | n/a | 10 Grain, 10 Lumber |
-| Croft | Grain | 1 Yeoman; at most 5 Crofts per Town | 10 | 0 |
+| Croft | Grain | 1 Yeoman; at most 5 Crofts per Town (`max_per_town`) | 10 | 0 |
 | Lumber Yard | Lumber | one per adjacent forest tile, max 6 | 10 | 0 |
 | Ore Pit | Ore | one per adjacent mountain tile, max 6 | 10 | 0 |
 | Scriptorium | Lore | 3 Scribes | 5 | 10 |
@@ -83,19 +83,21 @@ Everything gets pricier the more you own. Three rules, all integer, all in `crat
 
 ### Yeomen: +1 Grain each
 
+The Yeoman's entry in `units.ron` has `cost: {"grain": 20}` and `ramp: PerUnit({"grain": 1})`: each `PerUnit` amount is added once per unit of the kind the player has alive or queued (`Rules::unit_cost`).
+
 ```text
-cost = yeoman_base_grain + yeoman_ramp_grain * n
+cost = cost["grain"] + ramp["grain"] * n
      = 20 + 1 * n
 n    = Yeomen alive plus Yeomen currently queued
 ```
 
-Queuing a Yeoman raises the next Yeoman's cost by 1 Grain before it finishes. Whether the 5 starting Yeomen count toward `n` is an open question (below).
+Queuing a Yeoman raises the next Yeoman's cost by 1 Grain before it finishes. The 5 starting Yeomen count toward `n`, so the first trained Yeoman costs 25 Grain (open question 1, answered for M3a).
 
 ### Buildings: +20% of base per copy owned or queued
 
 ```text
-cost = floor(base * (1000 + 200 * n) / 1000)
-n    = copies of that building kind owned or under construction
+cost = floor(base * (1000 + building_ramp_step_permille * n) / 1000)   // step 200
+n    = copies of that building kind owned or under construction, the Seat included
 ```
 
 | n | Multiplier |
@@ -106,7 +108,7 @@ n    = copies of that building kind owned or under construction
 | 3 | 1.60 |
 | 4 | 1.80 |
 
-The second Town costs exactly 1.2 times the first. The acceptance test checks this against the `rules.ron` formula, not a hard-coded number.
+The second Town costs exactly 1.2 times the first: 120 Lumber against the Town's base 100 in `buildings.ron`. That plus one 30 Lumber Croft is exactly the 150 starting Lumber, which the M3a economy fixture relies on. The acceptance test checks this against the `rules.ron` formula, not a hard-coded number.
 
 ### Military units: triangular per training-building class, capped at 2.25x
 
@@ -115,11 +117,11 @@ The ramp counts units currently queued, not units alive, so it throttles product
 ```text
 k       = 1 + units already queued at buildings of this class
 T(m)    = m * (m + 1) / 2                       // triangular number
-mult    = min(2250, 1000 + military_ramp_step_permille * T(k - 1))
+mult    = min(military_ramp_cap_permille, 1000 + military_ramp_step_permille * T(k - 1))
 cost    = floor(base * mult / 1000)             // per resource
 ```
 
-With the starting step of 100 permille:
+A unit kind opts in with `ramp: Military` in `units.ron`, as the Skirmisher does. With the starting step of 100 permille (`military_ramp_step_permille: 100`) and the cap of 2250 permille (`military_ramp_cap_permille: 2250`):
 
 | k (position in class queue) | T(k-1) | Multiplier |
 | --- | --- | --- |
@@ -149,16 +151,16 @@ Scribes cost 1 pop. Per-kind pop costs for the other units are in `units.ron`. A
 
 ## Idle Yeoman work seeking
 
-A Yeoman that has been idle for 5 s (100 ticks) looks for work on its own.
+A Yeoman that has been idle for `idle_seek_delay_ds` (50 ds = 5 s = 100 ticks) looks for work on its own.
 
 ```text
 candidates = gather buildings owned by the player with a free slot
 order by (dist_sq_i64(yeoman, building), BuildingId)
 if any: issue an internal Gather order to the first
-else:   stay idle and retry after another 100 ticks
+else:   stay idle and retry after idle_seek_retry_ds (50 ds = 100 ticks)
 ```
 
-The ordering is a total order with an id tiebreak, as every sort in the sim must be (see `docs/DETERMINISM.md`). The 100-tick retry interval is an M3a choice, not a design number. The delay is a good first issue: tune `idle_seek_delay_ds` (starting value 50, that is 5 s) in `rules.ron` and document the play-bots result.
+The ordering is a total order with an id tiebreak, as every sort in the sim must be (see `docs/DETERMINISM.md`). The retry interval is an M3a choice, not a design number: it is its own field, `idle_seek_retry_ds` in `rules.ron`, starting equal to the delay. The delay is a good first issue: tune `idle_seek_delay_ds` (starting value 50, that is 5 s) in `rules.ron` and document the play-bots result.
 
 ## Standard start
 
@@ -174,9 +176,34 @@ The ordering is a total order with an id tiebreak, as every sort in the sim must
 | Yield Cap | 70 |
 | Pop cap | 25 |
 
+The Seat, the Yeomen and the stockpiles are data: `standard_start` in `rules.ron` holds `units: {"yeoman": 5}` and `stockpile: {"grain": 150, "lumber": 150, "ore": 0, "lore": 0}`, and the Seat is one Town of the `town: true` kind in `buildings.ron`, centred on the map start (the map validator checks that the 3x3 footprint fits there on grass). By owner decision the sim selects it through `MatchSetup.start: StartKind { Empty, Standard }`, added in the first M3a slice: skirmish matches use `Standard`, scenarios `Empty` unless they set `Standard` (the economy fixture does). The resulting ids are in [towns.md](towns.md) ("M3a implementation notes").
+
 ## Commands and rejections
 
 The economy consumes `Build { unit, kind, tile }`, `Train { building, kind }`, `Gather { units, node }`, `Cancel { building, slot }` and `SetRally { building, target }`. Costs are deducted when the order is accepted; `Cancel` refunds the deducted cost. Rejections never panic; they emit `SimEvent::CommandRejected { player, seq, reason }` with reasons including `OutsideBorders` (see [territory.md](territory.md)), `PopCapReached` and `CannotAfford`.
+
+## M3a implementation notes
+
+The first M3a slice (the Town loop, `SIM_VERSION` 6) implements income from base yields, building costs, construction and the site `Cancel`. The gathering slice (`SIM_VERSION` 8, `rules_version` 9) adds gather slots, worked-slot income and idle-worker seeking in `crates/sim/src/gather.rs`. The training slice (`SIM_VERSION` 9, `rules_version` 10) adds training queues, the unit cost ramps, the pop cap, the queue `Cancel` and `SetRally` in `crates/sim/src/training.rs`; with it all six M3a slices are implemented. Where it is more precise than the sections above:
+
+| Topic | As implemented |
+| --- | --- |
+| Income | Raw income is the `base_yield` of every complete building (the Town's 10 Grain and 10 Lumber, the Scriptorium's 10 Lore per 30 s) plus `rate_per_worker` for every worked slot. The Yield Cap applies per resource to every resource with `yield_capped` and is level 0 (70) until Trade research in M4a; Lore is exempt. After each tick's credit every stockpile with a `stockpile_cap` is clamped to it, so Lore stops at 999. Ten Crofts need two Towns (five per Town), so the flatline test's raw Grain rate is 120 (ten Crofts plus two Towns), not the 110 of the cap example above. Only stockpiles and accumulators are stored; rates, pop and ramp counters are computed when needed. `SimView::income` returns `RateInfo { raw, cap, credited }` per resource for the M3b readout. |
+| Building cost | Deducted when `Build` is accepted. The ramp's `n` counts every own building of the kind, sites and the Seat included. `SimView::building_cost` and `SimView::check_build` quote with the same functions `Build` uses. |
+| Construction | One builder per site. The builder walks to the tile around the footprint nearest to it that it can reach with the footprint blocked (ties by tile); `Build` is `Unreachable` when there is none. The site gains one tick of progress per tick its builder is at work: no order, and its post (the tile it arrived at) touches the footprint (Chebyshev distance 1). The post counts, not the live position, so separation jostle never pauses work. A `Move`, `AttackMove` or `Stop` ends the job, and a builder whose path ends anywhere else loses it; the site keeps its progress and waits. |
+| Resuming | Re-issuing `Build` with the same kind and tile on an own site, by any builder, makes that unit its builder at no cost; a previous builder goes idle. |
+| Site cancel | `Cancel { building: site, slot: 0 }` refunds `paid` in full, clamped to the stockpile caps, unblocks the footprint and idles the builder. Any other slot of a site is `InvalidSlot`; the slots of a complete building are its training queue (see Queue cancel); a missing building or another player's is `UnknownBuilding`. |
+| Rejections | `Build`, `Cancel`, `Gather`, `Train` and `SetRally` rejections change no state and draw no randomness; the full `Build` check order is in [towns.md](towns.md) ("M3a implementation notes"). Only `Attack`, `Research` and `AdvanceAge` still draw from the RNG: they are rejected as `NotImplemented` until M4a. |
+| Gather | `Gather { units, node }` is validated by a pure function (`gather::validate_gather`), and the first failure is the reason: the node is the player's (`UnknownBuilding`), is complete (`UnderConstruction`) and has gather slots (`NotAGatherNode`); at least one given unit is the player's, of the node's `worker` kind and able to walk to a tile beside the footprint (`NoValidUnits`); a slot is free (`NoFreeSlot`), checked only when some valid unit is not already on the node: re-issuing the order to the node's own workers is accepted and changes nothing, whether or not the node is full. The valid units not already on the node take the lowest free slots in `UnitId` order; units left over when the slots run out are untouched. A unit that had another job leaves it. `Gather` no longer draws from the RNG. |
+| Slots | A slot is taken only by a unit holding `Job::Gather { node, slot }`; nothing else records occupancy, so nothing can fall out of sync. The stand tile of slot `k` for a worker is the `(k mod n)`-th of the `n` passable ring tiles (around the footprint, clockwise from the north-west corner) in the worker's connected component; a complete building's footprint is blocked, so these are exactly the ring tiles the worker can reach. `Adjacent` slot counts are fixed at placement from the 8-neighbourhood (open question 4). `SimView::worked_slots(id)` returns `(worked, taken, slots)`. |
+| Worked slots | A slot is worked, and earns `rate_per_worker`, while its unit is at work: no order, and its post adjacent to the footprint (Chebyshev distance 1), the same rule as a builder's. The post counts, not the live position, so a worker pushed off its stand tile keeps earning. Step 6c drops a gather job when its building is gone, is not the unit's owner's, is not complete or is not worked by the unit's kind, or when the unit has no order and is not at work there; `Move`, `AttackMove` and `Stop` end it too. Either way the slot is free again. |
+| Idle seeking | A unit of a kind that works some building (the Yeoman and the Scribe) is idle when it has no job and no order; holding a post is still idle. In step 6c an idle unit without a timer sets `seek_at` to the current tick plus `idle_seek_delay_ds` (100 ticks). When the timer runs out it takes the lowest free slot of the nearest own complete building its kind works, among those with a free slot and a ring tile it can reach, ordered by `dist_sq_i64` from its position to the footprint centre, then `BuildingId`, and walks to the slot's stand tile. It takes the slot directly; no command is issued. With no such building it tries again after `idle_seek_retry_ds` (100 ticks). A unit with a job or an order has no timer. Units are visited in `UnitId` order and see the slots taken earlier in the same tick. `SimView::idle_workers(p)` lists a player's idle workers. |
+| Builder takes its slot | When a site completes, its builder takes the lowest free slot there if its kind is the building's `worker` and a slot is free, so a Croft's builder takes its slot at once and works it once it reaches the slot's stand tile, beside the footprint it already stands next to; otherwise the builder goes idle. |
+| Train | `Train { building, kind }` is validated by a pure function (`training::validate_train`, also behind `SimView::check_train`), and the first failure is the reason: the building is the player's (`UnknownBuilding`) and complete (`UnderConstruction`); the unit kind exists (`UnknownUnitKind`) and the building's kind is its `trainer` (`CannotTrainHere`); the queue holds fewer than `train_queue_max` (5) entries (`QueueFull`); pop used plus the kind's `pop` stays within the pop cap (`PopCapReached`); the player can pay the ramped cost (`CannotAfford`, naming the first short resource). Pop used is every own unit alive plus every entry queued at an own building, each at its kind's `pop`; the cap is `pop_cap_base` (25) until Arms research in M4a. An accepted `Train` deducts the cost and appends `QueueEntry { item: Unit(kind), paid, progress: 0 }`, so cost and pop are both charged when the unit is queued. `SimView::pop(p)` returns `(used, cap)`. `Train` no longer draws from the RNG. |
+| Training | In step 6b every complete building, in `BuildingId` order, adds one tick of progress to whichever entry is the head of its queue when 6b reaches it; the other entries gain nothing. The head becomes a unit in the step where its progress reaches the kind's `train_time_ds` (Yeoman 120 ds = 240 ticks), that is, in the `train_time`-th step in which it was the head. An entry queued into an empty queue is the head in the very step that applied the `Train`, so it appears `train_time` - 1 steps after that step; the entry behind a finished head becomes the head after 6b has passed the building, so it starts in the next step and a busy building turns out exactly one unit every `train_time` steps. The unit appears beside the building (`UnitSpawned`): on the first passable tile of the spiral around the footprint's centre tile that lies in the spawn component. The candidates are the components of the passable tiles on the building's ring, or every component when the whole ring is blocked. The spawn component is the rally point's when the rally point's own tile is passable and its component is a candidate (the player pointed into it; a rally on a building names no side), and otherwise the largest candidate by tile count, then the lower id. So a pocket that neighbouring buildings seal against the building takes the unit only when the rally point is inside it (`SIM_VERSION` 11). The tile may already hold a unit; separation pushes them apart. With a rally point set the unit walks there, the point corrected to a passable tile as for a `Move`; otherwise it takes the lowest free slot of its own building when its kind is the building's `worker` (a Scribe trained at a Scriptorium takes a slot there at once and works it once it reaches the slot's stand tile); otherwise it starts idle: a worker kind (Yeoman, Scribe) then seeks work after `idle_seek_delay_ds`, and any other kind (the Skirmisher) stands where it appeared. |
+| Unit cost | `training::unit_cost_for` takes the counts and `Rules::unit_cost` turns them into the price. `n` is the player's units of the kind alive plus entries of the kind queued at its buildings; the five standard-start Yeomen count (owner decision D11, open question 1), so the first trained Yeoman costs 25 Grain. `k` is 1 plus every entry, of any unit kind, queued at the player's buildings of the kind's trainer kind, so every Muster Hall shares one counter. `Flat` costs the base, `PerUnit` the base plus `step * n` (the Yeoman 20 + `n` Grain) and `Military` `floor(base * min(cap, 1000 + step * T(k - 1)) / 1000)` with the 100 permille step and the 2250 cap: the Skirmisher's 40 Grain gives 40, 44, 52, 64, 80 and 90 for `k` = 1 to 6. An entry counts toward `k` until it finishes or is cancelled; a finished unit keeps counting toward `n` while it is alive. `SimView::unit_cost(p, kind)` quotes with the same function `Train` uses. |
+| Queue cancel | `Cancel { building, slot }` on an own complete building with `slot` below its queue length removes that entry and refunds exactly its `paid`, clamped to the stockpile caps, and emits `TrainingCancelled { building, slot }`; a cancelled head loses its progress. A slot at or past the end of the queue is `InvalidSlot`. |
+| Rally | `SetRally { building, target }` on an own building, site or complete, sets its rally point (otherwise `UnknownBuilding`); units trained there from then on walk to it. `SetRally` no longer draws from the RNG. |
 
 ## Interactions
 
@@ -191,9 +218,14 @@ The economy consumes `Build { unit, kind, tile }`, `Train { building, kind }`, `
 
 ## Acceptance checklist (from M3a)
 
-- [ ] `cargo test -p sim economy`: one Yeoman on a Croft yields exactly 10 Grain per 600 ticks; with 10 Crofts worked the Grain rate is clamped to 70 per 600 ticks and the stockpile grows by exactly 70; Lore ignores the Yield Cap; the second Town costs more than the first by exactly the rules.ron formula; queuing a Yeoman raises the next Yeoman's cost by 1 Grain before it finishes; the 6th queued Skirmisher is capped at 2.25x base.
-- [ ] Scripted headless economy fixture: from the standard start (1 Town, 5 Yeomen, 150 Grain / 150 Lumber / 0 Ore / 0 Lore) a fixed build order founds a second Town before tick 3600 and the final hash matches the fixture.
-- [ ] Data-only contributor path: change croft gather rate from 10 to 12 in data/rules/buildings.ron, run `sim-cli data-check` and `cargo test -p sim` (the flatline test reads the number from data) without touching Rust; documented in CONTRIBUTING.
+- [x] `cargo test -p sim economy`: one Yeoman on a Croft yields exactly 10 Grain per 600 ticks; with 10 Crofts worked the Grain rate is clamped to 70 per 600 ticks and the stockpile grows by exactly 70; Lore ignores the Yield Cap; the second Town costs more than the first by exactly the rules.ron formula; queuing a Yeoman raises the next Yeoman's cost by 1 Grain before it finishes; the 6th queued Skirmisher is capped at 2.25x base.
+
+  Note: the first three clauses are tested by `economy_one_yeoman_on_a_croft_yields_exactly_the_croft_rate_per_income_period`, `economy_ten_worked_crofts_flatline_at_the_yield_cap` (two complete Towns and ten Crofts placed with `DebugPlaceBuilding`, by owner decision D2; raw 120 against the cap of 70) and `economy_lore_ignores_the_yield_cap` (three Scriptoria with three Scribes each, 75 Lore against 70, all credited). Each reads its rates from data. The second-Town clause is `economy_second_town_costs_more_than_the_first_by_the_rules_formula`. The Yeoman clause is `economy_queuing_a_yeoman_raises_the_next_cost_before_it_finishes` (the quote rises by the `PerUnit` step from `units.ron` as soon as the Yeoman is queued, the deduction equals the quote, and the quote does not move again when the unit appears). The Skirmisher clause is `economy_sixth_queued_skirmisher_is_capped`: five Skirmishers queued at one Muster Hall and the sixth at a second one, so the shared counter is what reaches the cap (a sixth at the first hall is `QueueFull`); cancelling two entries refunds exactly what they paid and the next quote falls back to `k` = 5.
+
+- [x] Scripted headless economy fixture: from the standard start (1 Town, 5 Yeomen, 150 Grain / 150 Lumber / 0 Ore / 0 Lore) a fixed build order founds a second Town before tick 3600 and the final hash matches the fixture.
+- [x] Data-only contributor path: change croft gather rate from 10 to 12 in data/rules/buildings.ron, run `sim-cli data-check` and `cargo test -p sim` (the flatline test reads the number from data) without touching Rust; documented in CONTRIBUTING.
+
+  Note (owner decision): any RON edit changes `rules_hash`, so the documented path also bumps `rules_version` and runs `just rerecord` between `data-check` and `cargo test -p sim`; otherwise the golden fixtures report `RULES CHANGED since recording`. See CONTRIBUTING, "The data-first path".
 
 The complete M3a list, including the territory lines, is in [territory.md](territory.md) and `docs/ROADMAP.md`.
 
@@ -204,10 +236,10 @@ cargo run -p sim-cli -- data-check data/
 
 ## Open tuning questions
 
-1. Do the 5 starting Yeomen count toward the Yeoman ramp? If yes, the first trained Yeoman costs 25 Grain; if no, 20.
-2. The military ramp step (100 permille) is derived, not designed. Confirm it, and confirm that the class counter spans every unit kind the class trains.
-3. Should the idle-Yeoman retry interval equal the initial delay (100 ticks), or be longer to reduce path requests?
-4. Adjacency for Lumber Yard and Ore Pit slots: 8-neighbourhood of the footprint is the M3a reading.
+1. Do the 5 starting Yeomen count toward the Yeoman ramp? If yes, the first trained Yeoman costs 25 Grain; if no, 20. Answered for M3a: they count, so the first trained Yeoman costs 25 Grain.
+2. The military ramp step (100 permille) is derived, not designed. Confirm it, and confirm that the class counter spans every unit kind the class trains. M3a implements that reading: `k` counts every entry queued at the player's buildings of the trainer kind, whatever unit kind it is.
+3. Should the idle-Yeoman retry interval equal the initial delay (100 ticks), or be longer to reduce path requests? Answered in data: `idle_seek_retry_ds` is its own field in `rules.ron`, starting at 50 ds (100 ticks), equal to `idle_seek_delay_ds`, and tunable without Rust.
+4. Adjacency for Lumber Yard and Ore Pit slots: 8-neighbourhood of the footprint is the M3a reading. Implemented that way: a Lumber Yard at (13, 57) on `plains_1v1` touches three forest tiles and gets three slots (`economy_adjacent_slots_count_forest_and_mountain_tiles`).
 5. Should Grain, Lumber and Ore have a stockpile cap at all? v0.1 says no.
 6. Is the Yield Cap decay after minute 30 ever on by default? M6 decides from the 20 seeded bot games.
 7. Croft gather rate 10 versus 12 is the documented data-only contributor path; the balance issue form asks for a play-bots table.

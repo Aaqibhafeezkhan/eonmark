@@ -1,0 +1,107 @@
+// Eonmark building kinds. Schema: crates/rules/src/buildings.rs
+// (deny_unknown_fields). List index is the BuildingKindId; code looks kinds
+// up by id, never by index. Integers only: costs and yields per resource id,
+// rates per 30 s (600 ticks at 20 Hz), build_time_ds in deciseconds,
+// footprints and radii in tiles. A building's tile is its north-west corner.
+//
+// Exactly one kind has town: true; its border radius and limit are in
+// rules.ron. Border sources (the Town, any kind with border_radius_tiles)
+// need odd width and height so the centre is a tile. gather slots are
+// Fixed(n), or Adjacent(terrain: Forest | Mountain, max: n): one slot per
+// such tile sharing an edge or corner with the footprint, counted at
+// placement. Costs ramp by building_ramp_step_permille in rules.ron.
+// The second Town (120 Lumber with the ramp) plus a Croft (30) is exactly
+// the 150 starting Lumber; the economy_second_town fixture relies on that.
+(
+  buildings: [
+    (
+      id: "town",
+      name: "Town",
+      town: true,
+      width_tiles: 3,
+      height_tiles: 3,
+      cost: {"lumber": 100},
+      build_time_ds: 600,
+      hp: 2000,
+      vision_tiles: 14,
+      base_yield: {"grain": 10, "lumber": 10},
+    ),
+    (
+      id: "croft",
+      name: "Croft",
+      width_tiles: 2,
+      height_tiles: 2,
+      cost: {"lumber": 30},
+      build_time_ds: 150,
+      hp: 300,
+      vision_tiles: 6,
+      gather: Some((resource: "grain", worker: "yeoman", rate_per_worker: 10, slots: Fixed(1))),
+      max_per_town: Some(5),
+    ),
+    (
+      id: "lumber_yard",
+      name: "Lumber Yard",
+      width_tiles: 2,
+      height_tiles: 2,
+      cost: {"lumber": 50},
+      build_time_ds: 200,
+      hp: 400,
+      vision_tiles: 6,
+      gather: Some((resource: "lumber", worker: "yeoman", rate_per_worker: 10, slots: Adjacent(terrain: Forest, max: 6))),
+    ),
+    (
+      id: "ore_pit",
+      name: "Ore Pit",
+      width_tiles: 2,
+      height_tiles: 2,
+      cost: {"lumber": 50},
+      build_time_ds: 200,
+      hp: 400,
+      vision_tiles: 6,
+      gather: Some((resource: "ore", worker: "yeoman", rate_per_worker: 10, slots: Adjacent(terrain: Mountain, max: 6))),
+    ),
+    (
+      id: "scriptorium",
+      name: "Scriptorium",
+      width_tiles: 3,
+      height_tiles: 3,
+      cost: {"lumber": 80},
+      build_time_ds: 300,
+      hp: 600,
+      vision_tiles: 8,
+      base_yield: {"lore": 10},
+      gather: Some((resource: "lore", worker: "scribe", rate_per_worker: 5, slots: Fixed(3))),
+    ),
+    (
+      id: "muster_hall",
+      name: "Muster Hall",
+      width_tiles: 3,
+      height_tiles: 3,
+      cost: {"lumber": 100},
+      build_time_ds: 400,
+      hp: 800,
+      vision_tiles: 8,
+    ),
+    (
+      id: "watchtower",
+      name: "Watchtower",
+      width_tiles: 1,
+      height_tiles: 1,
+      cost: {"ore": 40},
+      build_time_ds: 300,
+      hp: 500,
+      vision_tiles: 12,
+      border_radius_tiles: Some(2),
+    ),
+    (
+      id: "engine_yard",
+      name: "Engine Yard",
+      width_tiles: 3,
+      height_tiles: 3,
+      cost: {"lumber": 150},
+      build_time_ds: 500,
+      hp: 900,
+      vision_tiles: 8,
+    ),
+  ],
+)

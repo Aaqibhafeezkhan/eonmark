@@ -227,6 +227,31 @@ impl Map {
         true
     }
 
+    /// Block or unblock several tiles at once (a building footprint). Bumps
+    /// the generation once and rebuilds the components once, and only when
+    /// at least one tile's cost actually changed; returns whether it did.
+    /// Equivalent to calling [`Map::set_blocked`] per tile except for the
+    /// number of generation bumps, which is what the path cache keys on.
+    pub fn set_blocked_many(&mut self, tiles: &[Tile], blocked: bool) -> bool {
+        let new = if blocked { COST_BLOCKED } else { COST_PASSABLE };
+        let mut changed = false;
+        for &t in tiles {
+            let i = self.idx(t);
+            if self.cost[i] != new {
+                self.cost[i] = new;
+                changed = true;
+            }
+        }
+        if changed {
+            self.cost_grid_generation = self
+                .cost_grid_generation
+                .checked_add(1)
+                .expect("cost_grid_generation overflow");
+            self.rebuild_components();
+        }
+        changed
+    }
+
     /// Offset a tile; `None` when the result leaves the map.
     pub fn offset(&self, t: Tile, dx: i32, dy: i32) -> Option<Tile> {
         let x = i32::from(t.x) + dx;
@@ -537,6 +562,37 @@ mod tests {
             !m.step_allowed(Tile::new(3, 3), Tile::new(5, 3)),
             "not adjacent"
         );
+    }
+
+    #[test]
+    fn set_blocked_many_bumps_once_and_matches_per_tile_writes() {
+        let wall: Vec<Tile> = (0..4).map(|y| Tile::new(2, y)).collect();
+        let mut batched = Map::open(4, 4);
+        assert!(batched.set_blocked_many(&wall, true));
+        assert_eq!(
+            batched.cost_grid_generation(),
+            1,
+            "one bump for the whole footprint"
+        );
+        assert_eq!(
+            batched.component_count(),
+            2,
+            "components rebuilt: the wall splits the map"
+        );
+        let mut single = Map::open(4, 4);
+        for &t in &wall {
+            single.set_blocked(t, true);
+        }
+        assert_eq!(batched.cost, single.cost);
+        assert_eq!(batched.components, single.components);
+        // A write that changes nothing keeps the generation.
+        assert!(!batched.set_blocked_many(&wall, true));
+        assert!(!batched.set_blocked_many(&[], false));
+        assert_eq!(batched.cost_grid_generation(), 1);
+        // A partly redundant write still bumps once.
+        assert!(batched.set_blocked_many(&[Tile::new(2, 0), Tile::new(0, 0)], false));
+        assert_eq!(batched.cost_grid_generation(), 2);
+        assert!(batched.passable(Tile::new(2, 0)) && batched.passable(Tile::new(0, 0)));
     }
 
     #[test]

@@ -105,7 +105,8 @@ data-check:
 bots *ARGS:
     @echo "bots: available from M5b (sim-cli play-bots)"
 
-# Sim benchmarks: `just bench` runs the 500-mover crossing, `just bench --astar --budget 4000` one saturated A* tick.
+# Sim benchmarks: `just bench` runs the 500-mover crossing, `just bench --astar --budget 4000` one saturated A* tick,
+# `just bench --territory --sources 16 --edits 100` incremental territory recompute (M3a acceptance: mean < 2 ms).
 bench *ARGS:
     cargo run -p sim-cli --locked --release -- bench {{ARGS}}
 
@@ -118,6 +119,10 @@ verify *ARGS:
       printf '%s: ' "$f"
       cargo run -q -p sim-cli --locked --release -- verify "$f"
     done
+
+# Re-record every golden fixture (or the names given) after a rules_version bump; .hash comes from verify.
+rerecord *NAMES:
+    scripts/rerecord_fixtures.sh {{NAMES}}
 
 # Golden fixtures change only with a rules_version bump; compares HEAD against BASE (default: merge base with main).
 fixture-policy BASE="":

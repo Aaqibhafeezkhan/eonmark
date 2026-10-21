@@ -1,6 +1,6 @@
 // Eonmark resources. Schema: crates/rules/src/resources.rs (deny_unknown_fields).
-// gathered_from lists building ids; they are cross-checked against
-// buildings.ron from M3a. Yield-capped resources use yield_cap_table in
+// gathered_from lists building ids and must equal the buildings.ron kinds
+// whose base_yield or gather names the resource. Yield-capped resources use yield_cap_table in
 // rules.ron; a resource with yield_capped: false must set stockpile_cap.
 (
   resources: [

@@ -1,12 +1,12 @@
 # Towns
 
-This document specifies Towns: how they are founded, how many a player may hold, how their border radius grows, why they cannot be destroyed, the annexation state machine that transfers them, and the victory conditions that depend on them. Every number here is a starting value in `data/rules/rules.ron` and may move during M6 tuning. Founding, limits and radius growth land in M3a (`crates/sim/src/town.rs`); annexation and victory land in M5a. For the design lineage see [prior-art.md](prior-art.md).
+This document specifies Towns: how they are founded, how many a player may hold, how their border radius grows, why they cannot be destroyed, the annexation state machine that transfers them, and the victory conditions that depend on them. Every number here is a starting value in `data/rules/rules.ron` or `data/rules/buildings.ron` and may move during M6 tuning. Founding, limits and radius growth land in M3a (`crates/sim/src/town.rs`); annexation and victory land in M5a. For the design lineage see [prior-art.md](prior-art.md).
 
 | Field | Value |
 | --- | --- |
 | Milestone | M3a (founding, limit, radius), M5a (annexation, victory) |
 | Labels | `area:sim`, `area:rules` |
-| Rules files | `data/rules/rules.ron` (town radius, town limit, annexation 60 s, defender radius 6, match cap 45 min), `data/rules/buildings.ron` (Town HP, cost, shooter stats) |
+| Rules files | `data/rules/rules.ron` (town radius, town limit `town_limit_base`, annexation 60 s, defender radius 6, match cap 45 min), `data/rules/buildings.ron` (Town footprint, HP, cost, build time, base yield; the Croft limit `max_per_town`; shooter stats from M4a) |
 | Sim modules | `crates/sim/src/town.rs`, annexation in `crates/sim/src/attrition.rs` neighbourhood or its own module, `outcome()` in `state.rs` |
 | Sub-hash | `buildings`, `territory` |
 
@@ -14,26 +14,28 @@ This document specifies Towns: how they are founded, how many a player may hold,
 
 | Parameter | Start value | Where |
 | --- | --- | --- |
-| Town limit | 1 + Statecraft level | `rules.ron`, `techs.ron` row `town_limit Add 1` |
+| Town limit | 2 + Statecraft level (the Seat and Town sites count) | `rules.ron` `town_limit_base: 2`, `techs.ron` row `town_limit Add 1` |
 | Border radius, tier 1 | 20 tiles | `rules.ron` |
 | Border radius, tier 2 | 24 tiles, once 5 distinct building kinds are attributed to the Town | `rules.ron` |
 | Town base yield | 10 Grain and 10 Lumber per 30 s | `buildings.ron` |
-| Crofts per Town | 5 | `rules.ron` |
-| Town HP and cost | set in `buildings.ron` at M3a | `buildings.ron` |
+| Crofts per Town | 5 | `buildings.ron` (`croft` `max_per_town: Some(5)`) |
+| Town footprint, HP, cost, build time | 3x3 tiles, 2000 HP, 100 Lumber (120 for the second, with the building ramp), 600 ds = 60 s | `buildings.ron` |
 | Annexation timer | 60 s = 1200 ticks | `rules.ron` |
 | Defender exclusion radius | 6 tiles | `rules.ron` |
 | Match cap | 45 min = 54000 ticks | `rules.ron` |
 
 | Statecraft level | Town limit |
 | --- | --- |
-| 0 | 1 |
-| 1 | 2 |
-| 2 | 3 |
-| 3 | 4 |
+| 0 | 2 |
+| 1 | 3 |
+| 2 | 4 |
+| 3 | 5 |
+
+The base limit is 2 by owner decision, so a second Town can be founded in M3a, before Statecraft exists (it arrives in M4a); the M3a economy fixture founds one. The design's earlier reading was 1 + Statecraft level.
 
 ## Founding
 
-A Town is a building kind. A Yeoman founds one through `Build { unit, kind: Town, tile }`, so it obeys every construction rule: the tile must be inside the founder's borders (`is_buildable`), passable and unoccupied, the player must be under the town limit, and the ramped cost (base times 1.2 for the second copy, see [economy.md](economy.md)) must be affordable. The second Town is therefore placed at the edge of current borders and extends them by its own radius when complete.
+A Town is a building kind. A Yeoman founds one through `Build { unit, kind: Town, tile }`, so it obeys every construction rule: the tile must be inside the founder's borders (`is_buildable`), passable and unoccupied, the player must be under the town limit, and the ramped cost (base times 1.2 for the second copy, 120 Lumber, see [economy.md](economy.md)) must be affordable. The second Town is therefore placed at the edge of current borders and extends them by its own radius when complete.
 
 | Rejection | Reason |
 | --- | --- |
@@ -117,6 +119,34 @@ These are measured with `sim-cli play-bots`, not enforced by the sim.
 | Median game length | at most tick 54000 |
 | Games lasting past tick 24000 | at least 10 of 20 |
 
+## M3a implementation notes
+
+The first M3a slice (the Town loop, `SIM_VERSION` 6) implements the standard start, founding and the town limit in `crates/sim/src/town.rs` and `construction.rs`; the gathering slice (`SIM_VERSION` 8) adds tier-2 growth. Where it is more precise than the sections above:
+
+| Topic | As implemented |
+| --- | --- |
+| Standard start | With `MatchSetup.start: Standard` (the skirmish default), `Sim::new` places per player, in id order, the Seat (a complete Town, `TownState { seat: true, tier: 1 }`, centred on the map start and projecting its border), then the start units on the nearest passable tiles, then the stockpile. On `plains_1v1` the Seats are `BuildingId(1)` (P0) and `BuildingId(2)` (P1), P0's Yeomen `UnitId(1..=5)` and P1's `UnitId(6..=10)`, and each Seat owns 1245 tiles. |
+| Borders | A founded Town projects its border when it completes, not when its site is placed; a site claims nothing. The kernel centre is the footprint's centre tile. |
+| Town limit | Counts every Town-kind building of the player, sites and the Seat included, against `town_limit_base` plus the Statecraft level (0 until M4a). The proposed name `TownLimitReached` is the one used. |
+| Attribution | Fixed at placement: the nearest own complete Town by `dist_sq_i64` between footprint centres, then `BuildingId`. Town sites do not count. A kind with `max_per_town` (the Croft) placed while the player has no complete Town is rejected with `PerTownLimitReached`; any other non-Town kind is then placed with no Town. |
+| Tier 2 | `town::recompute_tier` runs when a building attributed to a Town completes. The Town is tier 2 when the owner's complete buildings attributed to it cover at least `town_growth_distinct_buildings` (5) distinct non-Town kinds, else tier 1. Sites do not count, and attribution is fixed at placement: a building counts for the Town it was attributed to then, even after a nearer Town completes. A tier change moves the Town's border source to the tier's radius (`town_radius_grown_tiles`, 24, plus Statecraft, 0 until M4a) with `TerritoryField::change_source` and emits `TownTierChanged { town, tier }` and `TerritoryChanged`. The rule would also drop a Town back to tier 1, but nothing removes a complete building before combat (M4a). The Masonry Age gate waits for ages in M4a (open question 4). `territory_town_grows_to_tier_two_at_five_distinct_kinds` checks the radius and that the field equals a fresh recompute. |
+
+`Build` checks run in this order and the first failure is the reason (the one the M3b HUD will show); a rejected `Build` changes nothing and draws no randomness:
+
+1. the unit exists and is the player's (`NoValidUnits`);
+2. the kind exists (`UnknownBuildingKind`);
+3. the unit's kind can build (`NotABuilder`);
+4. an own site of the same kind at the same tile is resumed instead, at no cost (see [economy.md](economy.md));
+5. the footprint is on the map (`SiteOutOfBounds`);
+6. every footprint tile is the player's territory (`OutsideBorders`);
+7. every footprint tile is passable (`SiteBlocked`);
+8. no unit of any player stands on it (`SiteOccupied`);
+9. a Town keeps the player within the town limit (`TownLimitReached`);
+10. a kind with `max_per_town` has a complete Town to belong to and room under its limit there, sites included (`PerTownLimitReached`);
+11. a gatherer with `Adjacent` slots has at least one tile of its terrain beside the footprint (`NoAdjacentResource`);
+12. the builder can walk to a tile around the footprint, with the footprint already blocked (`SiteBlocked` when none is passable, `Unreachable` when none is reachable; a resume, check 4, is held to the same rule);
+13. the player can pay the ramped cost (`CannotAfford`, naming the first short resource).
+
 ## Interactions
 
 | System | Interaction |
@@ -133,8 +163,8 @@ These are measured with `sim-cli play-bots`, not enforced by the sim.
 
 From M3a:
 
-- [ ] `cargo test -p sim economy`: the second Town costs more than the first by exactly the rules.ron formula (part of the economy test line).
-- [ ] Scripted headless economy fixture: from the standard start (1 Town, 5 Yeomen, 150 Grain / 150 Lumber / 0 Ore / 0 Lore) a fixed build order founds a second Town before tick 3600 and the final hash matches the fixture.
+- [x] `cargo test -p sim economy`: the second Town costs more than the first by exactly the rules.ron formula (part of the economy test line).
+- [x] Scripted headless economy fixture: from the standard start (1 Town, 5 Yeomen, 150 Grain / 150 Lumber / 0 Ore / 0 Lore) a fixed build order founds a second Town before tick 3600 and the final hash matches the fixture.
 
 From M5a:
 

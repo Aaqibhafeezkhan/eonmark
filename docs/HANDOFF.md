@@ -17,10 +17,10 @@ in a game that runs and a command that proves it.
 ## State of the repository
 
 The repository was planned and scaffolded on 2026-10-05 with AI assistance.
-What is here is the M0 skeleton: a Cargo workspace of five crates, the data
-directory, CI, scripts, and the full set of design and process documents.
-Treat the tree as M0 "in progress" until every M0 acceptance checkbox in
-`docs/ROADMAP.md` is ticked with pasted command output in a merged PR.
+M0, M1 and M2 are merged. M3a is implemented on PR #26 (all six slices,
+training last) and awaits merge; M3b is next. A milestone is done when every
+acceptance checkbox in `docs/ROADMAP.md` is ticked with pasted command
+output in a merged PR.
 
 | Area | Where | Status |
 | --- | --- | --- |
@@ -29,9 +29,9 @@ Treat the tree as M0 "in progress" until every M0 acceptance checkbox in
 | Architecture and invariants | `docs/ARCHITECTURE.md`, `docs/DETERMINISM.md`, `docs/DATA_FORMAT.md` | Complete |
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
-| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M0 scope |
-| Presentation crate | `crates/game` | M0 scope: window, ground, camera, headless run |
-| CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | M0 scope, green on first push |
+| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M2 merged; M3a (economy, Towns, territory, construction, gathering, training) on PR #26; `crates/ai` holds the M0 bots until M5b |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu |
+| CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order
 

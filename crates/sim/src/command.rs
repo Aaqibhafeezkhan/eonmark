@@ -43,14 +43,17 @@ pub enum Command {
         /// Units to stop.
         units: Vec<UnitId>,
     },
-    /// Send Yeomen to a gathering building.
+    /// Send workers to a gathering building (handled from the next M3a
+    /// slice).
     Gather {
         /// Workers.
         units: Vec<UnitId>,
         /// Croft, Lumber Yard, Ore Pit or Scriptorium.
         node: BuildingId,
     },
-    /// Place a building with one worker.
+    /// Place a construction site and make `unit` its builder, or, when an
+    /// own site of `kind` already stands at `tile`, make `unit` its builder
+    /// at no cost. Every footprint tile must be the player's territory.
     Build {
         /// Builder.
         unit: UnitId,
@@ -59,7 +62,8 @@ pub enum Command {
         /// North-west tile of the footprint.
         tile: Tile,
     },
-    /// Cancel a queue slot (training or research) in a building.
+    /// Cancel a queue slot (training or research) in a building, or a
+    /// construction site with slot 0 (full refund).
     Cancel {
         /// Building.
         building: BuildingId,
@@ -108,6 +112,31 @@ pub enum Command {
         at: FxVec2,
         /// Units to spawn.
         count: u16,
+    },
+    /// Place a building of `kind` for `owner` with its north-west corner at
+    /// `tile`, as a site or, with `complete`, finished at once. Skips
+    /// borders, limits and cost; the footprint must still be on the map,
+    /// passable and free of units. Gated like `DebugSpawn`.
+    DebugPlaceBuilding {
+        /// Owning player.
+        owner: PlayerId,
+        /// Building kind (index into `buildings.ron`).
+        kind: BuildingKindId,
+        /// North-west footprint tile.
+        tile: Tile,
+        /// Finish it at once (a border source projects immediately).
+        complete: bool,
+    },
+    /// Add `amount` of resource `resource` (index into `resources.ron`) to
+    /// `owner`'s stockpile, clamped to its `stockpile_cap`. Gated like
+    /// `DebugSpawn`.
+    DebugGrant {
+        /// Receiving player.
+        owner: PlayerId,
+        /// Resource index.
+        resource: u8,
+        /// Amount added.
+        amount: u32,
     },
 }
 

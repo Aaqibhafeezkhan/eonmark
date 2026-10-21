@@ -31,6 +31,7 @@ pub enum Primitive {
 
 /// How a kind is drawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Visual {
     /// One shared primitive mesh, tinted with the owner's team colour.
     Primitive(Primitive),
@@ -142,6 +143,14 @@ mod tests {
             waypoint_radius_tiles_x100: 50,
             separation_tiles_x100: 10,
             return_to_post_radius_tiles_x100: 100,
+            class: crate::UnitClass::Civilian,
+            cost: BTreeMap::new(),
+            ramp: crate::UnitRamp::Flat,
+            pop: 1,
+            train_time_ds: 120,
+            trainer: "town".into(),
+            builder: true,
+            vision_tiles: 8,
         }]
     }
 
@@ -220,6 +229,16 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn scene_rejects_unknown_fields() {
+        let err = parse(
+            r#"(units: { "yeoman": Scene(path: "a.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, tint: 3) })"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tint"), "{err}");
     }
 
     #[test]

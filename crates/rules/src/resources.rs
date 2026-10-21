@@ -12,8 +12,9 @@ pub struct Resource {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Building ids that produce this resource. Cross-checked against
-    /// `buildings.ron` from M3a; until then only non-emptiness is checked.
+    /// Building ids that produce this resource. `Rules::load` checks it
+    /// equals the `buildings.ron` kinds whose `base_yield` or `gather`
+    /// names the resource.
     pub gathered_from: Vec<String>,
     /// One-sentence description of what the resource pays for.
     pub role: String,

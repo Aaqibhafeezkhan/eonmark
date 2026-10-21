@@ -11,7 +11,7 @@ Area: `area:sim` (grid, `SimView`) and `area:game` (shader channel, visibility t
 | Grid | 128 x 128 u8 per player (16 KiB per player) | `VisibilityGrid` in `crates/sim/src/visibility.rs` |
 | States | 0 unexplored, 1 explored, 2 visible | `visibility.rs` |
 | Stamp cadence | every tick, inside `Sim::step` | `visibility.rs` |
-| Vision radii | M0 placeholder: `vision: (unit_tiles: 8, building_tiles: 10, town_tiles: 14)`, three values by class | `data/rules/rules.ron`; per-kind radii, if wanted, replace the three values at M3a with a `rules_version` bump |
+| Vision radii | per kind, `vision_tiles`: every unit kind 8 (Yeoman, Scribe, Skirmisher); Town 14; Watchtower 12; Scriptorium, Muster Hall and Engine Yard 8; Croft, Lumber Yard and Ore Pit 6 | `data/rules/units.ron` and `data/rules/buildings.ron`; they replaced the M0 `rules.ron` placeholder at M3a (`rules_version` 6) |
 | Albedo multiplier | 0.0 unexplored, 0.45 explored, 1.0 visible | `assets/shaders/field.wgsl` (`FieldExt`) |
 | Texture channel | B of the 128 x 128 RGBA8 field texture (R owner, G strength, B fog, A supply) | `crates/game/src/ground.rs` |
 | Enemy units | hidden unless their tile is state 2 for the viewing player | `present.rs` |
@@ -20,7 +20,7 @@ Area: `area:sim` (grid, `SimView`) and `area:game` (shader channel, visibility t
 | Frame budget | 400 units + two full Towns + fog at >= 60 fps, 1440p, release, base M-series | M7 acceptance |
 | Hash impact | one `rules_version` bump in M7; every earlier golden fixture must verify after it | M7 acceptance |
 
-Vision radius values are not fixed by the design. M0 ships a three-value placeholder in `rules.ron` (`vision.unit_tiles` 8, `vision.building_tiles` 10, `vision.town_tiles` 14, validated but unused). If per-kind radii are wanted, they replace that block at M3a with a `rules_version` bump, so the rules hash and every fixture from M3a onward already contain them; the values are tuned at M7.
+Vision radius values are not fixed by the design. M0 shipped a three-value placeholder in `rules.ron` (`vision.unit_tiles` 8, `vision.building_tiles` 10, `vision.town_tiles` 14, validated but unused). M3a replaced that block with a required `vision_tiles` field (1..=64) on every unit kind in `units.ron` and every building kind in `buildings.ron`, with the `rules_version` bump to 6, so the rules hash and every fixture from M3a onward already contain them; they are loaded and validated but unused until M7, when the values are tuned.
 
 ## The visibility grid
 
@@ -78,7 +78,7 @@ Left-clicking the minimap moves the camera to that tile. Right-clicking it order
 
 | System | Interaction |
 | --- | --- |
-| Rules ([../DATA_FORMAT.md](../DATA_FORMAT.md)) | vision radii are data; `sim-cli data-check` fails if any unit or building kind lacks one once the field exists |
+| Rules ([../DATA_FORMAT.md](../DATA_FORMAT.md)) | vision radii are data; `vision_tiles` is required on every unit and building kind from M3a, so `sim-cli data-check` fails if any kind lacks one |
 | Territory ([territory.md](territory.md)) | shares the field texture; fog multiplies after tint and isoline |
 | Combat ([combat.md](combat.md)) | auto-acquire uses weapon range, which the data should keep at or below vision radius so units never shoot what their owner cannot see (see open questions) |
 | Attrition ([attrition.md](attrition.md)) | independent of fog; the supply coverage channel (A) is the same texture |
@@ -104,7 +104,7 @@ cargo run --release -p game -- --scenario fog_walkthrough
 
 ## Open questions
 
-- Vision radius starting values per kind (Yeoman, Scribe, military kinds, Towns, Watchtower). Set at M3a in `rules.ron`; the Watchtower should see further than any unit so its border placement by the bot has a purpose.
+- Vision radius starting values per kind (Yeoman, Scribe, military kinds, Towns, Watchtower). Set at M3a in `units.ron` and `buildings.ron` (table above); the Watchtower (12) sees further than any unit (8) so its border placement by the bot has a purpose. The M4a military kinds need values too; tune all of them at M7.
 - Should `data-check` enforce `vision_radius >= attack_range` for every kind that shoots? Recommended, so no unit attacks an invisible target; decide at M4a when ranges are authored.
 - Whether the enemy's territory field should be hidden under state 0 tiles. v0.1 shows borders everywhere, which keeps the minimap readable; a stricter rule would also have to filter `SimView` for the bot.
 - Fog edge softness. Bilinear sampling of the B channel gives a one-tile soft edge for free; nearest sampling gives hard tile edges. Judge on the M7 screenshot against [../ART_STYLE.md](../ART_STYLE.md).

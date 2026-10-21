@@ -129,6 +129,18 @@ pub enum ReplayError {
         /// Version found in the file.
         found: u16,
     },
+    /// The header was written by a different `SIM_VERSION`. Detected by
+    /// peeking the header's first field before decoding the rest, because
+    /// the header layout itself changes between versions (M3a appended
+    /// `MatchSetup::start`): decoding an older header with this build's
+    /// layout would misread the record stream. [`verify`] and
+    /// [`hash_dump`] report it as [`VerifyOutcome::SimVersionMismatch`].
+    SimVersion {
+        /// File involved.
+        path: PathBuf,
+        /// `sim_version` in the file's header.
+        found: u32,
+    },
     /// The header did not decode (the file is shorter than a header or corrupt).
     Header {
         /// File involved.
@@ -175,6 +187,15 @@ impl core::fmt::Display for ReplayError {
                 f,
                 "{}: unsupported replay format version {found} (this build reads {FORMAT_VERSION})",
                 path.display()
+            ),
+            ReplayError::SimVersion { path, found } => write!(
+                f,
+                "{}: {}",
+                path.display(),
+                VerifyOutcome::SimVersionMismatch {
+                    replay: *found,
+                    binary: SIM_VERSION,
+                }
             ),
             ReplayError::Header { path, source } => {
                 write!(
@@ -378,6 +399,16 @@ impl ReplayReader {
         } else {
             rest
         };
+        // `sim_version` is the header's first field; a file from another
+        // version may lay out the rest of the header differently.
+        if let Ok((found, _)) = postcard::take_from_bytes::<u32>(stream)
+            && found != SIM_VERSION
+        {
+            return Err(ReplayError::SimVersion {
+                path: path.to_path_buf(),
+                found,
+            });
+        }
         let (setup, mut rest): (MatchSetup, &[u8]) =
             postcard::take_from_bytes(stream).map_err(|source| ReplayError::Header {
                 path: path.to_path_buf(),
@@ -479,7 +510,10 @@ pub fn verify(
     data_dir: &Path,
     ai: Box<dyn AiController>,
 ) -> Result<VerifyOutcome, ReplayError> {
-    let ReplayFile { setup, records, .. } = ReplayReader::open(path)?;
+    let ReplayFile { setup, records, .. } = match open_for_check(path)? {
+        Ok(file) => file,
+        Err(outcome) => return Ok(outcome),
+    };
     let mut sim = match prepare(setup, data_dir, ai)? {
         Ok(sim) => sim,
         Err(outcome) => return Ok(outcome),
@@ -529,7 +563,10 @@ pub fn hash_dump(
     every: u32,
     mut emit: impl FnMut(u32, u64, &SubHashes),
 ) -> Result<VerifyOutcome, ReplayError> {
-    let ReplayFile { setup, records, .. } = ReplayReader::open(path)?;
+    let ReplayFile { setup, records, .. } = match open_for_check(path)? {
+        Ok(file) => file,
+        Err(outcome) => return Ok(outcome),
+    };
     let mut sim = match prepare(setup, data_dir, ai)? {
         Ok(sim) => sim,
         Err(outcome) => return Ok(outcome),
@@ -581,6 +618,20 @@ pub fn hash_dump(
         final_hash: sim.hash(),
         ticks: sim.tick(),
     })
+}
+
+/// Open `path` for [`verify`] or [`hash_dump`]: a header from another
+/// `SIM_VERSION` is the outcome [`VerifyOutcome::SimVersionMismatch`], not
+/// an error.
+fn open_for_check(path: &Path) -> Result<Result<ReplayFile, VerifyOutcome>, ReplayError> {
+    match ReplayReader::open(path) {
+        Ok(file) => Ok(Ok(file)),
+        Err(ReplayError::SimVersion { found, .. }) => Ok(Err(VerifyOutcome::SimVersionMismatch {
+            replay: found,
+            binary: SIM_VERSION,
+        })),
+        Err(e) => Err(e),
+    }
 }
 
 /// The checks shared by [`verify`] and [`hash_dump`]: `sim_version` before
@@ -974,6 +1025,78 @@ mod tests {
             }
         );
         assert_eq!(outcome.exit_code(), 1);
+    }
+
+    /// A finished replay from `SIM_VERSION` 5, whose header has no `start`
+    /// field: without the version peek the reader would decode `start` from
+    /// the first record byte and report the file as corrupt (exit 2). With
+    /// it, `verify` and `hash_dump` report the version mismatch (exit 1) and
+    /// the reader names the version.
+    #[test]
+    fn older_sim_version_header_reports_sim_version_mismatch() {
+        #[derive(Serialize)]
+        struct SetupV5 {
+            sim_version: u32,
+            git_sha: String,
+            rules_version: u32,
+            rules_hash: u64,
+            map: String,
+            seed: u64,
+            tick_rate_hz: u32,
+            cmd_delay: u32,
+            players: Vec<crate::state::PlayerSlot>,
+            debug_commands: bool,
+        }
+        let (setup, _) = scenario_setup(1);
+        let old = SetupV5 {
+            sim_version: 5,
+            git_sha: String::new(),
+            rules_version: setup.rules_version,
+            rules_hash: setup.rules_hash,
+            map: setup.map.clone(),
+            seed: setup.seed,
+            tick_rate_hz: setup.tick_rate_hz,
+            cmd_delay: setup.cmd_delay,
+            players: setup.players.clone(),
+            debug_commands: setup.debug_commands,
+        };
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend(postcard::to_allocvec(&old).unwrap());
+        bytes.extend(
+            postcard::to_allocvec(&Record::Hash(HashRecord {
+                tick: 0,
+                hash: 1,
+                sub: SubHashes::default(),
+            }))
+            .unwrap(),
+        );
+        bytes.extend_from_slice(&TRAILER);
+        let path = temp_path("sim_version_v5");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = ReplayReader::open(&path).unwrap_err();
+        assert!(
+            matches!(err, ReplayError::SimVersion { found: 5, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("SIM VERSION MISMATCH"), "{err}");
+        let want = VerifyOutcome::SimVersionMismatch {
+            replay: 5,
+            binary: SIM_VERSION,
+        };
+        let outcome = verify(&path, Path::new("/nonexistent/data"), Box::new(NoAi)).unwrap();
+        assert_eq!(outcome, want);
+        assert_eq!(outcome.exit_code(), 1);
+        let dumped = hash_dump(
+            &path,
+            Path::new("/nonexistent/data"),
+            Box::new(NoAi),
+            1,
+            |_, _, _| panic!("nothing is simulated"),
+        )
+        .unwrap();
+        assert_eq!(dumped, want);
     }
 
     #[test]

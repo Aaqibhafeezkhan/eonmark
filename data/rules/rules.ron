@@ -3,7 +3,7 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  rules_version: 4,
+  rules_version: 12,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",
@@ -12,24 +12,37 @@
   yield_cap_table: [70, 100, 150, 200],
   pop_cap_base: 25,
   pop_cap_per_arms_level: 25,
+  // Building cost = floor(base * (1000 + step * n) / 1000), n = copies of
+  // the kind already owned, sites and the Seat included.
+  building_ramp_step_permille: 200,
+  // Military cost = floor(base * min(cap, 1000 + step * T(k - 1)) / 1000),
+  // k = 1 + entries queued at the player's buildings of the trainer kind,
+  // T(m) = m * (m + 1) / 2. The 6th queued unit reaches the cap.
+  military_ramp_step_permille: 100,
+  military_ramp_cap_permille: 2250,
+  train_queue_max: 5,
+  // An idle worker seeks a free slot after 50 ds (5 s = 100 ticks) and
+  // retries every 50 ds while none is free.
+  idle_seek_delay_ds: 50,
+  idle_seek_retry_ds: 50,
+  // Standard start, besides the Seat (one Town centred on the map start).
+  standard_start: (
+    units: {"yeoman": 5},
+    stockpile: {"grain": 150, "lumber": 150, "ore": 0, "lore": 0},
+  ),
 
-  // Towns and borders (M3a).
+  // Towns and borders (M3a). The town limit counts the Seat and Town
+  // sites: 2 lets a player found a second Town before Statecraft (M4a adds
+  // 1 per Statecraft level).
   town_radius_tiles: 20,
   town_radius_grown_tiles: 24,
   town_growth_distinct_buildings: 5,
-  town_limit_base: 1,
+  town_limit_base: 2,
 
   // Attrition, supply and annexation (M5a). 32 ds = 3.2 s; 600 ds = 60 s.
   supply_radius_tiles: 14,
   attrition_interval_ds: 32,
   annexation_ds: 600,
-
-  // Vision radii placeholder (M3a targeting, M7 fog of war).
-  vision: (
-    unit_tiles: 8,
-    building_tiles: 10,
-    town_tiles: 14,
-  ),
 
   // Pathfinding (M1). Expansions shared by all requests per tick; cache entries.
   path_budget_expansions: 4000,

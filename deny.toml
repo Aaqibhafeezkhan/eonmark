@@ -26,6 +26,7 @@ ignore = [
   # RUSTSEC-2024-0370) is off and no ignore entry is needed. Re-check if
   # muda's features change (docs/DEPENDENCIES.md, cargo-deny table).
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained (not a vulnerability). Reached only through sctk-adwaita <- winit (Wayland client-side decorations) on the Linux target; a fix must come from winit/Bevy upstream." },
+  { id = "RUSTSEC-2026-0344", reason = "ruzstd 0.8.3 decompression bomb (denial of service only). Reached through bevy_image 0.19.1 (Bevy's default zstd_rust feature), which requires ruzstd ^0.8 while the fix is 0.9.1. The game decodes zstd only in KTX2 textures: Bevy's tonemapping LUTs embedded in the binary and repo-controlled assets, never untrusted input. A fix must come from a Bevy bump." },
 ]
 
 [licenses]
