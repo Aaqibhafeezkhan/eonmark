@@ -12,6 +12,9 @@
 // placement. Costs ramp by building_ramp_step_permille in rules.ron.
 // The second Town (120 Lumber with the ramp) plus a Croft (30) is exactly
 // the 150 starting Lumber; the economy_second_town fixture relies on that.
+// attack (M4a): Some((damage, range_tiles_x100, cooldown_ds)) makes the
+// complete building shoot enemy units (the Town and the Watchtower), None
+// when absent; the same block as in units.ron, prefer must stay Units.
 (
   buildings: [
     (
@@ -25,6 +28,7 @@
       hp: 2000,
       vision_tiles: 14,
       base_yield: {"grain": 10, "lumber": 10},
+      attack: Some((damage: 15, range_tiles_x100: 700, cooldown_ds: 15)),
     ),
     (
       id: "croft",
@@ -92,6 +96,7 @@
       hp: 500,
       vision_tiles: 12,
       border_radius_tiles: Some(2),
+      attack: Some((damage: 15, range_tiles_x100: 700, cooldown_ds: 15)),
     ),
     (
       id: "engine_yard",

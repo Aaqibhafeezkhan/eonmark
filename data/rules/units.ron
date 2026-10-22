@@ -2,14 +2,19 @@
 // List index is the UnitKindId; yeoman stays at 0. Integers only: fields
 // ending in _x100 are scaled by 100 (180 = 1.80 tiles per second). The sim
 // converts speed to tiles per tick and radii to fixed-point exactly once,
-// at spawn.
+// at spawn. radius_tiles_x100 is at most 50.
 // return_to_post_radius_tiles_x100: an arrived unit pushed farther than this
 // from the tile centre it arrived at walks straight back (100 = one tile).
 // Training (M3a): class, cost per resource id, ramp (Flat when absent,
 // PerUnit({...}) per unit alive or queued, Military for the shared trainer
 // queue ramp in rules.ron), pop, train_time_ds, trainer (a buildings.ron
-// id), builder, vision_tiles. Combat stats arrive in M4a; the Skirmisher
-// moves like a Yeoman until then.
+// id), builder, vision_tiles.
+// Combat (M4a): hp; attack: Some((damage, range_tiles_x100 edge to edge,
+// cooldown_ds, prefer: Units | Buildings, Units when absent)), None when
+// absent; requires_tech: Some("<techs.ron id>") on top of the age that
+// unlocks the kind (ages.ron), None when absent. The sim reads them from
+// the M4a tech and combat slices. The counter table at the end scales hits
+// by attacker and defender in permille; a pair not listed is 1000.
 (
   units: [
     (
@@ -23,6 +28,7 @@
       separation_tiles_x100: 10,
       return_to_post_radius_tiles_x100: 100,
       class: Civilian,
+      hp: 40,
       cost: {"grain": 20},
       ramp: PerUnit({"grain": 1}),
       pop: 1,
@@ -42,6 +48,7 @@
       separation_tiles_x100: 10,
       return_to_post_radius_tiles_x100: 100,
       class: Civilian,
+      hp: 30,
       cost: {"grain": 30},
       pop: 1,
       train_time_ds: 150,
@@ -51,6 +58,46 @@
     (
       id: "skirmisher",
       name: "Skirmisher",
+      speed_tiles_per_s_x100: 220,
+      radius_tiles_x100: 35,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Infantry,
+      hp: 80,
+      attack: Some((damage: 10, range_tiles_x100: 25, cooldown_ds: 10)),
+      cost: {"grain": 40},
+      ramp: Military,
+      pop: 1,
+      train_time_ds: 150,
+      trainer: "muster_hall",
+      vision_tiles: 8,
+    ),
+    (
+      id: "shieldbearer",
+      name: "Shieldbearer",
+      speed_tiles_per_s_x100: 140,
+      radius_tiles_x100: 40,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Infantry,
+      hp: 130,
+      attack: Some((damage: 12, range_tiles_x100: 25, cooldown_ds: 12)),
+      cost: {"grain": 20, "ore": 40},
+      ramp: Military,
+      pop: 1,
+      train_time_ds: 200,
+      trainer: "muster_hall",
+      vision_tiles: 8,
+    ),
+    (
+      id: "bowman",
+      name: "Bowman",
       speed_tiles_per_s_x100: 180,
       radius_tiles_x100: 35,
       arrive_radius_tiles_x100: 25,
@@ -59,12 +106,90 @@
       separation_tiles_x100: 10,
       return_to_post_radius_tiles_x100: 100,
       class: Infantry,
-      cost: {"grain": 40},
+      hp: 46,
+      attack: Some((damage: 10, range_tiles_x100: 500, cooldown_ds: 15)),
+      cost: {"grain": 20, "lumber": 40},
       ramp: Military,
       pop: 1,
-      train_time_ds: 150,
+      train_time_ds: 180,
       trainer: "muster_hall",
+      vision_tiles: 9,
+    ),
+    (
+      id: "outrider",
+      name: "Outrider",
+      speed_tiles_per_s_x100: 320,
+      radius_tiles_x100: 45,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Cavalry,
+      hp: 100,
+      attack: Some((damage: 12, range_tiles_x100: 25, cooldown_ds: 10)),
+      cost: {"grain": 30, "ore": 60},
+      ramp: Military,
+      pop: 2,
+      train_time_ds: 250,
+      trainer: "muster_hall",
+      vision_tiles: 10,
+    ),
+    (
+      id: "mangonel",
+      name: "Mangonel",
+      speed_tiles_per_s_x100: 100,
+      radius_tiles_x100: 50,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Siege,
+      hp: 120,
+      attack: Some((damage: 30, range_tiles_x100: 800, cooldown_ds: 40, prefer: Buildings)),
+      cost: {"lumber": 160},
+      ramp: Military,
+      pop: 3,
+      train_time_ds: 400,
+      trainer: "engine_yard",
       vision_tiles: 8,
     ),
+    (
+      id: "supply_wain",
+      name: "Supply Wain",
+      speed_tiles_per_s_x100: 160,
+      radius_tiles_x100: 50,
+      arrive_radius_tiles_x100: 25,
+      arrive_slowdown_radius_tiles_x100: 50,
+      waypoint_radius_tiles_x100: 50,
+      separation_tiles_x100: 10,
+      return_to_post_radius_tiles_x100: 100,
+      class: Support,
+      hp: 150,
+      cost: {"lumber": 100},
+      ramp: Military,
+      pop: 2,
+      train_time_ds: 300,
+      trainer: "engine_yard",
+      vision_tiles: 8,
+    ),
+  ],
+  // Counter table (permille). Skirmishers beat Bowmen, Bowmen beat
+  // Shieldbearers, Shieldbearers beat Outriders, Outriders beat Bowmen,
+  // Skirmishers and Mangonels, and Mangonels beat buildings; the other
+  // armed kinds do a quarter of their damage to buildings.
+  counters: [
+    (attacker: "skirmisher", defender: Kind("bowman"), permille: 2500),
+    (attacker: "bowman", defender: Kind("shieldbearer"), permille: 3000),
+    (attacker: "shieldbearer", defender: Kind("outrider"), permille: 3000),
+    (attacker: "outrider", defender: Kind("bowman"), permille: 2500),
+    (attacker: "outrider", defender: Kind("skirmisher"), permille: 1500),
+    (attacker: "outrider", defender: Kind("mangonel"), permille: 3000),
+    (attacker: "mangonel", defender: Buildings, permille: 4000),
+    (attacker: "skirmisher", defender: Buildings, permille: 250),
+    (attacker: "shieldbearer", defender: Buildings, permille: 250),
+    (attacker: "bowman", defender: Buildings, permille: 250),
+    (attacker: "outrider", defender: Buildings, permille: 250),
   ],
 )

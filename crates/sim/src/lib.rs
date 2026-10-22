@@ -15,24 +15,27 @@
 //! | [`fx`] | `Fx` 32.32 fixed point, `FxVec2`, `dist_sq_i64` |
 //! | [`ids`] | `PlayerId`, `UnitId`, `BuildingId`, kind ids, `Tile`, `IdGen` |
 //! | [`command`] | `Command`, `PlayerCommand`, `sort_commands` |
-//! | [`state`] | `Sim`, `MatchSetup`, `StartKind`, `State`, `Unit`, `Building`, `MoveOrder`, `SimEvent`, `SubHashes`, snapshot/restore, the tick order |
+//! | [`state`] | `Sim`, `MatchSetup`, `StartKind`, `State`, `Unit` (with its combat `Intent`), `Building`, `MoveOrder`, `SimEvent`, `SubHashes`, snapshot/restore, the tick order |
 //! | [`map`] | `Map`: cost grid, generation, components, neighbours, BFS, spiral |
 //! | [`pathing`] | budgeted resumable A*, request queue, transparent cache |
 //! | [`movement`] | `SpatialGrid`, movement step, group targets |
 //! | [`replay`] | `.eonreplay` writer, reader, `verify` |
-//! | [`scenarios`] | scripted M1 command streams shared by tests, benches, `record` and fixtures |
+//! | [`scenarios`] | scripted command streams shared by tests, benches, `record` and fixtures (the M4a counter duels and `combat_skirmish` among them) |
 //! | [`territory`] | `TerritoryField`: integer disc kernels per owner layer, tie-to-neutral ownership |
 //! | [`economy`] | `Economy` stockpiles and accumulators, `RateInfo`, exact income, jobs step, cost helpers |
 //! | [`construction`] | footprints, `Build` validation, sites, construction, site cancel |
 //! | [`gather`] | `Gather`, slots and stand tiles, worked-slot income, idle workers seeking work |
-//! | [`town`] | standard start, town count and limit, attribution to the nearest Town, tier growth |
-//! | [`training`] | `Train`, queue `Cancel`, `SetRally`, pop, the unit cost ramps, the training step |
+//! | [`town`] | standard start, town count and limit, attribution to the nearest Town, tier and radius refresh |
+//! | [`training`] | `Train`, queue `Cancel`, `SetRally`, pop, the unit cost ramps, the training and research step |
+//! | [`tech`] | `TechState` (ages, researched techs), Modifier-resolved player stats, `Research`, `AdvanceAge`, `DebugResearch` |
+//! | [`combat`] | unit combat stats from the Modifier rows, explicit `Attack` (hold, direct chase, path chase, give up), target acquisition by guards and attack-movers, Watchtower and Town shooters, simultaneous hits, death and building destruction |
 //! | [`ai_hook`] | `AiController`, `SimView` |
 //! | [`hash`] | xxh3 over postcard |
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod ai_hook;
+pub mod combat;
 pub mod command;
 pub mod construction;
 pub mod economy;
@@ -46,11 +49,13 @@ pub mod pathing;
 pub mod replay;
 pub mod scenarios;
 pub mod state;
+pub mod tech;
 pub mod territory;
 pub mod town;
 pub mod training;
 
 pub use ai_hook::{AiController, SimView};
+pub use combat::{AttackStats, Engage, UnitStats};
 pub use command::{Command, PlayerCommand, sort_commands};
 pub use economy::{Economy, PlayerEconomy, RateInfo};
 pub use fx::{Fx, FxVec2};
@@ -63,8 +68,9 @@ pub use pathing::{AStarSearch, PathRequest, Pathing, SearchStatus};
 pub use replay::{ReplayError, ReplayFile, ReplayReader, ReplayWriter, VerifyOutcome, verify};
 pub use rules::Rules;
 pub use state::{
-    Building, Construction, Job, MatchSetup, MoveOrder, Player, PlayerSlot, Post, QueueEntry,
-    QueueItem, RejectReason, SIM_VERSION, Sim, SimEvent, SnapshotError, StartKind, SubHashes,
-    TownState, Unit,
+    Building, Construction, Intent, Job, MatchSetup, MoveOrder, Player, PlayerSlot, Post,
+    QueueEntry, QueueItem, RejectReason, SIM_VERSION, Sim, SimEvent, SnapshotError, StartKind,
+    SubHashes, TownState, Unit,
 };
+pub use tech::{PlayerTech, TechState};
 pub use territory::{InvalidTerritoryField, Source, SourceOwner, TerritoryField};

@@ -82,7 +82,7 @@ Keys the design fixes are given as such. Keys marked "proposed" are not fixed by
 | Assign control group | ctrl + 1 to 9 | M2 |
 | Recall control group | 1 to 9 | M2 |
 | Context order (move, attack, gather, build site confirm, rally when a building is selected) | right click on ground or target | M2, M3b |
-| Attack-move | A, then left click a point (`orders::OrderMode::AttackMove`; Esc or a right click cancels). M2 ships it as a placeholder: the sim applies `Command::AttackMove` exactly like `Move` until combat lands in M4a | M2 (placeholder), M4a (real) |
+| Attack-move | A, then left click a point (`orders::OrderMode::AttackMove`; Esc or a right click cancels). M2 shipped it as a placeholder: the sim applied `Command::AttackMove` exactly like `Move` until the M4a combat behaviour slice, since which armed units engage the enemies they meet on the way and then walk on (unarmed units still just move) | M2 (placeholder), M4a (real) |
 | Stop | S (`orders.rs`; also the Stop button on the bottom bar) | M2 |
 | Set rally point | right click with a training building selected | M3b |
 | Infinite queue toggle | button on the command card; key proposed Q | M4b (moved from M3b: it needs a repeat flag on the sim's training queue, a `Command` and hash change) |

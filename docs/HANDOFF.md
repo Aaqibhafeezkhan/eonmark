@@ -17,12 +17,20 @@ in a game that runs and a command that proves it.
 ## State of the repository
 
 The repository was planned and scaffolded on 2026-10-05 with AI assistance.
-M0, M1, M2 and M3a are merged (M3a as PR #26). M3b, the game side of the
-economy, is on PR #31: its automated acceptance line is ticked and the rest
-wait on the owner's Mac (60 fps, draw calls, the border review, the controls
-checklists). A milestone is done when every
-acceptance checkbox in `docs/ROADMAP.md` is ticked with pasted command
-output in a merged PR.
+M0, M1, M2, M3a and M3b are merged (M3a as PR #26, M3b as PR #31). M3b's
+automated acceptance line is ticked; its other lines wait on the owner's Mac
+(60 fps with the draw-call count, the border review, the controls
+checklists). M4a, the simulation half of tech, ages and combat, is on PR #35:
+its four acceptance lines are ticked in `docs/ROADMAP.md` with observed
+output (the tech tests, the 20-seed counter tables, data-check and the combat
+bench), at `SIM_VERSION` 14 and `rules_version` 16 with seven golden
+fixtures. The combat bench and the `cargo test -p sim` time were measured on
+a Linux VM and still need the dev-Mac re-measure (`docs/BUILD_TIMES.md`).
+Next is M4b, the game side: research panel, age indicator, health bars and
+unit looks; M3b's open lines are due before it starts (rule 1 in
+`docs/IMPLEMENTER_NOTES.md`). A milestone is done when every acceptance
+checkbox in `docs/ROADMAP.md` is ticked with pasted command output in a
+merged PR.
 
 | Area | Where | Status |
 | --- | --- | --- |
@@ -31,8 +39,8 @@ output in a merged PR.
 | Architecture and invariants | `docs/ARCHITECTURE.md`, `docs/DETERMINISM.md`, `docs/DATA_FORMAT.md` | Complete |
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
-| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M2 merged; M3a (economy, Towns, territory, construction, gathering, training) on PR #26; `crates/ai` holds the M0 bots until M5b |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b on PR #31: buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders |
+| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a on PR #35 (tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); `crates/ai` holds the M0 bots until M5b |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b next |
 | CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order

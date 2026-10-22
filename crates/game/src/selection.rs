@@ -950,6 +950,168 @@ mod tests {
         assert_eq!(next(&sim, Some(5)), Some(2), "wraps past the busy one");
     }
 
+    /// Combat removes units and buildings from the sim between two frames:
+    /// the presenter despawns their entities and `prune_dead` drops them
+    /// from the selection and the control groups, a selected building
+    /// included, without a panic.
+    #[test]
+    fn units_and_buildings_destroyed_in_combat_leave_the_world_and_the_selection() {
+        use crate::buildings::{BuildingEntities, BuildingsPlugin};
+        use crate::present::PresentPlugin;
+        use crate::sim_driver::{ScenarioInput, SimPlugin};
+        use sim::{Command, FxVec2, PlayerCommand, PlayerId, TargetId, Tile, UnitKindId};
+        use std::time::Duration;
+
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let kind = |id: &str| {
+            UnitKindId(u16::try_from(rules.units.iter().position(|u| u.id == id).unwrap()).unwrap())
+        };
+        let (tower, _) = rules.building_kind_by_id("watchtower").unwrap();
+        let p1 = PlayerId(1);
+        // P0's Watchtower is BuildingId(1) and its Yeomen UnitId(1..=2);
+        // P1's six Mangonels UnitId(3..=8) destroy the tower (6 x 120
+        // against 500 HP), then kill the Yeomen (30 a hit against 40 HP).
+        // The Mangonels are spawned in the tick their first Attack is
+        // issued: idle armed units engage enemies in reach on their own
+        // (M4a), and the scene must still stand at tick 4.
+        let stream: sim::scenarios::Stream = vec![
+            (
+                0,
+                vec![
+                    PlayerCommand::new(
+                        LOCAL_PLAYER,
+                        0,
+                        Command::DebugPlaceBuilding {
+                            owner: LOCAL_PLAYER,
+                            kind: sim::BuildingKindId(tower),
+                            tile: Tile::new(20, 30),
+                            complete: true,
+                        },
+                    ),
+                    PlayerCommand::new(
+                        LOCAL_PLAYER,
+                        1,
+                        Command::DebugSpawn {
+                            owner: LOCAL_PLAYER,
+                            kind: kind("yeoman"),
+                            at: FxVec2::from_ints(18, 30),
+                            count: 2,
+                        },
+                    ),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    PlayerCommand::new(
+                        p1,
+                        0,
+                        Command::DebugSpawn {
+                            owner: p1,
+                            kind: kind("mangonel"),
+                            at: FxVec2::from_ints(24, 33),
+                            count: 6,
+                        },
+                    ),
+                    PlayerCommand::new(
+                        p1,
+                        1,
+                        Command::Attack {
+                            units: (3..=8).map(UnitId).collect(),
+                            target: TargetId::Building(BuildingId(1)),
+                        },
+                    ),
+                ],
+            ),
+            (
+                8,
+                vec![
+                    PlayerCommand::new(
+                        p1,
+                        2,
+                        Command::Attack {
+                            units: (3..=5).map(UnitId).collect(),
+                            target: TargetId::Unit(UnitId(1)),
+                        },
+                    ),
+                    PlayerCommand::new(
+                        p1,
+                        3,
+                        Command::Attack {
+                            units: (6..=8).map(UnitId).collect(),
+                            target: TargetId::Unit(UnitId(2)),
+                        },
+                    ),
+                ],
+            ),
+        ];
+        let setup = sim::MatchSetup::scenario(&rules, 3);
+        let handle = SimHandle::from_setup(setup, rules);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .add_plugins((
+                SimPlugin::new(handle, Box::new(ScenarioInput::new(stream))),
+                PresentPlugin,
+                BuildingsPlugin,
+            ))
+            .init_resource::<Selection>()
+            .add_systems(PostUpdate, prune_dead);
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        let mut entities = None;
+        for _ in 0..200 {
+            app.update();
+            let tick = app.world().non_send::<SimHandle>().tick();
+            if tick == 4 {
+                // Everything spawned and shown: select the tower, and the
+                // Yeomen in group 1.
+                let units = app.world().resource::<UnitEntities>().0.clone();
+                let buildings = app.world().resource::<BuildingEntities>().0.clone();
+                entities = Some((
+                    units[&UnitId(1)],
+                    units[&UnitId(2)],
+                    buildings[&BuildingId(1)],
+                ));
+                let mut selection = app.world_mut().resource_mut::<Selection>();
+                selection.set_building(BuildingId(1));
+                selection.groups[0] = [UnitId(1), UnitId(2)].into_iter().collect();
+            }
+        }
+        let (u1, u2, b1) = entities.expect("the scene was shown at tick 4");
+        let view_has = |app: &App| {
+            let sim = app.world().non_send::<SimHandle>();
+            let view = sim.view();
+            (
+                view.building(BuildingId(1)).is_some(),
+                view.unit(UnitId(1)).is_some() || view.unit(UnitId(2)).is_some(),
+            )
+        };
+        assert_eq!(view_has(&app), (false, false), "destroyed and killed");
+        assert!(
+            !app.world()
+                .resource::<BuildingEntities>()
+                .0
+                .contains_key(&BuildingId(1))
+        );
+        let units = &app.world().resource::<UnitEntities>().0;
+        assert!(!units.contains_key(&UnitId(1)) && !units.contains_key(&UnitId(2)));
+        for e in [u1, u2, b1] {
+            assert!(app.world().get_entity(e).is_err(), "{e:?} despawned");
+        }
+        let selection = app.world().resource::<Selection>();
+        assert_eq!(selection.building, None);
+        assert!(selection.groups[0].is_empty());
+    }
+
     #[test]
     fn drag_rect_distinguishes_clicks() {
         let click = DragRect {

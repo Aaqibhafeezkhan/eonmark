@@ -217,6 +217,7 @@ mod tests {
             slots: 0,
             queue: Vec::new(),
             rally: None,
+            ready_at: 0,
         }
     }
 

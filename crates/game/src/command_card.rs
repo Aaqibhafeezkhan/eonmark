@@ -11,9 +11,10 @@
 //!   full refund).
 //!
 //! A button the sim would reject is greyed, not hidden, and its tooltip is
-//! the rejection's message (`SimView::check_train`, or affordability and
-//! the town limit for Build, whose site check needs a tile); clicking it
-//! shows the message instead of sending the command. An enabled button's
+//! the rejection's message (`SimView::check_train`, or for Build
+//! `SimView::check_build_kind`: the age, the town limit and affordability,
+//! since the site checks need a tile); clicking it shows the message
+//! instead of sending the command. An enabled button's
 //! tooltip shows what it does and costs. Text comes from the rules and
 //! `data/rules/strings/en.ron`; the HUD hard-codes no number.
 //!
@@ -258,16 +259,6 @@ pub fn cost_text(rules: &Rules, cost: &[i64]) -> String {
     }
 }
 
-/// The first resource `stock` is short of for `cost`, as a rejection.
-fn shortfall(stock: &[i64], cost: &[i64]) -> Option<RejectReason> {
-    cost.iter()
-        .zip(stock)
-        .position(|(c, s)| c > s)
-        .map(|i| RejectReason::CannotAfford {
-            resource: u8::try_from(i).expect("resources fit u8"),
-        })
-}
-
 /// The label, cost and verdict of `action` now.
 pub fn evaluate(
     view: &SimView<'_>,
@@ -280,13 +271,7 @@ pub fn evaluate(
                 .building_kind(kind.0)
                 .expect("card kinds come from the rules");
             let cost = view.building_cost(LOCAL_PLAYER, kind);
-            let stock = &view.economy(LOCAL_PLAYER).stock;
-            let (towns, limit) = view.towns(LOCAL_PLAYER);
-            let verdict = if def.town && towns >= limit {
-                Err(RejectReason::TownLimitReached)
-            } else {
-                shortfall(stock, &cost).map_or(Ok(()), Err)
-            };
+            let verdict = view.check_build_kind(LOCAL_PLAYER, kind).map(|_| ());
             (def.name.clone(), cost, verdict)
         }
         CardAction::Train(building, kind) => {
@@ -566,13 +551,23 @@ pub fn selection_text(
                         .iter()
                         .enumerate()
                         .map(|(i, e)| {
-                            let QueueItem::Unit(k) = e.item;
-                            let unit = rules.unit_kind(k.0).expect("queued kinds are in the rules");
+                            let (name, total) = match e.item {
+                                QueueItem::Unit(k) => {
+                                    let unit = rules
+                                        .unit_kind(k.0)
+                                        .expect("queued kinds are in the rules");
+                                    (unit.name.as_str(), rules.train_time_ticks(unit))
+                                }
+                                QueueItem::Research { tech, ticks } => {
+                                    let tech =
+                                        rules.tech(tech.0).expect("queued techs are in the rules");
+                                    (tech.name.as_str(), ticks)
+                                }
+                            };
                             if i == 0 {
-                                let total = rules.train_time_ticks(unit).max(1);
-                                format!("{} {}%", unit.name, e.progress * 100 / total)
+                                format!("{name} {}%", e.progress * 100 / total.max(1))
                             } else {
-                                unit.name.clone()
+                                name.to_string()
                             }
                         })
                         .collect();
@@ -715,6 +710,47 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_research_shows_its_tech_name_and_progress() {
+        let mut sim = standard();
+        let rules = sim.rules().clone();
+        let lore = u8::try_from(rules.resource_index("lore").unwrap()).unwrap();
+        let letters = sim::TechId(rules.tech_by_id("letters_1").unwrap().0);
+        let p = LOCAL_PLAYER;
+        let cmds = [
+            Command::DebugPlaceBuilding {
+                owner: p,
+                kind: kind(&rules, "scriptorium"),
+                tile: sim::Tile::new(28, 67),
+                complete: true,
+            },
+            Command::DebugGrant {
+                owner: p,
+                resource: lore,
+                amount: 100,
+            },
+            Command::Research {
+                building: BuildingId(3),
+                tech: letters,
+            },
+        ];
+        let cmds: Vec<_> = (0..)
+            .zip(cmds)
+            .map(|(seq, c)| sim::PlayerCommand::new(p, seq, c))
+            .collect();
+        sim.step(&cmds);
+        let (_, ticks) = sim.view().research_quote(p, letters);
+        // Applied during tick 2 (the command delay), which also gives the
+        // head its first tick; then half the research time.
+        for _ in 0..2 + ticks / 2 - 1 {
+            sim.step(&[]);
+        }
+        let mut selection = Selection::default();
+        selection.set_building(BuildingId(3));
+        let text = selection_text(&sim.view(), &rules, &strings(), &selection);
+        assert_eq!(text.lines().last(), Some("Queue: Letters I 50%"), "{text}");
+    }
+
+    #[test]
     fn at_the_walkthroughs_pop_cap_train_is_disabled_and_says_why() {
         use sim::scenarios::{ECONOMY_WALKTHROUGH_POPCAP_TICK, commands_at, economy_walkthrough};
         let rules = rules();
@@ -759,12 +795,104 @@ mod tests {
         assert_eq!(cost_text(&r, &[0, 0, 0, 0]), "free");
     }
 
+    /// On a tile where every site check passes, a Build button's verdict
+    /// is the sim's `check_build`: enabled, the first short resource, or
+    /// the age.
     #[test]
-    fn the_first_short_resource_is_the_reason() {
-        assert_eq!(shortfall(&[150, 150, 0, 0], &[0, 100, 0, 0]), None);
+    fn the_build_verdict_is_the_sims_on_a_valid_site() {
+        let sim = standard();
+        let (view, rules) = (sim.view(), sim.rules());
+        let tile = sim::Tile::new(19, 67);
+        let mut verdicts = Vec::new();
+        for id in ["town", "scriptorium", "watchtower", "engine_yard"] {
+            let k = kind(rules, id);
+            let (_, _, verdict) = evaluate(&view, rules, CardAction::Build(k));
+            let placed = view
+                .check_build(LOCAL_PLAYER, sim::UnitId(1), k, tile)
+                .map(|_| ());
+            assert_eq!(verdict, placed, "{id}");
+            verdicts.push(verdict);
+        }
+        let ore = u8::try_from(rules.resource_index("ore").unwrap()).unwrap();
         assert_eq!(
-            shortfall(&[150, 50, 0, 0], &[0, 100, 40, 0]),
-            Some(RejectReason::CannotAfford { resource: 1 })
+            verdicts,
+            [
+                Ok(()),
+                Ok(()),
+                Err(RejectReason::CannotAfford { resource: ore }),
+                Err(RejectReason::AgeRequired),
+            ]
         );
+    }
+
+    /// The Engine Yard needs the Masonry Age: in the Hearth Age its button
+    /// is greyed with the age message although the starting Lumber pays
+    /// for it, and it is enabled once the player has advanced.
+    #[test]
+    fn the_engine_yard_build_button_waits_for_the_masonry_age() {
+        let mut sim = standard();
+        let rules = sim.rules().clone();
+        let p = LOCAL_PLAYER;
+        let yard = CardAction::Build(kind(&rules, "engine_yard"));
+        let (_, cost, verdict) = evaluate(&sim.view(), &rules, yard);
+        assert_eq!(cost_text(&rules, &cost), "150 Lumber");
+        assert!(
+            sim.view()
+                .economy(p)
+                .stock
+                .iter()
+                .zip(&cost)
+                .all(|(s, c)| s >= c),
+            "affordable from the start"
+        );
+        assert_eq!(verdict, Err(RejectReason::AgeRequired));
+        let (state, _) = card_state(&sim.view(), &rules, &strings(), yard);
+        assert_eq!(
+            state,
+            CardState {
+                enabled: false,
+                tooltip: reject_text(&strings(), &rules, &RejectReason::AgeRequired),
+            }
+        );
+        assert_eq!(state.tooltip, "Not available in this age");
+        let tech = |id: &str| sim::TechId(rules.tech_by_id(id).unwrap().0);
+        let res = |id: &str| u8::try_from(rules.resource_index(id).unwrap()).unwrap();
+        let cmds = [
+            Command::DebugResearch {
+                owner: p,
+                tech: tech("letters_1"),
+            },
+            Command::DebugResearch {
+                owner: p,
+                tech: tech("trade_1"),
+            },
+            Command::DebugGrant {
+                owner: p,
+                resource: res("grain"),
+                amount: 250,
+            },
+            Command::DebugGrant {
+                owner: p,
+                resource: res("lore"),
+                amount: 100,
+            },
+            Command::AdvanceAge { player: p },
+        ];
+        let cmds: Vec<_> = (0..)
+            .zip(cmds)
+            .map(|(seq, c)| sim::PlayerCommand::new(p, seq, c))
+            .collect();
+        sim.step(&cmds);
+        for _ in 0..sim.setup().cmd_delay {
+            sim.step(&[]);
+        }
+        assert_eq!(sim.view().age(p), 1, "the Masonry Age");
+        let (_, cost, verdict) = evaluate(&sim.view(), &rules, yard);
+        assert_eq!(
+            (cost_text(&rules, &cost), verdict),
+            ("150 Lumber".into(), Ok(()))
+        );
+        let (state, _) = card_state(&sim.view(), &rules, &strings(), yard);
+        assert!(state.enabled, "{state:?}");
     }
 }

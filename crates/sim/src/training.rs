@@ -1,5 +1,9 @@
 //! Training queues: `Train`, queue `Cancel`, `SetRally` and the training
 //! step (`docs/design/economy.md`, "Ramping costs" and "Population cap").
+//! The same queue holds research entries (`QueueItem::Research`, queued by
+//! `tech::validate_research`): they progress and cancel like units, take
+//! no pop and count toward no ramp, and a finished one completes its tech
+//! (`tech::complete`) instead of spawning anything.
 //!
 //! A complete building whose kind is a unit kind's `trainer` queues that
 //! kind, up to `train_queue_max` entries. The cost is deducted and the pop
@@ -21,11 +25,12 @@ use crate::movement;
 use crate::state::{
     Building, Construction, QueueEntry, QueueItem, RejectReason, SimEvent, State, Unit,
 };
+use crate::tech;
 use rules::Rules;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Pop `p` uses: every own unit alive plus every entry queued at an own
-/// building, each at its kind's `pop`.
+/// Pop `p` uses: every own unit alive plus every unit entry queued at an
+/// own building, each at its kind's `pop`. Research entries take no pop.
 pub(crate) fn pop_used(state: &State, rules: &Rules, p: PlayerId) -> u32 {
     let pop = |k: UnitKindId| rules.unit_kind(k.0).expect("kind in state").pop;
     let alive: u32 = state
@@ -41,21 +46,17 @@ pub(crate) fn pop_used(state: &State, rules: &Rules, p: PlayerId) -> u32 {
         .flat_map(|b| &b.queue)
         .map(|e| match e.item {
             QueueItem::Unit(k) => pop(k),
+            QueueItem::Research { .. } => 0,
         })
         .sum();
     alive.checked_add(queued).expect("pop fits u32")
 }
 
-/// `p`'s population cap. Arms research arrives in M4a; until then every
-/// player is at level 0.
-pub(crate) fn pop_cap(rules: &Rules, _p: PlayerId) -> u32 {
-    rules.pop_cap(0)
-}
-
 /// What one more unit of `kind` costs `p` now. `n` counts own units of the
 /// kind alive or queued (the standard start's Yeomen included); `k` is 1
-/// plus the entries queued at own buildings of the kind's trainer kind, of
-/// any unit kind, so every Muster Hall shares one military ramp.
+/// plus the unit entries queued at own buildings of the kind's trainer
+/// kind, of any unit kind, so every Muster Hall shares one military ramp.
+/// Research entries count toward neither.
 pub(crate) fn unit_cost_for(
     state: &State,
     rules: &Rules,
@@ -75,7 +76,9 @@ pub(crate) fn unit_cost_for(
     let mut queued_class = 0usize;
     for b in state.buildings.values().filter(|b| b.owner == p) {
         for e in &b.queue {
-            let QueueItem::Unit(k) = e.item;
+            let QueueItem::Unit(k) = e.item else {
+                continue;
+            };
             if k == kind {
                 queued_same += 1;
             }
@@ -93,9 +96,12 @@ pub(crate) fn unit_cost_for(
 /// Checks, first failure wins: the building is `p`'s (`UnknownBuilding`)
 /// and complete (`UnderConstruction`); the unit kind exists
 /// (`UnknownUnitKind`) and is trained by this building's kind
-/// (`CannotTrainHere`); the queue has room (`QueueFull`); the unit fits
-/// under the pop cap, queued units included (`PopCapReached`); `p` can pay
-/// the ramped cost (`CannotAfford`, first short resource). Returns the cost.
+/// (`CannotTrainHere`); `p` has reached the age that unlocks it
+/// (`AgeRequired`) and researched its `requires_tech`, if any
+/// (`PrerequisiteMissing`); the queue has room (`QueueFull`); the unit fits
+/// under the pop cap with its `PopCap` rows, queued units included
+/// (`PopCapReached`); `p` can pay the ramped cost (`CannotAfford`, first
+/// short resource). Returns the cost.
 pub(crate) fn validate_train(
     state: &State,
     rules: &Rules,
@@ -117,12 +123,18 @@ pub(crate) fn validate_train(
     if building_kind(rules, b.kind).id != def.trainer {
         return Err(RejectReason::CannotTrainHere);
     }
+    if !tech::age_allows_unit(state, rules, p, kind) {
+        return Err(RejectReason::AgeRequired);
+    }
+    if !tech::has_required_tech(state, rules, p, kind) {
+        return Err(RejectReason::PrerequisiteMissing);
+    }
     let max = usize::try_from(rules.train_queue_max).expect("validated <= 255");
     if b.queue.len() >= max {
         return Err(RejectReason::QueueFull);
     }
     let used = pop_used(state, rules, p);
-    if used.checked_add(def.pop).expect("pop fits u32") > pop_cap(rules, p) {
+    if used.checked_add(def.pop).expect("pop fits u32") > tech::pop_cap(state, rules, p) {
         return Err(RejectReason::PopCapReached);
     }
     let cost = unit_cost_for(state, rules, p, kind);
@@ -153,9 +165,9 @@ pub(crate) fn enqueue(
         });
 }
 
-/// Cancel queue entry `slot` of `building` (the caller checked it exists):
-/// refund exactly what it paid, clamped to stockpile caps. The head's
-/// progress is lost with it.
+/// Cancel queue entry `slot` of `building` (the caller checked it exists),
+/// a unit or a research entry: refund exactly what it paid, clamped to
+/// stockpile caps. The head's progress is lost with it.
 pub(crate) fn cancel_slot(
     state: &mut State,
     rules: &Rules,
@@ -178,9 +190,11 @@ pub(crate) fn cancel_slot(
 }
 
 /// Step 6b: every complete building's queue head gains one tick, in id
-/// order; a head that reaches its kind's training time becomes a unit. The
-/// entry behind it becomes the head and gains its first tick in the next
-/// step, so a busy building turns out one unit every `train_time` steps.
+/// order; a unit head that reaches its kind's training time becomes a
+/// unit, and a research head that reaches the time fixed when it was
+/// queued completes its tech (`tech::complete`). The entry behind it
+/// becomes the head and gains its first tick in the next step, so a busy
+/// building turns out one unit every `train_time` steps.
 pub(crate) fn step(state: &mut State, rules: &Rules, tick: u32, events: &mut Vec<SimEvent>) {
     let ids: Vec<BuildingId> = state
         .buildings
@@ -189,14 +203,25 @@ pub(crate) fn step(state: &mut State, rules: &Rules, tick: u32, events: &mut Vec
         .map(|b| b.id)
         .collect();
     for id in ids {
-        let done = {
+        let (done, item) = {
             let head = &mut state.buildings.get_mut(&id).expect("listed").queue[0];
-            let QueueItem::Unit(kind) = head.item;
-            let def = rules.unit_kind(kind.0).expect("validated unit kind");
-            head.progress = (head.progress + 1).min(rules.train_time_ticks(def));
-            head.progress == rules.train_time_ticks(def)
+            let total = match head.item {
+                QueueItem::Unit(kind) => {
+                    rules.train_time_ticks(rules.unit_kind(kind.0).expect("validated unit kind"))
+                }
+                QueueItem::Research { ticks, .. } => ticks,
+            };
+            head.progress = (head.progress + 1).min(total);
+            (head.progress == total, head.item)
         };
         if !done {
+            continue;
+        }
+        if let QueueItem::Research { tech, .. } = item {
+            let b = state.buildings.get_mut(&id).expect("listed");
+            b.queue.remove(0);
+            let owner = b.owner;
+            tech::complete(state, rules, owner, tech, events);
             continue;
         }
         let b = &state.buildings[&id];
@@ -211,7 +236,9 @@ pub(crate) fn step(state: &mut State, rules: &Rules, tick: u32, events: &mut Vec
             continue;
         };
         let b = state.buildings.get_mut(&id).expect("listed");
-        let QueueItem::Unit(kind) = b.queue.remove(0).item;
+        let QueueItem::Unit(kind) = b.queue.remove(0).item else {
+            unreachable!("a research head completed above");
+        };
         let def = rules.unit_kind(kind.0).expect("validated unit kind");
         let unit = state.ids.unit();
         let u = Unit::spawn(unit, owner, kind, tile, def, &state.map, rules.tick_rate_hz);

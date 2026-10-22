@@ -23,6 +23,7 @@ use crate::pathing::PathRequest;
 use crate::state::{
     Building, Construction, Job, MoveOrder, RejectReason, SimEvent, State, TownState, Unit,
 };
+use crate::tech;
 use crate::territory::{Source, SourceOwner};
 use crate::town;
 use rules::{BuildingKind, MapDef, Rules, Slots};
@@ -216,21 +217,23 @@ pub(crate) enum BuildPlan {
 /// 2. the kind exists (`UnknownBuildingKind`);
 /// 3. the unit's kind can build (`NotABuilder`);
 /// 4. an own site of this kind at `nw` is resumed ([`BuildPlan::Resume`]),
-///    when the unit can reach a tile beside it (as in check 12);
-/// 5. the footprint is on the map (`SiteOutOfBounds`);
-/// 6. every footprint tile is `p`'s territory (`OutsideBorders`);
-/// 7. every footprint tile is passable (`SiteBlocked`);
-/// 8. no unit of any player stands on it (`SiteOccupied`);
-/// 9. a Town keeps `p` within the town limit, sites included
-///    (`TownLimitReached`);
-/// 10. a kind with `max_per_town` has a Town to belong to and room under
+///    when the unit can reach a tile beside it (as in check 13), whatever
+///    the age;
+/// 5. `p` has reached the age that unlocks the kind (`AgeRequired`);
+/// 6. the footprint is on the map (`SiteOutOfBounds`);
+/// 7. every footprint tile is `p`'s territory (`OutsideBorders`);
+/// 8. every footprint tile is passable (`SiteBlocked`);
+/// 9. no unit of any player stands on it (`SiteOccupied`);
+/// 10. a Town keeps `p` within the town limit with its `TownLimit` rows,
+///     sites included (`TownLimitReached`);
+/// 11. a kind with `max_per_town` has a Town to belong to and room under
 ///     its limit there, sites included (`PerTownLimitReached`);
-/// 11. an `Adjacent` gatherer has at least one resource tile beside it
+/// 12. an `Adjacent` gatherer has at least one resource tile beside it
 ///     (`NoAdjacentResource`);
-/// 12. the builder can walk to a tile of the ring around the footprint,
+/// 13. the builder can walk to a tile of the ring around the footprint,
 ///     with the footprint already blocked: `SiteBlocked` when no ring tile
 ///     is passable, `Unreachable` when none is reachable;
-/// 13. `p` can pay the ramped cost (`CannotAfford`, first short resource).
+/// 14. `p` can pay the ramped cost (`CannotAfford`, first short resource).
 pub(crate) fn validate_build(
     state: &State,
     rules: &Rules,
@@ -265,6 +268,9 @@ pub(crate) fn validate_build(
         builder_stand(map, rect, u.pos)?;
         return Ok(BuildPlan::Resume { site: site.id });
     }
+    if !tech::age_allows_building(state, rules, p, kind_id) {
+        return Err(RejectReason::AgeRequired);
+    }
     let rect =
         footprint(kind, nw, map.width(), map.height()).ok_or(RejectReason::SiteOutOfBounds)?;
     if !rect.tiles().all(|t| state.territory.is_buildable(p, t)) {
@@ -282,7 +288,7 @@ pub(crate) fn validate_build(
     }
     let town = if kind.town {
         let towns = town::town_count(state, rules, p);
-        if towns >= rules.town_limit(town::statecraft(p)) {
+        if towns >= tech::town_limit(state, rules, p) {
             return Err(RejectReason::TownLimitReached);
         }
         None
@@ -309,6 +315,36 @@ pub(crate) fn validate_build(
         return Err(RejectReason::CannotAfford { resource });
     }
     Ok(BuildPlan::New { cost, slots, town })
+}
+
+/// The checks of [`validate_build`] for a new building of `kind_id` that
+/// need neither the builder nor the site, in its order, through the same
+/// functions: the kind exists (`UnknownBuildingKind`, check 2), `p` has
+/// reached the age that unlocks it (`AgeRequired`, 5), a Town keeps `p`
+/// within the town limit (`TownLimitReached`, 10) and `p` can pay the
+/// ramped cost (`CannotAfford`, 14). Returns the cost. A rejection here is
+/// `validate_build`'s on every tile where the other checks pass; resuming
+/// an own site (check 4) is not considered.
+pub(crate) fn validate_build_kind(
+    state: &State,
+    rules: &Rules,
+    p: PlayerId,
+    kind_id: BuildingKindId,
+) -> Result<Vec<i64>, RejectReason> {
+    let kind = rules
+        .building_kind(kind_id.0)
+        .ok_or(RejectReason::UnknownBuildingKind)?;
+    if !tech::age_allows_building(state, rules, p, kind_id) {
+        return Err(RejectReason::AgeRequired);
+    }
+    if kind.town && town::town_count(state, rules, p) >= tech::town_limit(state, rules, p) {
+        return Err(RejectReason::TownLimitReached);
+    }
+    let cost = economy::building_cost_for(state, rules, p, kind_id);
+    if let Some(resource) = economy::first_short(&state.economy.player(p).stock, &cost) {
+        return Err(RejectReason::CannotAfford { resource });
+    }
+    Ok(cost)
 }
 
 /// Worker slots a building of `kind` gets at `rect`: `Fixed(n)` is `n`;
@@ -401,6 +437,7 @@ pub(crate) fn place(
             slots,
             queue: Vec::new(),
             rally: None,
+            ready_at: 0,
         },
     );
     let tiles: Vec<Tile> = rect.tiles().collect();
@@ -432,11 +469,14 @@ pub(crate) fn assign_builder(
     let u = state.units.get_mut(&unit).expect("validated unit");
     u.job = Some(Job::Build { site });
     u.seek_at = None;
+    u.disengage();
     order_move(state, rules, unit, goal, tick);
 }
 
 /// Give `unit` a fresh move order to `goal` with a path request, as `Move`
-/// does for one unit: the post is cleared.
+/// does for one unit: the post is cleared. Its job and combat order are
+/// left alone (a builder walking to its site, an attacker chasing its
+/// target along a path).
 pub(crate) fn order_move(state: &mut State, rules: &Rules, unit: UnitId, goal: FxVec2, tick: u32) {
     let u = state.units.get_mut(&unit).expect("unit exists");
     u.order = Some(MoveOrder {
@@ -500,8 +540,9 @@ pub(crate) fn step(state: &mut State, rules: &Rules, tick: u32, events: &mut Vec
 }
 
 /// Finish building `id`: a Town gets its town state and projects its
-/// tier-1 border, a kind with a border radius projects that, and the Town
-/// the building is attributed to may grow a tier. Emits
+/// tier-1 border (with the owner's `TownBorderRadius` rows), a kind with a
+/// border radius projects that, and the Town the building is attributed to
+/// is re-derived ([`town::refresh`]) and may grow a tier. Emits
 /// `BuildingCompleted` (and `TerritoryChanged` when a border moved).
 pub(crate) fn complete(
     state: &mut State,
@@ -514,16 +555,18 @@ pub(crate) fn complete(
     let kind = building_kind(rules, b.kind);
     let owner = b.owner;
     let centre = centre_tile(kind, b.tile);
-    let radius = if kind.town {
+    if kind.town {
         b.town_state.get_or_insert(TownState {
             seat: false,
             tier: 1,
         });
-        Some(rules.town_radius_for(1, town::statecraft(owner)))
+    }
+    let attributed = b.town;
+    let radius = if kind.town {
+        Some(tech::town_radius(state, rules, owner, 1))
     } else {
         kind.border_radius_tiles
     };
-    let attributed = b.town;
     events.push(SimEvent::BuildingCompleted { building: id });
     if let Some(r) = radius {
         state.territory.add_source(
@@ -537,34 +580,61 @@ pub(crate) fn complete(
         events.push(SimEvent::TerritoryChanged);
     }
     if let Some(t) = attributed {
-        town::recompute_tier(state, rules, t, events);
+        town::refresh(state, rules, t, events);
     }
 }
 
-/// Cancel a site: refund what was paid (clamped to stockpile caps), unblock
-/// the footprint, remove the site and idle its builder.
+/// What [`remove_building`] took off the map.
+pub(crate) struct Removed {
+    /// The building as it was.
+    pub building: Building,
+    /// Its footprint, still blocked in the cost grid.
+    pub tiles: Vec<Tile>,
+    /// Whether it had a border source, now removed from the field.
+    pub source: bool,
+}
+
+/// Take building `id` out of the state: remove it, remove its border
+/// source if it has one (a complete Watchtower), and idle every unit whose
+/// `Job::Build` names it. The footprint is returned still blocked, so a
+/// caller removing several buildings in one tick unblocks them all with
+/// one `set_blocked_many` (one generation bump). Gather jobs on it end in
+/// step 6c, and its queue and the pop queued there go with it.
+pub(crate) fn remove_building(state: &mut State, rules: &Rules, id: BuildingId) -> Removed {
+    let building = state.buildings.remove(&id).expect("building exists");
+    let rect = footprint(
+        building_kind(rules, building.kind),
+        building.tile,
+        state.map.width(),
+        state.map.height(),
+    )
+    .expect("placed footprint");
+    let source = state.territory.remove_source(id).is_some();
+    for u in state.units.values_mut() {
+        if u.job == Some(Job::Build { site: id }) {
+            u.job = None;
+        }
+    }
+    Removed {
+        building,
+        tiles: rect.tiles().collect(),
+        source,
+    }
+}
+
+/// Cancel a site: remove it and idle its builder ([`remove_building`]),
+/// unblock the footprint and refund what was paid (clamped to stockpile
+/// caps).
 pub(crate) fn cancel_site(
     state: &mut State,
     rules: &Rules,
     id: BuildingId,
     events: &mut Vec<SimEvent>,
 ) {
-    let b = state.buildings.remove(&id).expect("site exists");
-    let rect = footprint(
-        building_kind(rules, b.kind),
-        b.tile,
-        state.map.width(),
-        state.map.height(),
-    )
-    .expect("placed footprint");
-    let tiles: Vec<Tile> = rect.tiles().collect();
-    state.map.set_blocked_many(&tiles, false);
+    let removed = remove_building(state, rules, id);
+    state.map.set_blocked_many(&removed.tiles, false);
+    let b = removed.building;
     economy::refund(rules, &mut state.economy.player_mut(b.owner).stock, &b.paid);
-    for u in state.units.values_mut() {
-        if u.job == Some(Job::Build { site: id }) {
-            u.job = None;
-        }
-    }
     events.push(SimEvent::BuildingRemoved { building: id });
 }
 

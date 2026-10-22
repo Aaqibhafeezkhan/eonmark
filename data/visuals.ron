@@ -6,7 +6,8 @@
 // kinds join in M3b.
 //
 // M2: Primitive(Capsule | Cuboid | Cylinder | Sphere), sized from the kind's
-//     radius_tiles_x100 and tinted with the owner's team colour.
+//     radius_tiles_x100 and tinted with the owner's team colour. The M4a
+//     kinds get placeholder primitives; M4b gives each kind its own look.
 // M7: Scene(path: "models/x.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0)
 //     is parsed and validated now and used by the presenter from M7.
 (
@@ -14,5 +15,10 @@
     "yeoman": Primitive(Capsule),
     "scribe": Primitive(Cylinder),
     "skirmisher": Primitive(Cuboid),
+    "shieldbearer": Primitive(Cuboid),
+    "bowman": Primitive(Cylinder),
+    "outrider": Primitive(Capsule),
+    "mangonel": Primitive(Sphere),
+    "supply_wain": Primitive(Cylinder),
   },
 )

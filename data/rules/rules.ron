@@ -3,15 +3,17 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  rules_version: 12,
+  // 16: M4a combat behaviour (acquisition, AttackMove, shooters, spawn jitter; SIM_VERSION 14).
+  rules_version: 16,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",
 
-  // Economy (M3a). Yield Cap per resource per 30 s, indexed by Trade level.
-  yield_cap_table: [70, 100, 150, 200],
+  // Economy (M3a). The Yield Cap per resource per 30 s and the pop cap
+  // before any Modifier row: from M4a the Trade techs Set the cap to 100,
+  // 150 and 200 and each Arms level adds 25 pop (techs.ron).
+  yield_cap_base: 70,
   pop_cap_base: 25,
-  pop_cap_per_arms_level: 25,
   // Building cost = floor(base * (1000 + step * n) / 1000), n = copies of
   // the kind already owned, sites and the Seat included.
   building_ramp_step_permille: 200,
@@ -32,12 +34,24 @@
   ),
 
   // Towns and borders (M3a). The town limit counts the Seat and Town
-  // sites: 2 lets a player found a second Town before Statecraft (M4a adds
-  // 1 per Statecraft level).
+  // sites: 2 lets a player found a second Town before Statecraft (each
+  // Statecraft level adds 1 to the limit and 1 tile to every own Town
+  // radius, techs.ron). From M4a a Town grows to tier 2 only once its owner
+  // has reached town_growth_age (an ages.ron id; None for no age gate).
   town_radius_tiles: 20,
   town_radius_grown_tiles: 24,
   town_growth_distinct_buildings: 5,
+  town_growth_age: Some("masonry"),
   town_limit_base: 2,
+
+  // Combat (M4a). damage_variance_permille (0..=500) spreads every hit by
+  // a seeded draw in 1000 +/- v permille; 0 draws nothing. Units acquire
+  // enemies within acquire_range_tiles, or within their weapon range when
+  // that is longer. An explicit chase re-goals its path once the target's
+  // tile is more than chase_regoal_tiles from the goal.
+  damage_variance_permille: 0,
+  acquire_range_tiles: 6,
+  chase_regoal_tiles: 2,
 
   // Attrition, supply and annexation (M5a). 32 ds = 3.2 s; 600 ds = 60 s.
   supply_radius_tiles: 14,

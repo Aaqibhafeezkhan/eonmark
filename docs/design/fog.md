@@ -11,7 +11,7 @@ Area: `area:sim` (grid, `SimView`) and `area:game` (shader channel, visibility t
 | Grid | 128 x 128 u8 per player (16 KiB per player) | `VisibilityGrid` in `crates/sim/src/visibility.rs` |
 | States | 0 unexplored, 1 explored, 2 visible | `visibility.rs` |
 | Stamp cadence | every tick, inside `Sim::step` | `visibility.rs` |
-| Vision radii | per kind, `vision_tiles`: every unit kind 8 (Yeoman, Scribe, Skirmisher); Town 14; Watchtower 12; Scriptorium, Muster Hall and Engine Yard 8; Croft, Lumber Yard and Ore Pit 6 | `data/rules/units.ron` and `data/rules/buildings.ron`; they replaced the M0 `rules.ron` placeholder at M3a (`rules_version` 6) |
+| Vision radii | per kind, `vision_tiles`: Yeoman, Scribe, Skirmisher, Shieldbearer, Mangonel and Supply Wain 8, Bowman 9, Outrider 10 (M4a); Town 14; Watchtower 12; Scriptorium, Muster Hall and Engine Yard 8; Croft, Lumber Yard and Ore Pit 6 | `data/rules/units.ron` and `data/rules/buildings.ron`; they replaced the M0 `rules.ron` placeholder at M3a (`rules_version` 6) |
 | Albedo multiplier | 0.0 unexplored, 0.45 explored, 1.0 visible | `crates/game/src/field.wgsl` (`FieldExt`, embedded in the binary) |
 | Texture channel | B of the 128 x 128 RGBA8 field texture (R owner, G strength, B fog, A supply) | `crates/game/src/field.rs` |
 | Enemy units | hidden unless their tile is state 2 for the viewing player | `present.rs` |
@@ -104,7 +104,7 @@ cargo run --release -p game -- --scenario fog_walkthrough
 
 ## Open questions
 
-- Vision radius starting values per kind (Yeoman, Scribe, military kinds, Towns, Watchtower). Set at M3a in `units.ron` and `buildings.ron` (table above); the Watchtower (12) sees further than any unit (8) so its border placement by the bot has a purpose. The M4a military kinds need values too; tune all of them at M7.
+- Vision radius starting values per kind (Yeoman, Scribe, military kinds, Towns, Watchtower). Set at M3a in `units.ron` and `buildings.ron` (table above); the Watchtower (12) sees further than any unit (at most 10, the Outrider) so its border placement by the bot has a purpose. The M4a military kinds need values too; tune all of them at M7.
 - Should `data-check` enforce `vision_radius >= attack_range` for every kind that shoots? Recommended, so no unit attacks an invisible target; decide at M4a when ranges are authored.
 - Whether the enemy's territory field should be hidden under state 0 tiles. v0.1 shows borders everywhere, which keeps the minimap readable; a stricter rule would also have to filter `SimView` for the bot.
 - Fog edge softness. Bilinear sampling of the B channel gives a one-tile soft edge for free; nearest sampling gives hard tile edges. Judge on the M7 screenshot against [../ART_STYLE.md](../ART_STYLE.md).

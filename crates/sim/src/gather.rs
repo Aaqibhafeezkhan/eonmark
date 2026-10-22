@@ -191,7 +191,8 @@ pub(crate) fn validate_gather(
     Ok(plan)
 }
 
-/// Apply a validated `Gather`.
+/// Apply a validated `Gather`: each unit in the plan drops any combat
+/// order and walks to its slot.
 pub(crate) fn apply_gather(
     state: &mut State,
     rules: &Rules,
@@ -200,6 +201,9 @@ pub(crate) fn apply_gather(
     tick: u32,
 ) {
     for &(unit, slot) in plan {
+        if let Some(u) = state.units.get_mut(&unit) {
+            u.disengage();
+        }
         assign(state, rules, unit, node, slot, tick);
     }
 }

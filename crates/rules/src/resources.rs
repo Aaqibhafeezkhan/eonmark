@@ -18,7 +18,8 @@ pub struct Resource {
     pub gathered_from: Vec<String>,
     /// One-sentence description of what the resource pays for.
     pub role: String,
-    /// `true` if income flatlines at the Yield Cap in `rules.ron`.
+    /// `true` if income flatlines at the Yield Cap (`yield_cap_base` in
+    /// `rules.ron`, changed by `YieldCap` Modifier rows such as Trade's).
     pub yield_capped: bool,
     /// Hard stockpile ceiling. Required when `yield_capped` is `false`.
     pub stockpile_cap: Option<u32>,
@@ -33,22 +34,14 @@ pub struct Resources {
 }
 
 impl Resources {
-    /// Validate ids, caps and references. `yield_cap_levels` is the length of
-    /// the Yield Cap table in `rules.ron`, passed so a later schema can check
-    /// per-resource overrides against it.
-    pub fn validate(&self, path: &Path, yield_cap_levels: usize) -> Result<(), Error> {
+    /// Validate ids, names, caps and the presence of every field. Every
+    /// error names `path` and the field.
+    pub fn validate(&self, path: &Path) -> Result<(), Error> {
         if self.resources.is_empty() {
             return Err(Error::invalid(
                 path,
                 "resources",
                 "must list at least one resource",
-            ));
-        }
-        if yield_cap_levels == 0 {
-            return Err(Error::invalid(
-                path,
-                "resources",
-                "rules.ron yield_cap_table is empty",
             ));
         }
         for (i, r) in self.resources.iter().enumerate() {
@@ -135,14 +128,14 @@ mod tests {
 
     #[test]
     fn sample_is_valid() {
-        sample().validate(Path::new("r.ron"), 4).unwrap();
+        sample().validate(Path::new("r.ron")).unwrap();
     }
 
     #[test]
     fn uncapped_resource_needs_stockpile_cap() {
         let mut r = sample();
         r.resources[1].stockpile_cap = None;
-        let err = r.validate(Path::new("r.ron"), 4).unwrap_err().to_string();
+        let err = r.validate(Path::new("r.ron")).unwrap_err().to_string();
         assert!(
             err.contains("r.ron") && err.contains("resources[1].stockpile_cap"),
             "{err}"
@@ -153,7 +146,7 @@ mod tests {
     fn duplicate_ids_are_rejected() {
         let mut r = sample();
         r.resources[1].id = "grain".into();
-        let err = r.validate(Path::new("r.ron"), 4).unwrap_err().to_string();
+        let err = r.validate(Path::new("r.ron")).unwrap_err().to_string();
         assert!(err.contains("resources[1].id"), "{err}");
     }
 

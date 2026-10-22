@@ -134,7 +134,7 @@ fn economy_walkthrough_beats_happen_in_order() {
     let town_def = rules.building_kind(town.0).expect("town");
     let yeoman_pop = rules.unit_kind(yeoman.0).expect("yeoman").pop;
     let grain = rules.resource_index("grain").expect("grain");
-    let cap = rules.pop_cap(0);
+    let cap = rules.pop_cap_base;
     assert!(
         stream.iter().flat_map(|(_, c)| c).all(|c| c.player == p0),
         "only P0 acts"
@@ -171,7 +171,7 @@ fn economy_walkthrough_beats_happen_in_order() {
     };
     let crofts = 1 + u32::try_from(late.len()).expect("a handful");
     let full_raw = 2 * town_def.base_yield["grain"] + crofts * croft_slots * gather.rate_per_worker;
-    let yield_cap = rules.yield_cap(0);
+    let yield_cap = rules.yield_cap_base;
     assert!(full_raw > yield_cap, "{full_raw} must exceed {yield_cap}");
 
     let mut sim = Sim::new(setup, rules.clone(), Box::new(NoAi));

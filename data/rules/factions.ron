@@ -1,0 +1,10 @@
+// Eonmark factions. Schema: crates/rules/src/factions.rs
+// (deny_unknown_fields). A faction's modifiers use the techs.ron row shape
+// and apply to its players from the start, before any tech's rows. Every
+// player uses the first faction until the match setup chooses one (M9).
+// Freeholders, the v0.1 faction, has no rows.
+(
+  factions: [
+    (id: "freeholders", name: "Freeholders", modifiers: []),
+  ],
+)

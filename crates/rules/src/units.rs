@@ -3,15 +3,18 @@
 //!
 //! `yeoman` stays at index 0 (scenarios and tests spawn `UnitKindId(0)`).
 //! M3a adds the class, cost, cost ramp, pop, training time, trainer
-//! building, builder flag and vision radius; combat stats arrive in M4a.
+//! building, builder flag and vision radius; M4a adds hit points, the
+//! attack, the optional `requires_tech` and the top-level counter table.
 //! Every value is an integer; fields ending in `_x100` are scaled by 100 so
 //! that `180` means `1.80`. The sim converts them to fixed-point exactly
-//! once at spawn time. `trainer` is checked against `buildings.ron` in
-//! `Rules::load`, which loads this file first.
+//! once at spawn time. `trainer` and `requires_tech` are checked against
+//! `buildings.ron` and `techs.ron` in `Rules::load`, which loads this file
+//! first.
 
 use crate::Error;
+use crate::attack::Attack;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// What a unit kind is for. Civilians gather and build; the other classes
@@ -79,6 +82,12 @@ pub struct UnitKind {
     pub return_to_post_radius_tiles_x100: u32,
     /// What the kind is for; non-civilians may use [`UnitRamp::Military`].
     pub class: UnitClass,
+    /// Hit points before Arms rows, in `1..=MAX_HP`.
+    pub hp: u32,
+    /// How the kind attacks; `None` (the default) for a kind that never
+    /// attacks.
+    #[serde(default)]
+    pub attack: Option<Attack>,
     /// Base training cost per resource id. Zero entries are omitted.
     pub cost: BTreeMap<String, u32>,
     /// How the cost grows; [`UnitRamp::Flat`] when absent.
@@ -90,6 +99,11 @@ pub struct UnitKind {
     pub train_time_ds: u32,
     /// Building kind id that trains this kind (`buildings.ron`).
     pub trainer: String,
+    /// A tech id (`techs.ron`) the owner must have researched before
+    /// training the kind, on top of the age that unlocks it; `None` (the
+    /// default) when the age alone gates it.
+    #[serde(default)]
+    pub requires_tech: Option<String>,
     /// Whether the kind can construct buildings (`Build`).
     #[serde(default)]
     pub builder: bool,
@@ -102,12 +116,37 @@ fn default_return_to_post_radius_tiles_x100() -> u32 {
     100
 }
 
+/// The defender side of a counter row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Defender {
+    /// Units of the kind with this id.
+    Kind(String),
+    /// Every building kind, sites included.
+    Buildings,
+}
+
+/// One row of the counter table: hits by `attacker` on `defender` are
+/// scaled by `permille`. A pair that is not listed is 1000 (x1.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Counter {
+    /// Unit kind id of the attacker; the kind must have an attack.
+    pub attacker: String,
+    /// What it hits.
+    pub defender: Defender,
+    /// Damage multiplier in permille, in `1..=10000`.
+    pub permille: u32,
+}
+
 /// Contents of `data/rules/units.ron`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Units {
     /// Unit kinds in `UnitKindId` order.
     pub units: Vec<UnitKind>,
+    /// The counter table; empty when absent.
+    #[serde(default)]
+    pub counters: Vec<Counter>,
 }
 
 /// Upper bound on every `_x100` field so the sim's fixed-point conversion
@@ -117,6 +156,11 @@ pub const MAX_X100: u32 = 100_000;
 pub const MAX_POP: u32 = 100;
 /// Largest `train_time_ds` (one hour).
 pub const MAX_TRAIN_TIME_DS: u32 = 36_000;
+/// Largest `radius_tiles_x100`: movement's neighbour query radius grows with
+/// the largest radius of any kind, so this bounds its cost.
+pub const MAX_UNIT_RADIUS_X100: u32 = 50;
+/// Largest counter multiplier in permille (x10).
+pub const MAX_COUNTER_PERMILLE: u32 = 10_000;
 
 impl Units {
     /// Validate ids, ranges and resource ids in costs (`resource_ids` from
@@ -174,6 +218,13 @@ impl Units {
             };
             positive("speed_tiles_per_s_x100", u.speed_tiles_per_s_x100)?;
             positive("radius_tiles_x100", u.radius_tiles_x100)?;
+            if u.radius_tiles_x100 > MAX_UNIT_RADIUS_X100 {
+                return Err(Error::invalid(
+                    path,
+                    &field("radius_tiles_x100"),
+                    format!("{} must be <= {MAX_UNIT_RADIUS_X100}", u.radius_tiles_x100),
+                ));
+            }
             positive("waypoint_radius_tiles_x100", u.waypoint_radius_tiles_x100)?;
             let bounded = |name: &str, v: u32| -> Result<(), Error> {
                 if v > MAX_X100 {
@@ -210,6 +261,55 @@ impl Units {
                 ));
             }
             validate_training(path, i, u, resource_ids)?;
+            validate_combat(path, i, u)?;
+        }
+        self.validate_counters(path)
+    }
+
+    /// The counter table: the attacker is a kind with an attack, a `Kind`
+    /// defender is a kind, each pair is listed once and `permille` is in
+    /// `1..=10000`. Errors name `counters[j].<field>`.
+    fn validate_counters(&self, path: &Path) -> Result<(), Error> {
+        let mut pairs = BTreeSet::new();
+        for (j, c) in self.counters.iter().enumerate() {
+            let field = |name: &str| format!("counters[{j}].{name}");
+            let Some(attacker) = self.get(&c.attacker) else {
+                return Err(Error::invalid(
+                    path,
+                    &field("attacker"),
+                    format!("{:?} is not a unit id", c.attacker),
+                ));
+            };
+            if attacker.attack.is_none() {
+                return Err(Error::invalid(
+                    path,
+                    &field("attacker"),
+                    format!("{:?} has no attack", c.attacker),
+                ));
+            }
+            if let Defender::Kind(id) = &c.defender
+                && self.get(id).is_none()
+            {
+                return Err(Error::invalid(
+                    path,
+                    &field("defender"),
+                    format!("{id:?} is not a unit id"),
+                ));
+            }
+            if !pairs.insert((c.attacker.as_str(), &c.defender)) {
+                return Err(Error::invalid(
+                    path,
+                    &field("defender"),
+                    format!("{:?} against {:?} is listed twice", c.attacker, c.defender),
+                ));
+            }
+            if !(1..=MAX_COUNTER_PERMILLE).contains(&c.permille) {
+                return Err(Error::invalid(
+                    path,
+                    &field("permille"),
+                    format!("{} must be in 1..={MAX_COUNTER_PERMILLE}", c.permille),
+                ));
+            }
         }
         Ok(())
     }
@@ -223,6 +323,31 @@ impl Units {
     pub fn kind(&self, index: u16) -> Option<&UnitKind> {
         self.units.get(usize::from(index))
     }
+}
+
+/// The M4a combat fields of `units[i]`: `hp` in `1..=MAX_HP`, the attack's
+/// ranges, a non-empty `requires_tech`. The tech itself is resolved by
+/// `Rules::load` once `techs.ron` is loaded.
+fn validate_combat(path: &Path, i: usize, u: &UnitKind) -> Result<(), Error> {
+    let field = |name: &str| format!("units[{i}].{name}");
+    if !(1..=crate::buildings::MAX_HP).contains(&u.hp) {
+        return Err(Error::invalid(
+            path,
+            &field("hp"),
+            format!("{} must be in 1..={}", u.hp, crate::buildings::MAX_HP),
+        ));
+    }
+    if let Some(a) = &u.attack {
+        crate::attack::validate(path, &field("attack"), a)?;
+    }
+    if u.requires_tech.as_deref() == Some("") {
+        return Err(Error::invalid(
+            path,
+            &field("requires_tech"),
+            "must not be empty; omit it or use None",
+        ));
+    }
+    Ok(())
 }
 
 /// The M3a training fields of `units[i]`.
@@ -290,25 +415,67 @@ mod tests {
             separation_tiles_x100: 10,
             return_to_post_radius_tiles_x100: 100,
             class: UnitClass::Civilian,
+            hp: 40,
+            attack: None,
             cost: BTreeMap::from([("grain".into(), 20)]),
             ramp: UnitRamp::PerUnit(BTreeMap::from([("grain".into(), 1)])),
             pop: 1,
             train_time_ds: 120,
             trainer: "town".into(),
+            requires_tech: None,
             builder: true,
             vision_tiles: 8,
+        }
+    }
+
+    fn skirmisher() -> UnitKind {
+        UnitKind {
+            id: "skirmisher".into(),
+            name: "Skirmisher".into(),
+            class: UnitClass::Infantry,
+            hp: 80,
+            attack: Some(Attack {
+                damage: 10,
+                range_tiles_x100: 25,
+                cooldown_ds: 10,
+                prefer: crate::Prefer::Units,
+            }),
+            cost: BTreeMap::from([("grain".into(), 40)]),
+            ramp: UnitRamp::Military,
+            trainer: "muster_hall".into(),
+            builder: false,
+            ..yeoman()
         }
     }
 
     const RES: [&str; 4] = ["grain", "lumber", "ore", "lore"];
 
     /// The movement and training fields every RON sample below shares.
-    const FIELDS: &str = r#"id: "yeoman", name: "Yeoman", speed_tiles_per_s_x100: 180, radius_tiles_x100: 35, arrive_radius_tiles_x100: 25, arrive_slowdown_radius_tiles_x100: 50, waypoint_radius_tiles_x100: 50, separation_tiles_x100: 10, class: Civilian, cost: {"grain": 20}, pop: 1, train_time_ds: 120, trainer: "town", vision_tiles: 8"#;
+    const FIELDS: &str = r#"id: "yeoman", name: "Yeoman", speed_tiles_per_s_x100: 180, radius_tiles_x100: 35, arrive_radius_tiles_x100: 25, arrive_slowdown_radius_tiles_x100: 50, waypoint_radius_tiles_x100: 50, separation_tiles_x100: 10, class: Civilian, hp: 40, cost: {"grain": 20}, pop: 1, train_time_ds: 120, trainer: "town", vision_tiles: 8"#;
 
     fn sample() -> Units {
         Units {
             units: vec![yeoman()],
+            counters: Vec::new(),
         }
+    }
+
+    /// A Yeoman and a Skirmisher with a counter row against the Yeoman.
+    fn armed() -> Units {
+        Units {
+            units: vec![yeoman(), skirmisher()],
+            counters: vec![Counter {
+                attacker: "skirmisher".into(),
+                defender: Defender::Kind("yeoman".into()),
+                permille: 1500,
+            }],
+        }
+    }
+
+    fn err(u: &Units) -> String {
+        u.validate(Path::new("u.ron"), &RES)
+            .unwrap_err()
+            .to_string()
     }
 
     #[test]
@@ -392,7 +559,79 @@ mod tests {
         assert_eq!(u.units[0].return_to_post_radius_tiles_x100, 100);
         assert_eq!(u.units[0].ramp, UnitRamp::Flat);
         assert!(!u.units[0].builder);
+        assert_eq!(u.units[0].attack, None);
+        assert_eq!(u.units[0].requires_tech, None);
+        assert!(u.counters.is_empty());
         u.validate(Path::new("u.ron"), &RES).unwrap();
+    }
+
+    #[test]
+    fn hp_is_required() {
+        let text = format!("(units: [({})])", FIELDS.replace("hp: 40, ", ""));
+        let e = crate::parse_ron::<Units>(Path::new("u.ron"), &text).unwrap_err();
+        assert!(e.to_string().contains("hp"), "{e}");
+    }
+
+    #[test]
+    fn combat_fields_are_checked_with_field_names() {
+        armed().validate(Path::new("u.ron"), &RES).unwrap();
+        let mut u = armed();
+        u.units[0].hp = 0;
+        assert!(err(&u).contains("units[0].hp"));
+        let mut u = armed();
+        u.units[0].hp = crate::buildings::MAX_HP + 1;
+        assert!(err(&u).contains("units[0].hp"));
+        let mut u = armed();
+        u.units[1].attack.as_mut().unwrap().range_tiles_x100 = 0;
+        assert!(err(&u).contains("units[1].attack.range_tiles_x100"));
+        let mut u = armed();
+        u.units[1].radius_tiles_x100 = MAX_UNIT_RADIUS_X100 + 1;
+        assert!(err(&u).contains("units[1].radius_tiles_x100"));
+        let mut u = armed();
+        u.units[1].requires_tech = Some(String::new());
+        assert!(err(&u).contains("units[1].requires_tech"));
+    }
+
+    #[test]
+    fn counter_rows_are_checked_with_field_names() {
+        let mut u = armed();
+        u.counters[0].attacker = "yeoman".into();
+        let e = err(&u);
+        assert!(
+            e.contains("counters[0].attacker") && e.contains("no attack"),
+            "{e}"
+        );
+        let mut u = armed();
+        u.counters[0].attacker = "dragon".into();
+        assert!(err(&u).contains("counters[0].attacker"));
+        let mut u = armed();
+        u.counters[0].defender = Defender::Kind("dragon".into());
+        assert!(err(&u).contains("counters[0].defender"));
+        let mut u = armed();
+        u.counters[0].permille = 0;
+        assert!(err(&u).contains("counters[0].permille"));
+        let mut u = armed();
+        u.counters[0].permille = MAX_COUNTER_PERMILLE + 1;
+        assert!(err(&u).contains("counters[0].permille"));
+        let mut u = armed();
+        u.counters.push(u.counters[0].clone());
+        let e = err(&u);
+        assert!(
+            e.contains("counters[1].defender") && e.contains("twice"),
+            "{e}"
+        );
+        let mut u = armed();
+        u.counters.push(Counter {
+            attacker: "skirmisher".into(),
+            defender: Defender::Buildings,
+            permille: 250,
+        });
+        u.validate(Path::new("u.ron"), &RES).unwrap();
+        let text = format!(
+            r#"(units: [({FIELDS})], counters: [(attacker: "yeoman", defender: Buildings, permille: 250)])"#
+        );
+        let parsed = crate::parse_ron::<Units>(Path::new("u.ron"), &text).unwrap();
+        assert_eq!(parsed.counters[0].defender, Defender::Buildings);
     }
 
     #[test]
@@ -490,8 +729,8 @@ mod tests {
 
     #[test]
     fn unknown_field_is_rejected_with_name() {
-        let text = format!("(units: [({FIELDS}, hp: 3)])");
+        let text = format!("(units: [({FIELDS}, armour: 3)])");
         let err = crate::parse_ron::<Units>(Path::new("u.ron"), &text).unwrap_err();
-        assert!(err.to_string().contains("hp"), "{err}");
+        assert!(err.to_string().contains("armour"), "{err}");
     }
 }

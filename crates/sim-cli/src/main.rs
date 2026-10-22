@@ -75,10 +75,11 @@ enum Cmd {
         /// Replay file (.eonreplay).
         replay: PathBuf,
     },
-    /// Measure step time: N units crossing the map, one saturated A* budget,
-    /// or territory recompute.
+    /// Measure step time: N units crossing the map, N units fighting, one
+    /// saturated A* budget, or territory recompute.
     Bench {
-        /// Units to spawn and move.
+        /// Units to spawn and move (--combat: both sides together, four kinds
+        /// a side, rounded down to a multiple of 8).
         #[arg(long, default_value_t = 500)]
         units: u16,
         /// Ticks to simulate.
@@ -90,6 +91,10 @@ enum Cmd {
         /// Benchmark incremental territory recompute instead of the crossing.
         #[arg(long)]
         territory: bool,
+        /// Benchmark a battle instead of the crossing: --units split into two
+        /// sides that attack-move at each other.
+        #[arg(long, conflicts_with_all = ["astar", "territory"])]
+        combat: bool,
         /// Border sources placed before the timed edits (--territory).
         #[arg(long, default_value_t = 16)]
         sources: u32,
@@ -166,6 +171,13 @@ fn main() -> ExitCode {
             ..
         } => hash_dump_replay(&cli.data, &replay, every),
         Cmd::Verify { replay } => verify(&cli.data, &replay),
+        Cmd::Bench {
+            combat: true,
+            units,
+            ticks,
+            seed,
+            ..
+        } => bench_combat(&cli.data, units, ticks, seed),
         Cmd::Bench {
             territory: true,
             sources,
@@ -276,12 +288,15 @@ fn data_check(dir: &Path) -> ExitCode {
     match Rules::load(dir).and_then(|r| Ok((r, rules::strings::Strings::load(dir, "en")?))) {
         Ok((r, _strings)) => {
             println!(
-                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} maps={} strings=en",
+                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} ages={} techs={} factions={} maps={} strings=en",
                 r.rules_version,
                 r.rules_hash(),
                 r.resources.resources.len(),
                 r.units.len(),
                 r.buildings.len(),
+                r.ages.len(),
+                r.techs.len(),
+                r.factions.len(),
                 r.maps.keys().cloned().collect::<Vec<_>>().join(",")
             );
             ExitCode::SUCCESS
@@ -916,6 +931,116 @@ fn bench_territory(data: &Path, sources: u32, edits: u32, seed: u64) -> ExitCode
     }
 }
 
+/// `bench --combat` exits 1 when fewer ticks than this were fighting ticks:
+/// the battle was too short to measure.
+const COMBAT_MIN_FIGHTING_TICKS: usize = 100;
+
+/// What `bench --combat` measured.
+struct CombatBench {
+    /// Units spawned: `--units` rounded down to a multiple of 8.
+    units: u16,
+    /// Milliseconds per step, every tick.
+    step_ms: Vec<f64>,
+    /// Milliseconds per step over the fighting ticks: ticks with at least
+    /// one `Hit` after whose step both sides still have a quarter of their
+    /// units (50 of 200 at the acceptance size, 400 units).
+    fighting_ms: Vec<f64>,
+    /// `Hit` events.
+    hits: u64,
+    /// `UnitDied` events per owner.
+    deaths: [u32; 2],
+    /// `BuildingDestroyed` events.
+    destroyed: u32,
+    /// Hash after the last tick.
+    final_hash: u64,
+}
+
+/// Run [`sim::scenarios::combat_bench`] for `ticks` ticks, timing each
+/// `step` alone (events and unit counts are read outside the timed region).
+fn run_combat_bench(rules: &Rules, units: u16, ticks: u32, seed: u64) -> CombatBench {
+    let (setup, stream) = sim::scenarios::combat_bench(rules, units, seed);
+    let mut sim = scenarios::build(&setup, rules);
+    let per_side_quarter = usize::from(units / 8);
+    let mut b = CombatBench {
+        units: units / 8 * 8,
+        step_ms: Vec::with_capacity(ticks as usize),
+        fighting_ms: Vec::new(),
+        hits: 0,
+        deaths: [0; 2],
+        destroyed: 0,
+        final_hash: 0,
+    };
+    for t in 0..ticks {
+        let cmds = sim::scenarios::commands_at(&stream, t);
+        let start = Instant::now();
+        sim.step(cmds);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        b.step_ms.push(ms);
+        let mut tick_hits = 0u64;
+        for e in sim.drain_events() {
+            match e {
+                SimEvent::Hit { .. } => tick_hits += 1,
+                SimEvent::UnitDied { owner, .. } => b.deaths[usize::from(owner.0)] += 1,
+                SimEvent::BuildingDestroyed { .. } => b.destroyed += 1,
+                _ => {}
+            }
+        }
+        b.hits += tick_hits;
+        let mut alive = [0usize; 2];
+        for u in sim.view().units() {
+            alive[usize::from(u.owner.0)] += 1;
+        }
+        if tick_hits > 0 && alive.iter().all(|&n| n >= per_side_quarter) {
+            b.fighting_ms.push(ms);
+        }
+    }
+    b.final_hash = sim.hash();
+    b
+}
+
+/// The `bench --combat` report, one line per entry.
+fn combat_bench_report(b: &CombatBench, ticks: u32, seed: u64) -> Vec<String> {
+    let (mean, p95, max) = stats_ms(&b.step_ms);
+    let (f_mean, f_p95, _) = stats_ms(&b.fighting_ms);
+    vec![
+        format!("bench combat units={} ticks={ticks} seed={seed}", b.units),
+        format!("step_ms mean={mean:.3} p95={p95:.3} max={max:.3}"),
+        format!(
+            "fighting_ticks={} fighting_mean_ms={f_mean:.3} fighting_p95_ms={f_p95:.3}",
+            b.fighting_ms.len()
+        ),
+        format!(
+            "hits={} deaths_p0={} deaths_p1={} destroyed={}",
+            b.hits, b.deaths[0], b.deaths[1], b.destroyed
+        ),
+        format!("final_hash=0x{:016x}", b.final_hash),
+    ]
+}
+
+/// `bench --combat`: step time while `units` units fight, half on each side
+/// (ROADMAP M4a: mean step < 5 ms with 200 vs 200 fighting; the PR also
+/// reads the fighting-tick mean against 5 ms and its p95 against 10 ms).
+/// Exits 1 only when fewer than [`COMBAT_MIN_FIGHTING_TICKS`] ticks were
+/// fighting ticks, not on the timing budget, like the other benches.
+fn bench_combat(data: &Path, units: u16, ticks: u32, seed: u64) -> ExitCode {
+    let rules = match load_rules(data) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let b = run_combat_bench(&rules, units, ticks, seed);
+    for line in combat_bench_report(&b, ticks, seed) {
+        println!("{line}");
+    }
+    if b.fighting_ms.len() < COMBAT_MIN_FIGHTING_TICKS {
+        eprintln!(
+            "bench combat: {} fighting ticks, fewer than {COMBAT_MIN_FIGHTING_TICKS}: too short a battle to measure",
+            b.fighting_ms.len()
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 /// What one fuzz case observed.
 struct FuzzCase {
     commands: usize,
@@ -1142,6 +1267,15 @@ mod tests {
             .filter(|r| matches!(r, sim::replay::Record::Hash(_)))
             .count();
         assert_eq!(hashes, 90);
+        // Nothing in the stream draws from the rng: its sub-hash never moves.
+        let rng: std::collections::BTreeSet<u64> = recs
+            .iter()
+            .filter_map(|r| match r {
+                sim::replay::Record::Hash(h) => Some(h.sub.rng),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rng.len(), 1, "the selftest stream draws nothing");
         // A different seed changes the final hash.
         let out3 = temp("selftest_seed2.eonreplay");
         let (final_hash3, _) =
@@ -1221,6 +1355,66 @@ mod tests {
         assert_eq!(b.edit_ms.len(), 40);
         assert!(b.matches);
         assert_eq!((b.width, b.height), (128, 128));
+    }
+
+    #[test]
+    fn cli_parses_bench_combat_flags() {
+        let cli = Cli::try_parse_from([
+            "sim-cli", "bench", "--units", "400", "--ticks", "1200", "--combat",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Bench {
+                combat: true,
+                astar: false,
+                territory: false,
+                units: 400,
+                ticks: 1200,
+                seed: 1,
+                ..
+            }
+        ));
+        for other in ["--astar", "--territory"] {
+            assert!(Cli::try_parse_from(["sim-cli", "bench", "--combat", other]).is_err());
+        }
+    }
+
+    /// The acceptance bench at a tenth of its size: the lines fight, both
+    /// sides lose units, and the run is repeatable.
+    #[test]
+    fn bench_combat_small_run_fights() {
+        let rules = load_rules(&data()).unwrap();
+        let b = run_combat_bench(&rules, 43, 300, 1);
+        assert_eq!(b.units, 40, "rounded down to a multiple of 8");
+        assert_eq!(b.step_ms.len(), 300);
+        assert!(b.hits > 0);
+        assert!(b.deaths.iter().all(|&d| d > 0), "{:?}", b.deaths);
+        assert!(!b.fighting_ms.is_empty());
+        assert_eq!(b.destroyed, 0, "no buildings on the field");
+        // 43 rounds down to the same 40-unit battle, and it repeats exactly.
+        assert_eq!(
+            run_combat_bench(&rules, 40, 300, 1).final_hash,
+            b.final_hash
+        );
+        let report = combat_bench_report(&b, 300, 1);
+        let prefixes = [
+            "bench combat units=40 ticks=300 seed=1",
+            "step_ms mean=",
+            "fighting_ticks=",
+            "hits=",
+            "final_hash=0x",
+        ];
+        assert_eq!(report.len(), prefixes.len());
+        for (line, prefix) in report.iter().zip(prefixes) {
+            assert!(line.starts_with(prefix), "{line}");
+        }
+        assert!(
+            report[2].contains(" fighting_mean_ms=") && report[2].contains(" fighting_p95_ms=")
+        );
+        assert!(report[3].contains(" deaths_p0=") && report[3].contains(" destroyed=0"));
+        // Exit 1 only for too few fighting ticks: 50 ticks cannot hold 100.
+        assert_eq!(bench_combat(&data(), 40, 50, 1), ExitCode::FAILURE);
     }
 
     #[test]

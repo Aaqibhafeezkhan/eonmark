@@ -1,9 +1,10 @@
 //! Orders (M2 decision 6): a right click on the ground becomes
 //! `Command::Move { units: selection, target, queue: shift }`, S is Stop,
-//! A then left click is the `AttackMove` placeholder (the sim applies it like
-//! Move until M4a). The ground hit is one ray-plane intersection with
-//! y = 0 (`Camera::viewport_to_world`, then solve for t): never a mesh
-//! raycast. World clicks are ignored while the pointer is over the HUD
+//! A then left click is `AttackMove`: the sim moves the selection there,
+//! and its armed units fight any enemy they meet on the way, then walk on
+//! (M4a; unarmed units just move). The ground hit is one ray-plane
+//! intersection with y = 0 (`Camera::viewport_to_world`, then solve for
+//! t): never a mesh raycast. World clicks are ignored while the pointer is over the HUD
 //! (`PointerOverUi`).
 //!
 //! Every order goes through `PendingCommands::push_local`, which stamps the
@@ -94,7 +95,8 @@ pub fn issue_stop(pending: &mut PendingCommands, selection: &Selection) -> Optio
     }))
 }
 
-/// Queue an `AttackMove` for the selection (applied like `Move` until M4a).
+/// Queue an `AttackMove` for the selection: armed units engage enemies on
+/// the way and resume; unarmed ones move as with `Move`.
 pub fn issue_attack_move(
     pending: &mut PendingCommands,
     selection: &Selection,

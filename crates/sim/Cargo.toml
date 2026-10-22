@@ -35,6 +35,10 @@ harness = false
 name = "territory_recompute"
 harness = false
 
+[[bench]]
+name = "combat_step"
+harness = false
+
 [lints]
 workspace = true
 

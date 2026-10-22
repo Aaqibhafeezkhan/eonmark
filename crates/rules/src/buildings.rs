@@ -3,12 +3,14 @@
 //!
 //! The list index is the sim's `BuildingKindId`. Exactly one kind is the
 //! Town (`town: true`); it is the border source every player starts with
-//! and founds more of. Costs, base yields and gather rates are integers;
+//! and founds more of. From M4a a kind may carry an `attack` (the Town and
+//! the Watchtower shoot). Costs, base yields and gather rates are integers;
 //! rates are per 30 s ([`crate::RATE_PERIOD_DS`]). Cross-references to
 //! `resources.ron` and `units.ron` are checked here, the reverse ones
 //! (`resources[i].gathered_from`, `units[i].trainer`) in `Rules::load`.
 
 use crate::Error;
+use crate::attack::{Attack, Prefer};
 use crate::map::Terrain;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,6 +57,10 @@ pub struct BuildingKind {
     /// The Town's radius comes from `rules.ron` instead.
     #[serde(default)]
     pub border_radius_tiles: Option<u32>,
+    /// How the complete building shoots at enemy units; `None` (the
+    /// default) for a kind that does not shoot. `prefer` must be `Units`.
+    #[serde(default)]
+    pub attack: Option<Attack>,
 }
 
 impl BuildingKind {
@@ -259,6 +265,16 @@ fn validate_kind(
         }
         in_range("border_radius_tiles", r, 1, MAX_RADIUS_TILES)?;
     }
+    if let Some(a) = &b.attack {
+        crate::attack::validate(path, &field("attack"), a)?;
+        if a.prefer != Prefer::Units {
+            return Err(Error::invalid(
+                path,
+                &field("attack.prefer"),
+                "a building shoots enemy units only; use Units or omit it",
+            ));
+        }
+    }
     if b.projects_border() && (b.width_tiles.is_multiple_of(2) || b.height_tiles.is_multiple_of(2))
     {
         return Err(Error::invalid(
@@ -320,6 +336,7 @@ mod tests {
             gather: None,
             max_per_town: None,
             border_radius_tiles: None,
+            attack: None,
         }
     }
 
@@ -350,6 +367,12 @@ mod tests {
         tower.width_tiles = 1;
         tower.height_tiles = 1;
         tower.border_radius_tiles = Some(2);
+        tower.attack = Some(Attack {
+            damage: 15,
+            range_tiles_x100: 700,
+            cooldown_ds: 15,
+            prefer: Prefer::Units,
+        });
         Buildings {
             buildings: vec![town, croft, yard, tower],
         }
@@ -430,6 +453,16 @@ mod tests {
             max: 6,
         };
         assert!(err(&b).contains("buildings[2].gather.slots.terrain"));
+    }
+
+    #[test]
+    fn shooter_attacks_are_checked() {
+        let mut b = sample();
+        b.buildings[3].attack.as_mut().unwrap().cooldown_ds = 0;
+        assert!(err(&b).contains("buildings[3].attack.cooldown_ds"));
+        let mut b = sample();
+        b.buildings[3].attack.as_mut().unwrap().prefer = Prefer::Buildings;
+        assert!(err(&b).contains("buildings[3].attack.prefer"));
     }
 
     #[test]

@@ -36,6 +36,14 @@
 //!    overlapping pairs in `(UnitId, UnitId)` order, half the penetration
 //!    each; a correction that would enter a blocked tile is dropped.
 //!
+//! A unit that `combat::think` engaged this tick (step 5a) replaces step 1
+//! with its [`Engage`]: hold (no desired velocity, idle push cap, facing
+//! the target) or chase (straight at the target's point, moving push cap);
+//! steps 2 to 4 apply as to any unit. A path chaser that `think` lists as
+//! awaiting (a path request outstanding) follows its path as usual but
+//! does not arrive at the final waypoint: it keeps steering at it and keeps
+//! its order until the new path lands.
+//!
 //! Units never enter a blocked tile. Repath triggers (each re-issues a
 //! `PathRequest` through `Pathing::request`, unless one is still
 //! outstanding): the next waypoint's tile is blocked, `tick >=
@@ -46,12 +54,13 @@
 //! Every number here comes from `data/rules/`: the per-kind radii from
 //! `units.ron` and the push caps and repath cadence from `rules.ron`.
 
+use crate::combat::Engage;
 use crate::fx::{Fx, FxVec2};
 use crate::ids::UnitId;
 use crate::map::Map;
 use crate::state::{MoveOrder, Post, SimEvent, Unit};
 use rules::Rules;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Side of one spatial-grid cell in tiles.
 pub const CELL_TILES: u16 = 2;
@@ -126,6 +135,24 @@ impl SpatialGrid {
         out.into_iter()
     }
 
+    /// Call `f` with the id of every unit whose cell intersects the square
+    /// `[pos - radius, pos + radius]`, without allocating: cell by cell,
+    /// row-major, each cell in ascending `UnitId` order (not ascending
+    /// overall, unlike [`SpatialGrid::neighbors`]). For callers that reduce
+    /// the candidates by a total key, so the visiting order cannot matter.
+    /// `pos`'s own unit is included.
+    pub fn for_each_in(&self, pos: FxVec2, radius: Fx, mut f: impl FnMut(UnitId)) {
+        let (x0, y0) = self.cell_of(FxVec2::new(pos.x - radius, pos.y - radius));
+        let (x1, y1) = self.cell_of(FxVec2::new(pos.x + radius, pos.y + radius));
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                for &id in &self.cells[self.cell_index(cx, cy)] {
+                    f(id);
+                }
+            }
+        }
+    }
+
     /// Total units indexed.
     pub fn len(&self) -> usize {
         self.cells.iter().map(Vec::len).sum()
@@ -197,7 +224,7 @@ fn push_cap(speed: Fx, div: u32) -> Fx {
 /// exact to one `I32F32` bit (`isqrt(len_sq << 32)` where `len_sq` is the
 /// `I32F32`-scaled square, so the result is `len << 32`). Deterministic;
 /// no floats.
-fn length(v: FxVec2) -> Fx {
+pub(crate) fn length(v: FxVec2) -> Fx {
     let sq = u128::try_from(v.length_sq_i64()).expect("squared length is non-negative");
     let bits = (sq << 32).isqrt();
     Fx::from_bits(i64::try_from(bits).expect("length fits I32F32"))
@@ -244,7 +271,16 @@ fn slide(map: &Map, from: FxVec2, v: FxVec2) -> (FxVec2, bool) {
 }
 
 /// Advance every unit with an order by one tick (see the module docs).
-/// `grid` was rebuilt from `units` at the start of this tick. Emits
+/// `grid` was rebuilt from `units` at the start of this tick. A unit in
+/// `engage` (step 5a, `combat::think`) is steered by its engagement instead
+/// of its order or post: [`Engage::Hold`] has no desired velocity, the idle
+/// push cap and faces its target; [`Engage::Chase`] steers straight at its
+/// point at full speed with the moving push cap. Neither follows a path,
+/// consumes waypoints, arrives, returns to a post or asks for a repath. A
+/// unit in `awaiting` (a path chaser whose path request is outstanding,
+/// step 5a) does not arrive at its final waypoint: it keeps its order and
+/// steers at the waypoint until step 4 writes the new path. Every other
+/// unit moves exactly as without combat. Emits
 /// [`SimEvent::UnitArrived`] when an order completes. Repath requests are
 /// not issued here; the function returns the ids of units that need one
 /// (blocked next waypoint, `tick >= repath_at`, or a unit whose every
@@ -293,11 +329,14 @@ fn slide(map: &Map, from: FxVec2, v: FxVec2) -> (FxVec2, bool) {
 /// - Circle correction is one pass over every unit (orders or not) in
 ///   `(a, b)` id order with `a < b`; coincident pairs separate along the x
 ///   axis. More passes were measured to slow the crowd, not help it.
+#[allow(clippy::too_many_arguments)]
 pub fn step(
     units: &mut BTreeMap<UnitId, Unit>,
     map: &Map,
     grid: &SpatialGrid,
     rules: &Rules,
+    engage: &BTreeMap<UnitId, Engage>,
+    awaiting: &BTreeSet<UnitId>,
     tick: u32,
     events: &mut Vec<SimEvent>,
 ) -> Vec<UnitId> {
@@ -332,7 +371,12 @@ pub fn step(
         // `Some(active)` for a unit holding a post: whether it walks back
         // this tick, which becomes its new `Post::returning`.
         let mut returning: Option<bool> = None;
-        if let Some(order) = &u.order {
+        let engaged = engage.get(id).copied();
+        if let Some(e) = engaged {
+            if let Engage::Chase(point) = e {
+                desired = arrival_steer(u.pos, point, u.speed, Fx::ZERO).0;
+            }
+        } else if let Some(order) = &u.order {
             if !order.path.is_empty() {
                 let last = order.path.len() - 1;
                 let mut i = usize::try_from(order.next).expect("fits").min(last);
@@ -354,7 +398,7 @@ pub fn step(
                 let target = map.center_of(order.path[i]);
                 let slowdown = if i == last { p.slowdown } else { Fx::ZERO };
                 let (v, dist) = arrival_steer(u.pos, target, u.speed, slowdown);
-                if i == last && dist <= p.arrive {
+                if i == last && dist <= p.arrive && !awaiting.contains(id) {
                     let u = units.get_mut(id).expect("exists");
                     u.order = None;
                     u.post = Some(Post {
@@ -417,7 +461,12 @@ pub fn step(
         //    arrive radius; once back it yields like any parked unit, so two
         //    neighbours cannot shove each other back and forth forever.
         let plen = length(push);
-        let cap = if u.order.is_some() || returning == Some(true) {
+        let moving = match engaged {
+            Some(Engage::Hold { .. }) => false,
+            Some(Engage::Chase(_)) => true,
+            None => u.order.is_some() || returning == Some(true),
+        };
+        let cap = if moving {
             push_cap(u.speed, moving_div)
         } else {
             push_cap(u.speed, idle_div)
@@ -440,6 +489,23 @@ pub fn step(
 
         let u = units.get_mut(id).expect("exists");
         u.pos = new_pos;
+        if let Some(e) = engaged {
+            match e {
+                Engage::Hold { face } => {
+                    let toward = sub(new_pos, face);
+                    let len = length(toward);
+                    if len > Fx::ZERO {
+                        u.facing = FxVec2::new(toward.x / len, toward.y / len);
+                    }
+                }
+                Engage::Chase(_) => {
+                    if let Some(f) = facing {
+                        u.facing = f;
+                    }
+                }
+            }
+            continue;
+        }
         match (next, returning) {
             (Some(next), _) => {
                 if let Some(f) = facing {
@@ -567,6 +633,10 @@ mod tests {
             post: None,
             job: None,
             seek_at: None,
+            damage_taken: 0,
+            ready_at: 0,
+            target: None,
+            intent: crate::state::Intent::Plain,
         }
     }
 
@@ -597,6 +667,14 @@ mod tests {
             .neighbors(FxVec2::from_ints(50, 50), Fx::ZERO)
             .collect();
         assert_eq!(n, vec![UnitId(1)]);
+        // The visitor sees the same ids, cell by cell, without allocating.
+        let mut seen = Vec::new();
+        grid.for_each_in(
+            FxVec2::new(Fx::from_ratio(3, 2), Fx::from_ratio(3, 2)),
+            Fx::ONE,
+            |id| seen.push(id),
+        );
+        assert_eq!(seen, vec![UnitId(2), UnitId(5), UnitId(4), UnitId(9)]);
         grid.rebuild(&BTreeMap::new());
         assert!(grid.is_empty());
     }
@@ -617,7 +695,16 @@ mod tests {
         let mut repath = Vec::new();
         for t in 0..ticks {
             grid.rebuild(units);
-            repath = step(units, map, &grid, rules, t, &mut events);
+            repath = step(
+                units,
+                map,
+                &grid,
+                rules,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                t,
+                &mut events,
+            );
         }
         (events, repath)
     }
@@ -771,6 +858,50 @@ mod tests {
                 returning: false
             })
         );
+    }
+
+    /// A path chaser waiting for a new path (`awaiting`) walks to the end
+    /// of its current path and holds there with its order instead of
+    /// arriving; once it no longer waits, it arrives as usual.
+    #[test]
+    fn awaiting_units_hold_the_end_of_their_path_instead_of_arriving() {
+        use crate::ids::Tile;
+        let rules = rules();
+        let map = Map::open(16, 16);
+        let mut units = BTreeMap::new();
+        let mut u = unit(1, 2, 2);
+        u.pos = map.center_of(Tile::new(2, 2));
+        u.order = Some(order(vec![Tile::new(2, 2), Tile::new(4, 2)], &map));
+        units.insert(UnitId(1), u);
+        let awaiting = BTreeSet::from([UnitId(1)]);
+        let mut grid = SpatialGrid::new(&map);
+        let mut events = Vec::new();
+        for t in 0..60 {
+            grid.rebuild(&units);
+            let repath = step(
+                &mut units,
+                &map,
+                &grid,
+                &rules,
+                &BTreeMap::new(),
+                &awaiting,
+                t,
+                &mut events,
+            );
+            assert!(repath.is_empty());
+        }
+        assert!(events.is_empty(), "{events:?}");
+        let u = &units[&UnitId(1)];
+        assert!(u.order.is_some() && u.post.is_none(), "{u:?}");
+        let end = map.center_of(Tile::new(4, 2));
+        let arrive = Fx::from_ratio(25, 100);
+        assert!(
+            u.pos.dist_sq_i64(end) <= (arrive * arrive).to_bits(),
+            "at the end"
+        );
+        let (events, _) = run(&mut units, &map, &rules, 1);
+        assert_eq!(events, vec![SimEvent::UnitArrived { unit: UnitId(1) }]);
+        assert!(units[&UnitId(1)].order.is_none());
     }
 
     #[test]

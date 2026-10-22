@@ -95,13 +95,17 @@ jobs:
           cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay | tail -n 1 | tee hash-macos.txt
           grep -q '^tick=1200 hash=0x[0-9a-f]\{16\}$' hash-macos.txt
 
-      - name: verify golden fixture move_500 (release)
-        # The same command runs in the headless job on Linux; hash-parity
-        # diffs the two `OK final_hash=...` lines. `verify` exits 1 on any
-        # other outcome and pipefail propagates it through grep and tee.
+      - name: verify golden fixtures move_500 and combat_skirmish (release)
+        # The same commands run in the headless job on Linux; hash-parity
+        # diffs each pair of `OK final_hash=...` lines (combat_skirmish puts
+        # acquisition, shooters, hits and destruction under the parity
+        # check). `verify` exits 1 on any other outcome and pipefail
+        # propagates it through grep and tee.
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-macos-fixture.txt
           test -s hash-macos-fixture.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-macos-combat.txt
+          test -s hash-macos-combat.txt
 
       - uses: actions/upload-artifact@v7
         with:
@@ -109,6 +113,7 @@ jobs:
           path: |
             hash-macos.txt
             hash-macos-fixture.txt
+            hash-macos-combat.txt
           if-no-files-found: error
 
   headless:
@@ -146,9 +151,10 @@ jobs:
 
       - name: verify golden fixtures (release)
         # Long goldens are verified here in release rather than by
-        # `cargo test -- --ignored`. move_500 is the hash-parity fixture:
-        # only its `OK final_hash=...` line is kept so the diff is clean;
-        # `verify` exits 1 on any other outcome and pipefail propagates it.
+        # `cargo test -- --ignored`. move_500 and combat_skirmish are the
+        # hash-parity fixtures: only their `OK final_hash=...` lines are
+        # kept so the diffs are clean; `verify` exits 1 on any other outcome
+        # and pipefail propagates it.
         # M5b: `cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --jobs 2`
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-linux-fixture.txt
@@ -157,6 +163,8 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/snapshot_restore.eonreplay | tee verify-snapshot-restore.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/economy_second_town.eonreplay | tee verify-economy-second-town.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/economy_walkthrough.eonreplay | tee verify-economy-walkthrough.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-linux-combat.txt
+          test -s hash-linux-combat.txt
 
       - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
         run: |
@@ -196,6 +204,7 @@ jobs:
           path: |
             hash-linux.txt
             hash-linux-fixture.txt
+            hash-linux-combat.txt
           if-no-files-found: error
 
   game-linux:
@@ -286,3 +295,12 @@ jobs:
           test -s hashes/macos/hash-macos-fixture.txt
           test -s hashes/linux/hash-linux-fixture.txt
           diff hashes/macos/hash-macos-fixture.txt hashes/linux/hash-linux-fixture.txt
+
+      - name: compare golden fixture combat_skirmish
+        # The M4a combat golden, verified the same way on each OS.
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos-combat.txt
+          echo "Linux:"; cat hashes/linux/hash-linux-combat.txt
+          test -s hashes/macos/hash-macos-combat.txt
+          test -s hashes/linux/hash-linux-combat.txt
+          diff hashes/macos/hash-macos-combat.txt hashes/linux/hash-linux-combat.txt

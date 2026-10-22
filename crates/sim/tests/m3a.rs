@@ -135,7 +135,9 @@ fn golden(name: &str) {
     }
 }
 
-/// 32 cases locally, 256 under CI, `PROPTEST_CASES` overrides (as in m1.rs).
+/// 32 cases locally, 256 under CI, `PROPTEST_CASES` overrides (the same
+/// switch as m1.rs, which runs 16 locally since the M4a combat behaviour
+/// slice).
 fn proptest_cases() -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
@@ -1540,7 +1542,7 @@ fn economy_ten_worked_crofts_flatline_at_the_yield_cap() {
         .unwrap()
         .rate_per_worker;
     let town_grain = rules.building_kind(town.0).unwrap().base_yield["grain"];
-    let cap = rules.yield_cap(0);
+    let cap = rules.yield_cap_base;
     let period = rules.income_period_ticks();
     let mut sim = empty(21);
     let mut cmds = vec![
@@ -1590,7 +1592,7 @@ fn economy_lore_ignores_the_yield_cap() {
         panic!("Scriptorium slots are fixed");
     };
     let per = def.base_yield["lore"] + slots * g.rate_per_worker;
-    let cap = rules.yield_cap(0);
+    let cap = rules.yield_cap_base;
     let n = cap / per + 1;
     assert!(n * per > cap);
     assert!(n <= 3, "the test places at most 3 Scriptoria");
@@ -2070,9 +2072,42 @@ fn economy_croft_builder_takes_its_slot() {
     assert!(run_until(&mut sim, 300, |s| worked(s, [3]) == 1));
 }
 
+/// Bring P0 into the Masonry Age, which `town_growth_age` requires for tier
+/// 2 since the M4a tech slice: `DebugResearch` two techs that leave
+/// territory alone (Letters I, Arms I), grant the age's cost and advance.
+/// Uses P0 sequence numbers `seq..seq + 5`.
+fn reach_masonry(sim: &mut Sim, rules: &Rules, seq: u32) {
+    let p = PlayerId(0);
+    let tech = |id: &str| sim::TechId(rules.tech_by_id(id).expect("tech in techs.ron").0);
+    let masonry = &rules.ages[1];
+    assert_eq!(rules.town_growth_age.as_deref(), Some(masonry.id.as_str()));
+    let mut cmds: Vec<Command> = ["letters_1", "arms_1"]
+        .map(|id| Command::DebugResearch {
+            owner: p,
+            tech: tech(id),
+        })
+        .into();
+    for (id, &amount) in &masonry.cost {
+        cmds.push(Command::DebugGrant {
+            owner: p,
+            resource: u8::try_from(resource(rules, id)).unwrap(),
+            amount,
+        });
+    }
+    cmds.push(Command::AdvanceAge { player: p });
+    let cmds = (seq..)
+        .zip(cmds)
+        .map(|(s, c)| PlayerCommand::new(p, s, c))
+        .collect();
+    let events = apply(sim, cmds);
+    assert!(rejections(&events).is_empty(), "{events:?}");
+    assert_eq!(sim.view().age(p), 1);
+}
+
 /// A Town grows to tier 2 when its complete attributed buildings cover
-/// `town_growth_distinct_buildings` distinct kinds: its radius moves to
-/// `town_radius_grown_tiles` and the field equals a fresh one.
+/// `town_growth_distinct_buildings` distinct kinds (its owner in the
+/// Masonry Age): its radius moves to `town_radius_grown_tiles` and the
+/// field equals a fresh one.
 #[test]
 fn territory_town_grows_to_tier_two_at_five_distinct_kinds() {
     let rules = load_rules();
@@ -2086,6 +2121,7 @@ fn territory_town_grows_to_tier_two_at_five_distinct_kinds() {
     ];
     assert_eq!(kinds.len(), need, "one placement per kind needed");
     let mut sim = standard(33);
+    reach_masonry(&mut sim, &rules, 100);
     for (i, (id, x, y)) in kinds.iter().enumerate() {
         let seq = u32::try_from(i).unwrap();
         let events = apply(
@@ -2163,9 +2199,10 @@ fn economy_restore_mid_gather_matches_uninterrupted() {
     assert!(worked(&a, [3, 4, 5]) >= 2);
 }
 
-/// Tier growth counts distinct kinds, per Town, among complete buildings:
-/// five Crofts are one kind; five kinds split across two Towns grow
-/// neither; a site of the fifth kind does not count until it completes.
+/// Tier growth counts distinct kinds, per Town, among complete buildings
+/// (P0 in the Masonry Age throughout, so the age gate is met): five Crofts
+/// are one kind; five kinds split across two Towns grow neither; a site of
+/// the fifth kind does not count until it completes.
 #[test]
 fn territory_town_tier_counts_distinct_complete_kinds_per_town() {
     let rules = load_rules();
@@ -2190,6 +2227,7 @@ fn territory_town_tier_counts_distinct_complete_kinds_per_town() {
     // Five Crofts at the Seat: one kind.
     let croft = kind(&rules, "croft");
     let mut sim = standard(50);
+    reach_masonry(&mut sim, &rules, 100);
     let crofts = (0..5u16)
         .map(|i| place(0, u32::from(i), croft, 28 + 3 * i, 58, true))
         .collect();
@@ -2200,6 +2238,7 @@ fn territory_town_tier_counts_distinct_complete_kinds_per_town() {
 
     // Five kinds split between the Seat (3) and a second Town (2).
     let mut sim = standard(51);
+    reach_masonry(&mut sim, &rules, 100);
     let events = apply(
         &mut sim,
         vec![place(0, 0, kind(&rules, "town"), 40, 63, true)],
@@ -2228,6 +2267,7 @@ fn territory_town_tier_counts_distinct_complete_kinds_per_town() {
     // Four complete kinds at the Seat plus an Engine Yard site: tier 1
     // until the site completes.
     let mut sim = standard(52);
+    reach_masonry(&mut sim, &rules, 100);
     let lumber = u8::try_from(resource(&rules, "lumber")).unwrap();
     let mut cmds = vec![PlayerCommand::new(
         PlayerId(0),
@@ -2620,7 +2660,7 @@ fn economy_unit_ramps_count_only_their_kind_class_and_owner() {
 fn economy_train_is_rejected_at_the_pop_cap() {
     let rules = load_rules();
     let yeoman = unit_kind(&rules, "yeoman");
-    let cap = rules.pop_cap(0);
+    let cap = rules.pop_cap_base;
     let start = rules.standard_start.units["yeoman"];
     let mut sim = standard(62);
     let grain = resource(&rules, "grain");
@@ -2668,11 +2708,11 @@ fn economy_train_rejections() {
         assert!(rejections(&events).is_empty(), "{events:?}");
     };
     let crowd = |s: &mut Sim| {
-        let room = rules.pop_cap(0) - rules.standard_start.units["yeoman"];
+        let room = rules.pop_cap_base - rules.standard_start.units["yeoman"];
         let spawn = spawn_kind(0, 120, 0, 34, 70, u16::try_from(room).unwrap());
         let events = apply(s, vec![spawn]);
         assert!(rejections(&events).is_empty(), "{events:?}");
-        assert_eq!(s.view().pop(PlayerId(0)).0, rules.pop_cap(0));
+        assert_eq!(s.view().pop(PlayerId(0)).0, rules.pop_cap_base);
     };
     type Setup<'a> = Box<dyn Fn(&mut Sim) + 'a>;
     let none: Setup = Box::new(|_| {});

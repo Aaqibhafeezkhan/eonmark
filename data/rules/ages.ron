@@ -1,0 +1,45 @@
+// Eonmark ages. Schema: crates/rules/src/ages.rs (deny_unknown_fields).
+// List index is the age; every player starts in ages[0], which must need
+// no techs and cost nothing. AdvanceAge enters the next age once the
+// player has researched techs_required techs (queued ones do not count)
+// and pays cost (per resource id, zero entries omitted). techs_required
+// and every resource of cost never decrease from one age to the next.
+// unlocks lists the units.ron, buildings.ron and techs.ron ids that become
+// available in the age: every id is listed by exactly one age, a unit no
+// earlier than its trainer and its requires_tech, a tech no earlier than
+// its host and the level before it in its line. Level k of every tech line
+// is unlocked in age k.
+(
+  ages: [
+    (
+      id: "hearth",
+      name: "Hearth Age",
+      techs_required: 0,
+      unlocks: (
+        units: ["yeoman", "scribe", "skirmisher", "shieldbearer", "bowman"],
+        buildings: ["town", "croft", "lumber_yard", "ore_pit", "scriptorium", "muster_hall", "watchtower"],
+        techs: ["arms_1", "statecraft_1", "trade_1", "letters_1"],
+      ),
+    ),
+    (
+      id: "masonry",
+      name: "Masonry Age",
+      techs_required: 2,
+      cost: {"grain": 250, "lore": 100},
+      unlocks: (
+        units: ["outrider", "mangonel", "supply_wain"],
+        buildings: ["engine_yard"],
+        techs: ["arms_2", "statecraft_2", "trade_2", "letters_2"],
+      ),
+    ),
+    (
+      id: "charter",
+      name: "Charter Age",
+      techs_required: 5,
+      cost: {"grain": 500, "lumber": 300, "lore": 300},
+      unlocks: (
+        techs: ["arms_3", "statecraft_3", "trade_3", "letters_3"],
+      ),
+    ),
+  ],
+)

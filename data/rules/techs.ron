@@ -1,0 +1,174 @@
+// Eonmark techs. Schema: crates/rules/src/techs.rs (deny_unknown_fields).
+// List index is the TechId. Each line's levels are listed in order: level
+// k of a line requires level k-1 of the same line (researched), and
+// ages.ron unlocks level k in age k. host is the buildings.ron kind that
+// researches it; cost is per resource id (zero entries omitted) and
+// research_time_ds is in deciseconds, both before the Letters rows.
+//
+// modifiers are (target: StatPath, op: Set | Add | Mul, value: integer).
+// StatPath is YieldCap, PopCap, TownLimit, TownBorderRadius, ResearchCost,
+// ResearchTime, UnitHp(sel) or UnitDamage(sel), with sel Military (every
+// non-Civilian class), Class(Infantry) or Kind("bowman"). Mul is permille
+// (900 = x0.9) and floors after each row. Resolution: the last Set, then
+// every Add, then each Mul in order; faction rows come first, then the
+// researched techs in TechId order. See docs/DATA_FORMAT.md.
+(
+  techs: [
+    (
+      id: "arms_1",
+      name: "Arms I",
+      line: "arms",
+      level: 1,
+      host: "scriptorium",
+      cost: {"ore": 50, "lore": 75},
+      research_time_ds: 300,
+      modifiers: [
+        (target: PopCap, op: Add, value: 25),
+        (target: UnitHp(Military), op: Mul, value: 1100),
+        (target: UnitDamage(Military), op: Mul, value: 1100),
+      ],
+    ),
+    (
+      id: "arms_2",
+      name: "Arms II",
+      line: "arms",
+      level: 2,
+      host: "scriptorium",
+      cost: {"ore": 100, "lore": 150},
+      research_time_ds: 450,
+      modifiers: [
+        (target: PopCap, op: Add, value: 25),
+        (target: UnitHp(Military), op: Mul, value: 1100),
+        (target: UnitDamage(Military), op: Mul, value: 1100),
+      ],
+    ),
+    (
+      id: "arms_3",
+      name: "Arms III",
+      line: "arms",
+      level: 3,
+      host: "scriptorium",
+      cost: {"ore": 150, "lore": 250},
+      research_time_ds: 600,
+      modifiers: [
+        (target: PopCap, op: Add, value: 25),
+        (target: UnitHp(Military), op: Mul, value: 1100),
+        (target: UnitDamage(Military), op: Mul, value: 1100),
+      ],
+    ),
+    (
+      id: "statecraft_1",
+      name: "Statecraft I",
+      line: "statecraft",
+      level: 1,
+      host: "scriptorium",
+      cost: {"lore": 80},
+      research_time_ds: 300,
+      modifiers: [
+        (target: TownLimit, op: Add, value: 1),
+        (target: TownBorderRadius, op: Add, value: 1),
+      ],
+    ),
+    (
+      id: "statecraft_2",
+      name: "Statecraft II",
+      line: "statecraft",
+      level: 2,
+      host: "scriptorium",
+      cost: {"lore": 160},
+      research_time_ds: 450,
+      modifiers: [
+        (target: TownLimit, op: Add, value: 1),
+        (target: TownBorderRadius, op: Add, value: 1),
+      ],
+    ),
+    (
+      id: "statecraft_3",
+      name: "Statecraft III",
+      line: "statecraft",
+      level: 3,
+      host: "scriptorium",
+      cost: {"lore": 260},
+      research_time_ds: 600,
+      modifiers: [
+        (target: TownLimit, op: Add, value: 1),
+        (target: TownBorderRadius, op: Add, value: 1),
+      ],
+    ),
+    (
+      id: "trade_1",
+      name: "Trade I",
+      line: "trade",
+      level: 1,
+      host: "scriptorium",
+      cost: {"lore": 70},
+      research_time_ds: 300,
+      modifiers: [
+        (target: YieldCap, op: Set, value: 100),
+      ],
+    ),
+    (
+      id: "trade_2",
+      name: "Trade II",
+      line: "trade",
+      level: 2,
+      host: "scriptorium",
+      cost: {"lore": 150},
+      research_time_ds: 450,
+      modifiers: [
+        (target: YieldCap, op: Set, value: 150),
+      ],
+    ),
+    (
+      id: "trade_3",
+      name: "Trade III",
+      line: "trade",
+      level: 3,
+      host: "scriptorium",
+      cost: {"lore": 250},
+      research_time_ds: 600,
+      modifiers: [
+        (target: YieldCap, op: Set, value: 200),
+      ],
+    ),
+    (
+      id: "letters_1",
+      name: "Letters I",
+      line: "letters",
+      level: 1,
+      host: "scriptorium",
+      cost: {"lore": 60},
+      research_time_ds: 250,
+      modifiers: [
+        (target: ResearchCost, op: Mul, value: 900),
+        (target: ResearchTime, op: Mul, value: 900),
+      ],
+    ),
+    (
+      id: "letters_2",
+      name: "Letters II",
+      line: "letters",
+      level: 2,
+      host: "scriptorium",
+      cost: {"lore": 120},
+      research_time_ds: 400,
+      modifiers: [
+        (target: ResearchCost, op: Mul, value: 900),
+        (target: ResearchTime, op: Mul, value: 900),
+      ],
+    ),
+    (
+      id: "letters_3",
+      name: "Letters III",
+      line: "letters",
+      level: 3,
+      host: "scriptorium",
+      cost: {"lore": 200},
+      research_time_ds: 550,
+      modifiers: [
+        (target: ResearchCost, op: Mul, value: 900),
+        (target: ResearchTime, op: Mul, value: 900),
+      ],
+    ),
+  ],
+)

@@ -11,12 +11,14 @@ reads these files; it never defines gameplay constants of its own.
 
 | Path | Contents | Schema | Since |
 |------|----------|--------|-------|
-| `rules/rules.ron` | Match rules: tick rate, command delay, Yield Cap table, pop cap, cost ramps, training queue, idle-worker seeking, standard start, town radii and limit, attrition, annexation, path budget | `crates/rules/src/lib.rs` (`Rules`) | M0 |
+| `rules/rules.ron` | Match rules: tick rate, command delay, Yield Cap and pop cap bases, cost ramps, training queue, idle-worker seeking, standard start, town radii, growth age and limit, combat knobs, attrition, annexation, path budget | `crates/rules/src/lib.rs` (`Rules`) | M0 |
 | `rules/resources.ron` | The four resources: Grain, Lumber, Ore, Lore | `crates/rules/src/resources.rs` | M0 |
-| `rules/units.ron` | Unit kinds (Yeoman, Scribe, Skirmisher): movement, class, cost and ramp, pop, training time, trainer, vision | `crates/rules/src/units.rs` (`Units`) | M1 (training fields M3a) |
-| `rules/buildings.ron` | The eight building kinds: footprint, cost, build time, hit points, vision, base yield, gather slots, per-Town limit, border radius | `crates/rules/src/buildings.rs` (`Buildings`) | M3a |
+| `rules/units.ron` | The eight unit kinds: movement, class, hit points, attack, cost and ramp, pop, training time, trainer, `requires_tech`, vision; then the counter table | `crates/rules/src/units.rs` (`Units`) | M1 (training fields M3a, combat M4a) |
+| `rules/buildings.ron` | The eight building kinds: footprint, cost, build time, hit points, vision, base yield, gather slots, per-Town limit, border radius, attack (Town and Watchtower) | `crates/rules/src/buildings.rs` (`Buildings`) | M3a |
+| `rules/techs.ron` | The 12 techs: line, level, host, cost, research time and Modifier rows | `crates/rules/src/techs.rs` (`Techs`) | M4a |
+| `rules/ages.ron` | The three ages: tech-count gate, cost and what each unlocks | `crates/rules/src/ages.rs` (`Ages`) | M4a |
+| `rules/factions.ron` | The factions and their Modifier rows (Freeholders, none) | `crates/rules/src/factions.rs` (`Factions`) | M4a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
-| `rules/ages.ron`, `techs.ron`, `factions.ron` | Content tables | not yet written | M4a |
 | `rules/strings/en.ron` | UI strings: the message line's text for every command rejection, HUD labels and tooltips. Presentation only, outside `rules_hash` (see `crates/rules/src/strings.rs`) | written | M3b |
 | `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear | `crates/rules/src/visuals.rs` (`Visuals`) | M2 |
 | `ai/` | Build orders, personalities, difficulty table | not yet written | M5b |
@@ -65,7 +67,7 @@ cargo test -p rules
 exits 1 and prints the file path, the span and the field, for example:
 
 ```text
-error: data/rules/rules.ron: 7:3-7:18: Unexpected field named `tick_rate_hertz` in `Rules`, expected one of `rules_version`, `tick_rate_hz`, ... instead
+error: data/rules/rules.ron: 8:3-8:18: Unexpected field named `tick_rate_hertz` in `Rules`, expected one of `rules_version`, `tick_rate_hz`, ... instead
 ```
 
 Every edit here changes `rules_hash`, so a change you keep also bumps

@@ -5,18 +5,23 @@
 //! state, draws no randomness of its own, and its commands go through the
 //! same delay queue as a human's.
 
+use crate::combat::{self, UnitStats};
 use crate::command::Command;
 use crate::construction::{self, BuildPlan};
 use crate::economy::{self, PlayerEconomy, RateInfo};
 use crate::gather;
-use crate::ids::{BuildingId, BuildingKindId, PlayerId, Tile, UnitId, UnitKindId};
+use crate::ids::{
+    BuildingId, BuildingKindId, PlayerId, TargetId, TechId, Tile, UnitId, UnitKindId,
+};
 use crate::map::Map;
 use crate::pathing::Pathing;
 use crate::state::{Building, MatchSetup, Player, RejectReason, State, Unit};
+use crate::tech;
 use crate::territory::TerritoryField;
 use crate::town;
 use crate::training;
 use rules::Rules;
+use std::collections::BTreeSet;
 
 /// Read-only view of the sim handed to AI controllers and the presenter.
 /// Every economy accessor calls the same function `Sim::step` uses, so a
@@ -53,7 +58,8 @@ impl<'a> SimView<'a> {
         self.state.economy.player(p)
     }
 
-    /// A player's income this tick per resource, `resources.ron` order.
+    /// A player's income this tick per resource, `resources.ron` order,
+    /// with the player's resolved Yield Cap.
     pub fn income(&self, p: PlayerId) -> Vec<RateInfo> {
         economy::rates(self.state, self.rules, p)
     }
@@ -91,11 +97,12 @@ impl<'a> SimView<'a> {
             .collect()
     }
 
-    /// `p`'s pop: `(used, cap)`, used counting units alive and queued.
+    /// `p`'s pop: `(used, cap)`, used counting units alive and queued, the
+    /// cap with `p`'s `PopCap` rows.
     pub fn pop(&self, p: PlayerId) -> (u32, u32) {
         (
             training::pop_used(self.state, self.rules, p),
-            training::pop_cap(self.rules, p),
+            tech::pop_cap(self.state, self.rules, p),
         )
     }
 
@@ -132,12 +139,61 @@ impl<'a> SimView<'a> {
         }
     }
 
-    /// Town-kind buildings `p` owns, sites included, and the town limit.
+    /// Town-kind buildings `p` owns, sites included, and the town limit
+    /// with `p`'s `TownLimit` rows.
     pub fn towns(&self, p: PlayerId) -> (u32, u32) {
         (
             town::town_count(self.state, self.rules, p),
-            self.rules.town_limit(town::statecraft(p)),
+            tech::town_limit(self.state, self.rules, p),
         )
+    }
+
+    /// The age `p` has reached (index into `ages.ron`).
+    ///
+    /// # Panics
+    ///
+    /// If the player does not exist.
+    pub fn age(&self, p: PlayerId) -> u8 {
+        self.state.tech.player(p).age
+    }
+
+    /// The techs `p` has completed (queued research is in its host's
+    /// queue).
+    ///
+    /// # Panics
+    ///
+    /// If the player does not exist.
+    pub fn researched(&self, p: PlayerId) -> &'a BTreeSet<TechId> {
+        &self.state.tech.player(p).researched
+    }
+
+    /// What researching `tech` costs `p` now and how many ticks it takes
+    /// (what `Research` would deduct and queue), `resources.ron` order.
+    ///
+    /// # Panics
+    ///
+    /// If `tech` is not in the rules.
+    pub fn research_quote(&self, p: PlayerId, tech: TechId) -> (Vec<i64>, u32) {
+        tech::research_quote(self.state, self.rules, p, tech)
+    }
+
+    /// Whether `Research { building, tech }` from `p` would be accepted
+    /// now, and its quote: the cost and the time in ticks.
+    pub fn check_research(
+        &self,
+        p: PlayerId,
+        building: BuildingId,
+        tech: TechId,
+    ) -> Result<(Vec<i64>, u32), RejectReason> {
+        self.check_player(p)?;
+        tech::validate_research(self.state, self.rules, p, building, tech)
+    }
+
+    /// Whether `AdvanceAge { player: p }` from `p` would be accepted now,
+    /// and what it would deduct.
+    pub fn check_advance_age(&self, p: PlayerId) -> Result<Vec<i64>, RejectReason> {
+        self.check_player(p)?;
+        tech::validate_advance(self.state, self.rules, p, p)
     }
 
     /// What a building of `kind` costs `p` now (the ramped cost `Build`
@@ -168,6 +224,54 @@ impl<'a> SimView<'a> {
             BuildPlan::Resume { .. } => Ok(vec![0; self.rules.resources.resources.len()]),
             BuildPlan::New { cost, .. } => Ok(cost),
         }
+    }
+
+    /// Whether `p` could place a new building of `kind` now, before a
+    /// builder and a tile are chosen, and what it would deduct: the checks
+    /// of `check_build` that need neither, in its order (`UnknownPlayer`,
+    /// `Surrendered`, `UnknownBuildingKind`, `AgeRequired`,
+    /// `TownLimitReached`, `CannotAfford`). `check_build` on a tile can
+    /// still reject the site.
+    pub fn check_build_kind(
+        &self,
+        p: PlayerId,
+        kind: BuildingKindId,
+    ) -> Result<Vec<i64>, RejectReason> {
+        self.check_player(p)?;
+        construction::validate_build_kind(self.state, self.rules, p, kind)
+    }
+
+    /// `p`'s combat stats for unit kind `kind` now: hit points with the
+    /// `UnitHp` rows and, for a kind that attacks, damage with the
+    /// `UnitDamage` rows, range, reach and cooldown (Arms raises hit points
+    /// and damage).
+    ///
+    /// # Panics
+    ///
+    /// If the player or `kind` does not exist.
+    pub fn unit_stats(&self, p: PlayerId, kind: UnitKindId) -> UnitStats {
+        combat::unit_stats(self.state, self.rules, p, kind)
+    }
+
+    /// A unit's hit points now and its maximum, `(hp, max_hp)`; `None`
+    /// when the unit does not exist (or has died).
+    pub fn unit_hp(&self, id: UnitId) -> Option<(i32, i32)> {
+        let u = self.state.units.get(&id)?;
+        let max = combat::unit_stats(self.state, self.rules, u.owner, u.kind).max_hp;
+        Some((max - u.damage_taken, max))
+    }
+
+    /// Whether `Attack { units, target }` from `p` would be accepted now,
+    /// and which units would attack (`p`'s listed units of a kind that
+    /// attacks, in id order).
+    pub fn check_attack(
+        &self,
+        p: PlayerId,
+        units: &[UnitId],
+        target: TargetId,
+    ) -> Result<Vec<UnitId>, RejectReason> {
+        self.check_player(p)?;
+        combat::validate_attack(self.state, self.rules, p, units, target)
     }
 
     /// The rules this match runs under.

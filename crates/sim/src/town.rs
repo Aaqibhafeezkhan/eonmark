@@ -1,19 +1,16 @@
 //! Towns (`docs/design/towns.md`): the standard start, the town count and
-//! limit, attribution of other buildings to a Town, and tier growth.
+//! limit, attribution of other buildings to a Town, and the tier and border
+//! radius a Town derives from its buildings, its owner's age and the
+//! owner's Statecraft rows.
 
 use crate::construction::{self, centre_fx};
 use crate::economy::building_kind;
 use crate::ids::{BuildingId, PlayerId, Tile, UnitKindId};
 use crate::state::{Construction, SimEvent, State, TownState, Unit};
+use crate::tech;
 use crate::territory::{Source, SourceOwner};
 use rules::{MapDef, Rules};
 use std::collections::BTreeSet;
-
-/// A player's Statecraft level. Research arrives in M4a; until then every
-/// player is at level 0.
-pub(crate) fn statecraft(_p: PlayerId) -> u32 {
-    0
-}
 
 /// Town-kind buildings `p` owns, sites included (the town limit counts
 /// both).
@@ -48,12 +45,19 @@ pub(crate) fn attribute(
         .map(|b| b.id)
 }
 
-/// Re-derive Town `town`'s tier: 2 when the owner's complete buildings
-/// attributed to it cover at least `town_growth_distinct_buildings`
-/// distinct non-Town kinds, else 1 (sites do not count; the Masonry Age
-/// gate arrives in M4a). A change moves the Town's border source to the
-/// tier's radius and emits `TownTierChanged` and `TerritoryChanged`.
-pub(crate) fn recompute_tier(
+/// Re-derive complete Town `town`'s tier and border radius. The tier is 2
+/// when the owner's complete buildings attributed to it cover at least
+/// `town_growth_distinct_buildings` distinct non-Town kinds (sites do not
+/// count) and the owner has reached `town_growth_age` (when set), else 1.
+/// The radius is the tier's base radius with the owner's
+/// `TownBorderRadius` rows ([`tech::town_radius`]). A tier change emits
+/// `TownTierChanged`; a radius change, which a tier change or a Statecraft
+/// level makes, moves the Town's border source with
+/// `TerritoryField::change_source` and emits `TerritoryChanged`. Runs when a
+/// building attributed to the Town completes and, through [`refresh_all`],
+/// when the owner completes a tech or advances an age. Does nothing for a
+/// site or a building that is not a Town.
+pub(crate) fn refresh(
     state: &mut State,
     rules: &Rules,
     town: BuildingId,
@@ -79,17 +83,44 @@ pub(crate) fn recompute_tier(
         .map(|b| b.kind.0)
         .collect();
     let threshold = usize::try_from(rules.town_growth_distinct_buildings).expect("small");
-    let tier = if kinds.len() >= threshold { 2 } else { 1 };
-    if tier == ts.tier {
-        return;
+    let age_reached = rules.town_growth_age.as_ref().is_none_or(|id| {
+        state.tech.player(owner).age >= rules.age_index(id).expect("validated age id")
+    });
+    let tier = if kinds.len() >= threshold && age_reached {
+        2
+    } else {
+        1
+    };
+    if tier != ts.tier {
+        state.buildings.get_mut(&town).expect("exists").town_state = Some(TownState { tier, ..ts });
+        events.push(SimEvent::TownTierChanged { town, tier });
     }
-    let radius = rules.town_radius_for(tier, statecraft(owner));
+    let radius =
+        u16::try_from(tech::town_radius(state, rules, owner, tier)).expect("radius clamped to 64");
     let mut source = state.territory.sources()[&town];
-    source.radius = u16::try_from(radius).expect("validated radius fits u16");
-    state.territory.change_source(town, source);
-    state.buildings.get_mut(&town).expect("exists").town_state = Some(TownState { tier, ..ts });
-    events.push(SimEvent::TownTierChanged { town, tier });
-    events.push(SimEvent::TerritoryChanged);
+    if source.radius != radius {
+        source.radius = radius;
+        state.territory.change_source(town, source);
+        events.push(SimEvent::TerritoryChanged);
+    }
+}
+
+/// [`refresh`] every complete Town `p` owns, in `BuildingId` order.
+pub(crate) fn refresh_all(
+    state: &mut State,
+    rules: &Rules,
+    p: PlayerId,
+    events: &mut Vec<SimEvent>,
+) {
+    let towns: Vec<BuildingId> = state
+        .buildings
+        .values()
+        .filter(|b| b.owner == p && b.town_state.is_some())
+        .map(|b| b.id)
+        .collect();
+    for town in towns {
+        refresh(state, rules, town, events);
+    }
 }
 
 /// The standard start (`rules.ron` `standard_start`): first every player's
@@ -128,7 +159,7 @@ pub(crate) fn apply_standard_start(state: &mut State, rules: &Rules, def: &MapDe
             seat: true,
             tier: 1,
         });
-        let radius = rules.town_radius_for(1, statecraft(p));
+        let radius = tech::town_radius(state, rules, p, 1);
         state.territory.add_source(
             seat,
             Source {

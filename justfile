@@ -111,7 +111,8 @@ bots *ARGS:
     @echo "bots: available from M5b (sim-cli play-bots)"
 
 # Sim benchmarks: `just bench` runs the 500-mover crossing, `just bench --astar --budget 4000` one saturated A* tick,
-# `just bench --territory --sources 16 --edits 100` incremental territory recompute (M3a acceptance: mean < 2 ms).
+# `just bench --territory --sources 16 --edits 100` incremental territory recompute (M3a acceptance: mean < 2 ms),
+# `just bench --units 400 --ticks 1200 --combat` 200 vs 200 fighting (M4a acceptance: mean step < 5 ms).
 bench *ARGS:
     cargo run -p sim-cli --locked --release -- bench {{ARGS}}
 

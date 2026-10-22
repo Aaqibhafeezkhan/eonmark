@@ -11,8 +11,11 @@
 //! |------|--------|
 //! | `rules/rules.ron` | [`Rules`] (the fields that are not `skip_deserializing`) |
 //! | `rules/resources.ron` | [`Resources`] |
-//! | `rules/units.ron` | [`Units`] |
+//! | `rules/units.ron` | [`Units`] (unit kinds and the counter table) |
 //! | `rules/buildings.ron` | [`Buildings`] |
+//! | `rules/techs.ron` | [`Techs`] |
+//! | `rules/ages.ron` | [`Ages`] |
+//! | `rules/factions.ron` | [`Factions`] |
 //! | `maps/*.ron` | [`map::MapDef`] |
 //! | `visuals.ron` | [`Visuals`] (how each unit kind is drawn; validated here, read by the game) |
 //!
@@ -20,15 +23,21 @@
 //!
 //! The pure cost functions (building, Yeoman and military ramps) are
 //! methods on [`Rules`] in the `costs` module, so the sim, the HUD and the
-//! bot quote the same numbers.
+//! bot quote the same numbers. Tech and faction effects are [`Modifier`]
+//! rows, resolved by [`modifiers::resolve`].
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod ages;
+pub mod attack;
 pub mod buildings;
 pub mod costs;
+pub mod factions;
 pub mod map;
+pub mod modifiers;
 pub mod resources;
 pub mod strings;
+pub mod techs;
 pub mod units;
 pub mod visuals;
 
@@ -36,10 +45,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub use ages::{Age, Ages, Unlocks};
+pub use attack::{Attack, Prefer};
 pub use buildings::{BuildingKind, Buildings, GatherSpec, Slots};
+pub use factions::{Faction, Factions};
 pub use map::{MapDef, Symmetry, Terrain, TilePos};
+pub use modifiers::{ModOp, Modifier, StatPath, UnitSel};
 pub use resources::{Resource, Resources};
-pub use units::{UnitClass, UnitKind, UnitRamp, Units};
+pub use techs::{Tech, Techs};
+pub use units::{Counter, Defender, UnitClass, UnitKind, UnitRamp, Units};
 pub use visuals::{Primitive, Visual, Visuals};
 
 /// The time unit every income rate is authored in: per 30 s, in
@@ -50,9 +64,16 @@ pub const RATE_PERIOD_DS: u32 = 300;
 /// Largest `_ds` value for the idle-seek fields (one hour).
 pub const MAX_IDLE_SEEK_DS: u32 = 36_000;
 
-/// Largest Town radius before Statecraft, so the radius plus the three
-/// Statecraft levels stays within 64 tiles.
-pub const MAX_TOWN_RADIUS_TILES: u32 = 60;
+/// Largest border radius a Town can reach: its grown radius plus every
+/// `TownBorderRadius` row (the Statecraft techs and the faction's) must
+/// stay within it in the worst case.
+pub const MAX_BORDER_RADIUS_TILES: u32 = 64;
+
+/// Largest `damage_variance_permille` (+/- 50%).
+pub const MAX_DAMAGE_VARIANCE_PERMILLE: u32 = 500;
+
+/// Largest `acquire_range_tiles` and `chase_regoal_tiles`.
+pub const MAX_COMBAT_TILES: u32 = 16;
 
 /// Largest starting stockpile entry.
 pub const MAX_START_STOCK: u32 = 1_000_000;
@@ -144,21 +165,24 @@ pub struct Rules {
     pub cmd_delay_ticks: u32,
     /// Map loaded by `MatchSetup::skirmish`; must exist under `data/maps/`.
     pub default_map: String,
-    /// Per-resource income ceiling per 30 s, indexed by Trade level (0 = none).
-    /// Lore is exempt (see `resources.ron`). Must be strictly increasing.
-    pub yield_cap_table: Vec<u32>,
-    /// Population cap before any Arms research.
+    /// Per-resource income ceiling per 30 s before any `YieldCap` row (the
+    /// Trade techs set it to 100, 150 and 200). Lore is exempt (see
+    /// `resources.ron`).
+    pub yield_cap_base: u32,
+    /// Population cap before any `PopCap` row (each Arms level adds 25).
     pub pop_cap_base: u32,
-    /// Population cap added per Arms level.
-    pub pop_cap_per_arms_level: u32,
     /// Border radius a Town projects when founded.
     pub town_radius_tiles: u32,
     /// Border radius once a Town hosts `town_growth_distinct_buildings` kinds.
     pub town_radius_grown_tiles: u32,
     /// Distinct building kinds inside a Town's radius needed for growth.
     pub town_growth_distinct_buildings: u32,
-    /// Towns a player may own (sites included) before any Statecraft
-    /// research; the Seat counts.
+    /// The age (an `ages.ron` id) a Town's owner must have reached before
+    /// the Town grows to tier 2; `None` for no age gate. Read by the sim
+    /// from the M4a tech slice.
+    pub town_growth_age: Option<String>,
+    /// Towns a player may own (sites included) before any `TownLimit` row
+    /// (each Statecraft level adds 1); the Seat counts.
     pub town_limit_base: u32,
     /// Building ramp: the `n`-th copy of a kind (0-based, sites and the Seat
     /// included) costs `base * (1000 + step * n) / 1000`.
@@ -178,6 +202,15 @@ pub struct Rules {
     pub idle_seek_retry_ds: u32,
     /// What each player starts with under the standard start.
     pub standard_start: StandardStart,
+    /// Random spread of every hit in permille, `0..=500`: a hit is scaled
+    /// by a draw in `1000 - v ..= 1000 + v`. 0 draws nothing.
+    pub damage_variance_permille: u32,
+    /// Units acquire enemies within this many tiles, or within their weapon
+    /// range when that is longer.
+    pub acquire_range_tiles: u32,
+    /// An explicit chase re-goals its path once the target's tile is more
+    /// than this many tiles (Chebyshev) from the path's goal.
+    pub chase_regoal_tiles: u32,
     /// A Supply Wain cancels attrition within this radius.
     pub supply_radius_tiles: u32,
     /// Interval between attrition ticks at Harrying I, in deciseconds.
@@ -204,10 +237,25 @@ pub struct Rules {
     /// [`Rules::load`].
     #[serde(skip_deserializing)]
     pub units: Vec<UnitKind>,
+    /// The counter table from `rules/units.ron`. Attached by
+    /// [`Rules::load`]; read it through [`Rules::counter_permille`].
+    #[serde(skip_deserializing)]
+    pub counters: Vec<Counter>,
     /// Building kinds from `rules/buildings.ron` in `BuildingKindId` order.
     /// Attached by [`Rules::load`].
     #[serde(skip_deserializing)]
     pub buildings: Vec<BuildingKind>,
+    /// Techs from `rules/techs.ron` in `TechId` order. Attached by
+    /// [`Rules::load`].
+    #[serde(skip_deserializing)]
+    pub techs: Vec<Tech>,
+    /// Ages from `rules/ages.ron` in order. Attached by [`Rules::load`].
+    #[serde(skip_deserializing)]
+    pub ages: Vec<Age>,
+    /// Factions from `rules/factions.ron`; every player uses `factions[0]`
+    /// until a match setup chooses one (M9). Attached by [`Rules::load`].
+    #[serde(skip_deserializing)]
+    pub factions: Vec<Faction>,
     /// Every map under `maps/`, keyed by name. Attached by [`Rules::load`].
     #[serde(skip_deserializing)]
     pub maps: BTreeMap<String, MapDef>,
@@ -218,20 +266,70 @@ pub struct Rules {
     pub visuals: Visuals,
 }
 
+/// The files `Rules::load` read, so cross-file errors name the right one.
+struct Paths {
+    rules: PathBuf,
+    resources: PathBuf,
+    units: PathBuf,
+    buildings: PathBuf,
+    techs: PathBuf,
+    ages: PathBuf,
+}
+
+/// Which list of an age's `unlocks` a check reads.
+#[derive(Clone, Copy)]
+enum Unlock {
+    Units,
+    Buildings,
+    Techs,
+}
+
+impl Unlock {
+    fn list(self, u: &Unlocks) -> &[String] {
+        match self {
+            Unlock::Units => &u.units,
+            Unlock::Buildings => &u.buildings,
+            Unlock::Techs => &u.techs,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Unlock::Units => "units",
+            Unlock::Buildings => "buildings",
+            Unlock::Techs => "techs",
+        }
+    }
+}
+
+/// The result type of the cross-file checks.
+type Check = Result<(), Error>;
+
 impl Rules {
     /// Load and validate every rules file under `dir` (the `data/` directory).
+    ///
+    /// Each file is parsed and checked on its own first, in the order
+    /// `rules.ron`, `resources.ron`, `units.ron`, `buildings.ron`,
+    /// `techs.ron`, `ages.ron`, `factions.ron`; then one pass checks what
+    /// spans files, resolving the `ages.ron` references before anything
+    /// else; then `visuals.ron` and the maps load.
     pub fn load(dir: impl AsRef<Path>) -> Result<Rules, Error> {
         let dir = dir.as_ref();
-        let rules_path = dir.join("rules").join("rules.ron");
-        let mut rules: Rules = load_ron(&rules_path)?;
-        rules.validate_match_rules(&rules_path)?;
+        let file = |name: &str| dir.join("rules").join(name);
+        let paths = Paths {
+            rules: file("rules.ron"),
+            resources: file("resources.ron"),
+            units: file("units.ron"),
+            buildings: file("buildings.ron"),
+            techs: file("techs.ron"),
+            ages: file("ages.ron"),
+        };
+        let factions_path = file("factions.ron");
+        let mut rules: Rules = load_ron(&paths.rules)?;
+        rules.validate_match_rules(&paths.rules)?;
 
-        let resources_path = dir.join("rules").join("resources.ron");
-        rules.resources = load_ron(&resources_path)?;
-        rules
-            .resources
-            .validate(&resources_path, rules.yield_cap_table.len())?;
-
+        rules.resources = load_ron(&paths.resources)?;
+        rules.resources.validate(&paths.resources)?;
         let resource_ids: Vec<String> = rules
             .resources
             .resources
@@ -240,18 +338,28 @@ impl Rules {
             .collect();
         let resource_ids: Vec<&str> = resource_ids.iter().map(String::as_str).collect();
 
-        let units_path = dir.join("rules").join("units.ron");
-        let units: Units = load_ron(&units_path)?;
-        units.validate(&units_path, &resource_ids)?;
+        let units: Units = load_ron(&paths.units)?;
+        units.validate(&paths.units, &resource_ids)?;
         rules.units = units.units;
+        rules.counters = units.counters;
         let unit_ids: Vec<&str> = rules.units.iter().map(|u| u.id.as_str()).collect();
 
-        let buildings_path = dir.join("rules").join("buildings.ron");
-        let buildings: Buildings = load_ron(&buildings_path)?;
-        buildings.validate(&buildings_path, &resource_ids, &unit_ids)?;
+        let buildings: Buildings = load_ron(&paths.buildings)?;
+        buildings.validate(&paths.buildings, &resource_ids, &unit_ids)?;
         rules.buildings = buildings.buildings;
+        let building_ids: Vec<&str> = rules.buildings.iter().map(|b| b.id.as_str()).collect();
 
-        rules.cross_check(&rules_path, &resources_path, &units_path)?;
+        let techs: Techs = load_ron(&paths.techs)?;
+        techs.validate(&paths.techs, &resource_ids, &unit_ids, &building_ids)?;
+        let ages: Ages = load_ron(&paths.ages)?;
+        ages.validate(&paths.ages, &resource_ids)?;
+        let factions: Factions = load_ron(&factions_path)?;
+        factions.validate(&factions_path, &unit_ids)?;
+        rules.techs = techs.techs;
+        rules.ages = ages.ages;
+        rules.factions = factions.factions;
+
+        rules.cross_check(&paths)?;
 
         let visuals_path = dir.join("visuals.ron");
         rules.visuals = load_ron(&visuals_path)?;
@@ -261,7 +369,7 @@ impl Rules {
         rules.maps = map::load_dir(&maps_dir)?;
         if !rules.maps.contains_key(&rules.default_map) {
             return Err(Error::invalid(
-                &rules_path,
+                &paths.rules,
                 "default_map",
                 format!(
                     "no file maps/{}.ron (found: {})",
@@ -274,24 +382,230 @@ impl Rules {
         Ok(rules)
     }
 
-    /// The checks that need more than one file, run once `rules.ron`,
-    /// `resources.ron`, `units.ron` and `buildings.ron` are loaded. Each
-    /// error names the file holding the side that has to change.
-    fn cross_check(
-        &self,
-        rules_path: &Path,
-        resources_path: &Path,
-        units_path: &Path,
-    ) -> Result<(), Error> {
+    /// The checks that need more than one file, run once every file under
+    /// `rules/` has passed its own checks. Each error names the file holding
+    /// the side that has to change. The `ages.ron` references resolve first,
+    /// so a tech removed from `techs.ron` is reported where `ages.ron` names
+    /// it, before the line order of the remaining techs is checked.
+    fn cross_check(&self, p: &Paths) -> Check {
+        self.check_age_references(&p.ages)?;
+        techs::validate_lines(&p.techs, &self.techs)?;
+        self.check_unlocked_once(&p.ages)?;
+        self.check_unit_references(&p.units)?;
+        self.check_unlock_order(&p.ages)?;
+        self.check_age_gates_reachable(&p.ages)?;
+        if let Some(age) = &self.town_growth_age
+            && self.age_index(age).is_none()
+        {
+            return Err(Error::invalid(
+                &p.rules,
+                "town_growth_age",
+                format!("{age:?} is not an age id in ages.ron"),
+            ));
+        }
+        self.check_gathered_from(&p.resources)?;
+        let non_town = self.buildings.iter().filter(|b| !b.town).count();
+        if usize::try_from(self.town_growth_distinct_buildings).unwrap_or(usize::MAX) > non_town {
+            return Err(Error::invalid(
+                &p.rules,
+                "town_growth_distinct_buildings",
+                format!("must be <= the {non_town} non-Town kinds in buildings.ron"),
+            ));
+        }
+        self.check_standard_start(&p.rules)?;
+        self.check_costs_fit_caps(&p.techs, &p.ages)?;
+        self.check_cooldowns(&p.units, &p.buildings)?;
+        self.check_worst_cases(p)?;
+        self.check_min_hits(&p.units, &p.buildings)?;
+        self.check_research_times(&p.techs)
+    }
+
+    /// Where `id` is listed in `kind` lists: `(age, position)`.
+    fn unlock_position(&self, kind: Unlock, id: &str) -> Option<(usize, usize)> {
+        self.ages.iter().enumerate().find_map(|(i, a)| {
+            kind.list(&a.unlocks)
+                .iter()
+                .position(|x| x == id)
+                .map(|j| (i, j))
+        })
+    }
+
+    /// Every id an age unlocks names a unit kind, building kind or tech.
+    fn check_age_references(&self, path: &Path) -> Check {
+        for (i, a) in self.ages.iter().enumerate() {
+            for kind in [Unlock::Units, Unlock::Buildings, Unlock::Techs] {
+                for (j, id) in kind.list(&a.unlocks).iter().enumerate() {
+                    let (known, file) = match kind {
+                        Unlock::Units => (self.unit_kind_by_id(id).is_some(), "units.ron"),
+                        Unlock::Buildings => {
+                            (self.building_kind_by_id(id).is_some(), "buildings.ron")
+                        }
+                        Unlock::Techs => (self.tech_by_id(id).is_some(), "techs.ron"),
+                    };
+                    if !known {
+                        return Err(Error::invalid(
+                            path,
+                            &format!("ages[{i}].unlocks.{}[{j}]", kind.name()),
+                            format!("{id:?} is not an id in {file}"),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every unit kind, building kind and tech is unlocked by exactly one
+    /// age.
+    fn check_unlocked_once(&self, path: &Path) -> Check {
+        for kind in [Unlock::Units, Unlock::Buildings, Unlock::Techs] {
+            let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+            for (i, a) in self.ages.iter().enumerate() {
+                for (j, id) in kind.list(&a.unlocks).iter().enumerate() {
+                    if let Some(first) = seen.insert(id.as_str(), i) {
+                        return Err(Error::invalid(
+                            path,
+                            &format!("ages[{i}].unlocks.{}[{j}]", kind.name()),
+                            format!("{id:?} is already unlocked by ages[{first}]"),
+                        ));
+                    }
+                }
+            }
+            let ids: Vec<&str> = match kind {
+                Unlock::Units => self.units.iter().map(|u| u.id.as_str()).collect(),
+                Unlock::Buildings => self.buildings.iter().map(|b| b.id.as_str()).collect(),
+                Unlock::Techs => self.techs.iter().map(|t| t.id.as_str()).collect(),
+            };
+            if let Some(id) = ids.into_iter().find(|id| !seen.contains_key(id)) {
+                return Err(Error::invalid(
+                    path,
+                    &format!("ages[*].unlocks.{}", kind.name()),
+                    format!("{id:?} is unlocked by no age; list it in exactly one"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every unit kind's `trainer` names a building kind and its
+    /// `requires_tech`, if any, a tech.
+    fn check_unit_references(&self, path: &Path) -> Check {
         for (i, u) in self.units.iter().enumerate() {
             if self.building_kind_by_id(&u.trainer).is_none() {
                 return Err(Error::invalid(
-                    units_path,
+                    path,
                     &format!("units[{i}].trainer"),
                     format!("{:?} is not a building id in buildings.ron", u.trainer),
                 ));
             }
+            if let Some(t) = &u.requires_tech
+                && self.tech_by_id(t).is_none()
+            {
+                return Err(Error::invalid(
+                    path,
+                    &format!("units[{i}].requires_tech"),
+                    format!("{t:?} is not a tech id in techs.ron"),
+                ));
+            }
         }
+        Ok(())
+    }
+
+    /// Nothing is unlocked before what it needs: a tech no earlier than its
+    /// host and its predecessor, a unit kind no earlier than its trainer
+    /// and its `requires_tech`.
+    fn check_unlock_order(&self, path: &Path) -> Check {
+        let age_of = |kind: Unlock, id: &str| {
+            self.unlock_position(kind, id)
+                .expect("every id is unlocked once")
+                .0
+        };
+        let fail = |kind: Unlock, id: &str, needs: &str, other: Unlock, other_id: &str| {
+            let (i, j) = self.unlock_position(kind, id).expect("unlocked once");
+            Error::invalid(
+                path,
+                &format!("ages[{i}].unlocks.{}[{j}]", kind.name()),
+                format!(
+                    "{id:?} is unlocked in {:?}, before its {needs} {other_id:?} (unlocked in {:?})",
+                    self.ages[i].id,
+                    self.ages[age_of(other, other_id)].id
+                ),
+            )
+        };
+        for (i, t) in self.techs.iter().enumerate() {
+            let at = age_of(Unlock::Techs, &t.id);
+            if age_of(Unlock::Buildings, &t.host) > at {
+                return Err(fail(
+                    Unlock::Techs,
+                    &t.id,
+                    "host",
+                    Unlock::Buildings,
+                    &t.host,
+                ));
+            }
+            let index = u16::try_from(i).expect("validated tech count");
+            if let Some(prev) = self.tech_predecessor(index) {
+                let prev = &self.techs[usize::from(prev)].id;
+                if age_of(Unlock::Techs, prev) > at {
+                    return Err(fail(
+                        Unlock::Techs,
+                        &t.id,
+                        "predecessor",
+                        Unlock::Techs,
+                        prev,
+                    ));
+                }
+            }
+        }
+        for u in &self.units {
+            let at = age_of(Unlock::Units, &u.id);
+            if age_of(Unlock::Buildings, &u.trainer) > at {
+                return Err(fail(
+                    Unlock::Units,
+                    &u.id,
+                    "trainer",
+                    Unlock::Buildings,
+                    &u.trainer,
+                ));
+            }
+            if let Some(t) = &u.requires_tech
+                && age_of(Unlock::Techs, t) > at
+            {
+                return Err(fail(
+                    Unlock::Units,
+                    &u.id,
+                    "requires_tech",
+                    Unlock::Techs,
+                    t,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// An age's `techs_required` can be met with the techs the ages before
+    /// it unlock.
+    fn check_age_gates_reachable(&self, path: &Path) -> Check {
+        let mut available = 0usize;
+        for (i, a) in self.ages.iter().enumerate() {
+            if usize::try_from(a.techs_required).unwrap_or(usize::MAX) > available {
+                return Err(Error::invalid(
+                    path,
+                    &format!("ages[{i}].techs_required"),
+                    format!(
+                        "{} techs can never be researched: the ages before it unlock {available}",
+                        a.techs_required
+                    ),
+                ));
+            }
+            available += a.unlocks.techs.len();
+        }
+        Ok(())
+    }
+
+    /// Each resource's `gathered_from` equals the building kinds that yield
+    /// or gather it.
+    fn check_gathered_from(&self, path: &Path) -> Check {
         for (i, r) in self.resources.resources.iter().enumerate() {
             let declared: BTreeSet<&str> = r.gathered_from.iter().map(String::as_str).collect();
             let actual: BTreeSet<&str> = self
@@ -305,7 +619,7 @@ impl Rules {
                 .collect();
             if declared != actual {
                 return Err(Error::invalid(
-                    resources_path,
+                    path,
                     &format!("resources[{i}].gathered_from"),
                     format!(
                         "{declared:?} must equal the buildings.ron kinds that yield or gather {:?}: {actual:?}",
@@ -314,18 +628,10 @@ impl Rules {
                 ));
             }
         }
-        let non_town = self.buildings.iter().filter(|b| !b.town).count();
-        if usize::try_from(self.town_growth_distinct_buildings).unwrap_or(usize::MAX) > non_town {
-            return Err(Error::invalid(
-                rules_path,
-                "town_growth_distinct_buildings",
-                format!("must be <= the {non_town} non-Town kinds in buildings.ron"),
-            ));
-        }
-        self.check_standard_start(rules_path)
+        Ok(())
     }
 
-    fn check_standard_start(&self, path: &Path) -> Result<(), Error> {
+    fn check_standard_start(&self, path: &Path) -> Check {
         let start = &self.standard_start;
         let mut pop: u64 = 0;
         for (id, &count) in &start.units {
@@ -384,10 +690,295 @@ impl Rules {
         Ok(())
     }
 
+    /// Every tech and age cost fits the stockpile cap of each capped
+    /// resource (999 Lore), so it can be paid at all.
+    fn check_costs_fit_caps(&self, techs_path: &Path, ages_path: &Path) -> Check {
+        let lists = self
+            .techs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (techs_path, format!("techs[{i}].cost"), &t.cost))
+            .chain(
+                self.ages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (ages_path, format!("ages[{i}].cost"), &a.cost)),
+            );
+        for (path, field, cost) in lists {
+            for (id, &v) in cost {
+                let cap = self.resources.get(id).and_then(|r| r.stockpile_cap);
+                if let Some(cap) = cap
+                    && v > cap
+                {
+                    return Err(Error::invalid(
+                        path,
+                        &format!("{field}[{id:?}]"),
+                        format!("{v} is over the {id} stockpile cap {cap}; it could never be paid"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every attack's cooldown lasts at least one tick.
+    fn check_cooldowns(&self, units_path: &Path, buildings_path: &Path) -> Check {
+        let attacks = self
+            .units
+            .iter()
+            .enumerate()
+            .filter_map(|(i, u)| {
+                u.attack
+                    .as_ref()
+                    .map(|a| (units_path, format!("units[{i}]"), a))
+            })
+            .chain(self.buildings.iter().enumerate().filter_map(|(i, b)| {
+                b.attack
+                    .as_ref()
+                    .map(|a| (buildings_path, format!("buildings[{i}]"), a))
+            }));
+        for (path, field, a) in attacks {
+            if self.cooldown_ticks(a) == 0 {
+                return Err(Error::invalid(
+                    path,
+                    &format!("{field}.attack.cooldown_ds"),
+                    format!(
+                        "{} ds is 0 ticks at {} Hz; it must last at least one tick",
+                        a.cooldown_ds, self.tick_rate_hz
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The smallest possible hit of every attacker on every defender (each
+    /// unit kind and the buildings) does at least 1 damage, under every
+    /// faction's rows with any set of researched techs (a lower bound,
+    /// `modifiers::lower_bound`) and the lowest variance draw:
+    /// `floor(floor(damage * permille / 1000) * (1000 - v) / 1000) >= 1`.
+    fn check_min_hits(&self, units_path: &Path, buildings_path: &Path) -> Check {
+        let v = i64::from(self.damage_variance_permille);
+        let low = |raw: i64, permille: u32| raw * i64::from(permille) / 1000 * (1000 - v) / 1000;
+        let defenders: Vec<Defender> = self
+            .units
+            .iter()
+            .map(|u| Defender::Kind(u.id.clone()))
+            .chain([Defender::Buildings])
+            .collect();
+        for (f, faction) in self.factions.iter().enumerate() {
+            for (i, u) in self.units.iter().enumerate() {
+                let Some(a) = &u.attack else { continue };
+                let damage_row = |m: &&Modifier| {
+                    matches!(m.target, StatPath::UnitDamage(_)) && m.target.matches(u)
+                };
+                let raw = modifiers::lower_bound(
+                    i64::from(a.damage),
+                    faction.modifiers.iter().filter(damage_row),
+                    self.techs
+                        .iter()
+                        .flat_map(|t| t.modifiers.iter())
+                        .filter(damage_row),
+                )
+                .max(0);
+                for d in &defenders {
+                    let permille = self.counter_permille(&u.id, d);
+                    let hit = low(raw, permille);
+                    if hit >= 1 {
+                        continue;
+                    }
+                    let field = self
+                        .counters
+                        .iter()
+                        .position(|c| c.attacker == u.id && &c.defender == d)
+                        .map_or(format!("units[{i}].attack.damage"), |j| {
+                            format!("counters[{j}].permille")
+                        });
+                    return Err(Error::invalid(
+                        units_path,
+                        &field,
+                        format!(
+                            "{:?} hits {d:?} for {hit} (damage at least {raw} under factions[{f}] {:?} with any research, counter {permille}, variance {v}); every hit must do at least 1",
+                            u.id, faction.id
+                        ),
+                    ));
+                }
+            }
+        }
+        for (i, b) in self.buildings.iter().enumerate() {
+            let Some(a) = &b.attack else { continue };
+            let hit = low(i64::from(a.damage), 1000);
+            if hit < 1 {
+                return Err(Error::invalid(
+                    buildings_path,
+                    &format!("buildings[{i}].attack.damage"),
+                    format!("hits for {hit} at variance {v}; every hit must do at least 1"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Faction `f`'s rows, then every tech's in file order, that `keep`
+    /// accepts: every row that could ever apply to a stat.
+    fn all_rows<'a>(
+        &'a self,
+        f: &'a Faction,
+        keep: impl Fn(&StatPath) -> bool + Clone + 'a,
+    ) -> impl Iterator<Item = &'a Modifier> + Clone + 'a {
+        f.modifiers
+            .iter()
+            .chain(self.techs.iter().flat_map(|t| t.modifiers.iter()))
+            .filter(move |m| keep(&m.target))
+    }
+
+    /// Every stat stays within its type whatever is researched, in the worst
+    /// case `(|base| + max |Set| + sum |Add|)` times each `Mul` above 1000,
+    /// so the sim's checked math cannot overflow. The Town radius must stay
+    /// within [`MAX_BORDER_RADIUS_TILES`].
+    fn check_worst_cases(&self, p: &Paths) -> Check {
+        let u32_max = u64::from(u32::MAX);
+        let hp_max = u64::from(buildings::MAX_HP);
+        for (f, faction) in self.factions.iter().enumerate() {
+            let fits = |path: &Path,
+                        field: &str,
+                        base: u32,
+                        stat: &str,
+                        bound: Option<u128>,
+                        max: u64|
+             -> Check {
+                if bound.is_some_and(|b| b <= u128::from(max)) {
+                    return Ok(());
+                }
+                Err(Error::invalid(
+                    path,
+                    field,
+                    format!(
+                        "{base} with every {stat} row of techs.ron and factions[{f}] {:?} can reach {}; must be <= {max}",
+                        faction.id,
+                        bound.map_or_else(|| "more than u128".to_string(), |b| b.to_string())
+                    ),
+                ))
+            };
+            let player = |stat: StatPath, base: u32| {
+                modifiers::worst_case(i64::from(base), self.all_rows(faction, move |t| *t == stat))
+            };
+            for (field, base, stat, name) in [
+                (
+                    "yield_cap_base",
+                    self.yield_cap_base,
+                    StatPath::YieldCap,
+                    "YieldCap",
+                ),
+                (
+                    "pop_cap_base",
+                    self.pop_cap_base,
+                    StatPath::PopCap,
+                    "PopCap",
+                ),
+                (
+                    "town_limit_base",
+                    self.town_limit_base,
+                    StatPath::TownLimit,
+                    "TownLimit",
+                ),
+            ] {
+                fits(&p.rules, field, base, name, player(stat, base), u32_max)?;
+            }
+            let radius = self.town_radius_tiles.max(self.town_radius_grown_tiles);
+            fits(
+                &p.rules,
+                "town_radius_grown_tiles",
+                radius,
+                "TownBorderRadius",
+                player(StatPath::TownBorderRadius, radius),
+                u64::from(MAX_BORDER_RADIUS_TILES),
+            )?;
+            for (i, t) in self.techs.iter().enumerate() {
+                for (id, &amount) in &t.cost {
+                    fits(
+                        &p.techs,
+                        &format!("techs[{i}].cost[{id:?}]"),
+                        amount,
+                        "ResearchCost",
+                        player(StatPath::ResearchCost, amount),
+                        u32_max,
+                    )?;
+                }
+                fits(
+                    &p.techs,
+                    &format!("techs[{i}].research_time_ds"),
+                    t.research_time_ds,
+                    "ResearchTime",
+                    player(StatPath::ResearchTime, t.research_time_ds),
+                    u64::from(u32::MAX / 100),
+                )?;
+            }
+            for (i, u) in self.units.iter().enumerate() {
+                let unit = |hp: bool, base: u32| {
+                    modifiers::worst_case(
+                        i64::from(base),
+                        self.all_rows(faction, move |t| {
+                            let stat = if hp {
+                                matches!(t, StatPath::UnitHp(_))
+                            } else {
+                                matches!(t, StatPath::UnitDamage(_))
+                            };
+                            stat && t.matches(u)
+                        }),
+                    )
+                };
+                fits(
+                    &p.units,
+                    &format!("units[{i}].hp"),
+                    u.hp,
+                    "UnitHp",
+                    unit(true, u.hp),
+                    hp_max,
+                )?;
+                if let Some(a) = &u.attack {
+                    fits(
+                        &p.units,
+                        &format!("units[{i}].attack.damage"),
+                        a.damage,
+                        "UnitDamage",
+                        unit(false, a.damage),
+                        hp_max,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every research lasts at least one tick with every `ResearchTime` row
+    /// of the techs and the faction applied.
+    fn check_research_times(&self, path: &Path) -> Check {
+        for (f, faction) in self.factions.iter().enumerate() {
+            for (i, t) in self.techs.iter().enumerate() {
+                let rows = self.all_rows(faction, |s| *s == StatPath::ResearchTime);
+                let ds = modifiers::resolve(i64::from(t.research_time_ds), rows).max(0);
+                let ds = u32::try_from(ds).expect("bounded by check_worst_cases");
+                let ticks = self.ticks_from_ds(ds);
+                if ticks == 0 {
+                    return Err(Error::invalid(
+                        path,
+                        &format!("techs[{i}].research_time_ds"),
+                        format!(
+                            "{} ds falls to {ds} ds, 0 ticks, with every ResearchTime row of techs.ron and factions[{f}] {:?}; it must last at least one tick",
+                            t.research_time_ds, faction.id
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Every map start must fit the Town footprint centred on it (the
     /// Seat): in bounds and all Grass. Errors name `starts[i]` in the map's
     /// file.
-    fn check_start_footprints(&self, maps_dir: &Path) -> Result<(), Error> {
+    fn check_start_footprints(&self, maps_dir: &Path) -> Check {
         let town = &self.buildings[usize::from(self.town_kind())];
         let (w, h) = (town.width_tiles, town.height_tiles);
         for (name, map) in &self.maps {
@@ -424,7 +1015,7 @@ impl Rules {
         Ok(())
     }
 
-    fn validate_match_rules(&self, path: &Path) -> Result<(), Error> {
+    fn validate_match_rules(&self, path: &Path) -> Check {
         let positive = |field: &str, v: u32| -> Result<(), Error> {
             if v == 0 {
                 Err(Error::invalid(path, field, "must be > 0"))
@@ -441,22 +1032,8 @@ impl Rules {
         if self.default_map.is_empty() {
             return Err(Error::invalid(path, "default_map", "must not be empty"));
         }
-        if self.yield_cap_table.is_empty() {
-            return Err(Error::invalid(
-                path,
-                "yield_cap_table",
-                "must have at least one entry",
-            ));
-        }
-        if !self.yield_cap_table.windows(2).all(|w| w[0] < w[1]) {
-            return Err(Error::invalid(
-                path,
-                "yield_cap_table",
-                "must be strictly increasing",
-            ));
-        }
+        positive("yield_cap_base", self.yield_cap_base)?;
         positive("pop_cap_base", self.pop_cap_base)?;
-        positive("pop_cap_per_arms_level", self.pop_cap_per_arms_level)?;
         positive("town_radius_tiles", self.town_radius_tiles)?;
         if self.town_radius_grown_tiles < self.town_radius_tiles {
             return Err(Error::invalid(
@@ -465,17 +1042,17 @@ impl Rules {
                 "must be >= town_radius_tiles",
             ));
         }
-        if self.town_radius_grown_tiles > MAX_TOWN_RADIUS_TILES {
-            return Err(Error::invalid(
-                path,
-                "town_radius_grown_tiles",
-                format!("must be <= {MAX_TOWN_RADIUS_TILES}"),
-            ));
-        }
         positive(
             "town_growth_distinct_buildings",
             self.town_growth_distinct_buildings,
         )?;
+        if self.town_growth_age.as_deref() == Some("") {
+            return Err(Error::invalid(
+                path,
+                "town_growth_age",
+                "must not be empty; use None for no age gate",
+            ));
+        }
         positive("town_limit_base", self.town_limit_base)?;
         positive("supply_radius_tiles", self.supply_radius_tiles)?;
         positive("attrition_interval_ds", self.attrition_interval_ds)?;
@@ -522,6 +1099,24 @@ impl Rules {
             1,
             MAX_IDLE_SEEK_DS,
         )?;
+        in_range(
+            "damage_variance_permille",
+            self.damage_variance_permille,
+            0,
+            MAX_DAMAGE_VARIANCE_PERMILLE,
+        )?;
+        in_range(
+            "acquire_range_tiles",
+            self.acquire_range_tiles,
+            1,
+            MAX_COMBAT_TILES,
+        )?;
+        in_range(
+            "chase_regoal_tiles",
+            self.chase_regoal_tiles,
+            1,
+            MAX_COMBAT_TILES,
+        )?;
         positive("path_budget_expansions", self.path_budget_expansions)?;
         positive("path_cache_entries", self.path_cache_entries)?;
         positive("repath_interval_ds", self.repath_interval_ds)?;
@@ -556,40 +1151,18 @@ impl Rules {
         self.ticks_from_ds(self.repath_interval_ds)
     }
 
-    /// Yield cap for a Trade level, clamped to the last table entry.
-    pub fn yield_cap(&self, trade_level: u32) -> u32 {
-        let idx = (trade_level as usize).min(self.yield_cap_table.len() - 1);
-        self.yield_cap_table[idx]
-    }
-
-    /// Population cap at a given Arms level.
-    pub fn pop_cap(&self, arms_level: u32) -> u32 {
-        self.pop_cap_per_arms_level
-            .checked_mul(arms_level)
-            .and_then(|v| v.checked_add(self.pop_cap_base))
-            .expect("pop cap fits u32")
-    }
-
-    /// Towns a player may own, sites included, at a Statecraft level.
-    pub fn town_limit(&self, statecraft: u32) -> u32 {
-        self.town_limit_base
-            .checked_add(statecraft)
-            .expect("town limit fits u32")
-    }
-
-    /// Border radius of a Town at `tier` (1 = founded, 2 = grown) plus one
-    /// tile per Statecraft level of its owner.
+    /// Border radius of a Town at `tier` (1 = founded, 2 = grown) before any
+    /// `TownBorderRadius` row.
     ///
     /// # Panics
     ///
     /// If `tier` is not 1 or 2.
-    pub fn town_radius_for(&self, tier: u8, statecraft: u32) -> u32 {
-        let base = match tier {
+    pub fn town_radius_base(&self, tier: u8) -> u32 {
+        match tier {
             1 => self.town_radius_tiles,
             2 => self.town_radius_grown_tiles,
             _ => panic!("Town tier {tier} is not 1 or 2"),
-        };
-        base.checked_add(statecraft).expect("radius fits u32")
+        }
     }
 
     /// Ticks per income period: rates are per 30 s ([`RATE_PERIOD_DS`]),
@@ -607,6 +1180,26 @@ impl Rules {
     /// Training time of `kind` in ticks.
     pub fn train_time_ticks(&self, kind: &UnitKind) -> u32 {
         self.ticks_from_ds(kind.train_time_ds)
+    }
+
+    /// Cooldown of an attack in ticks; at least 1 for loaded data.
+    pub fn cooldown_ticks(&self, attack: &Attack) -> u32 {
+        self.ticks_from_ds(attack.cooldown_ds)
+    }
+
+    /// How far an attacker looks for enemies, in hundredths of a tile:
+    /// `acquire_range_tiles` or its weapon range, whichever is longer.
+    pub fn acquire_reach(&self, attack: &Attack) -> u32 {
+        (self.acquire_range_tiles * 100).max(attack.range_tiles_x100)
+    }
+
+    /// The counter multiplier in permille for hits by the unit kind
+    /// `attacker` (an id) on `defender`: the listed row, else 1000.
+    pub fn counter_permille(&self, attacker: &str, defender: &Defender) -> u32 {
+        self.counters
+            .iter()
+            .find(|c| c.attacker == attacker && &c.defender == defender)
+            .map_or(1000, |c| c.permille)
     }
 
     /// Ticks an idle worker waits before it seeks work.
@@ -660,15 +1253,113 @@ impl Rules {
         u16::try_from(i).expect("validated len")
     }
 
+    /// The tech at index `tech` (the sim's `TechId.0`), if it exists.
+    pub fn tech(&self, tech: u16) -> Option<&Tech> {
+        self.techs.get(usize::from(tech))
+    }
+
+    /// The tech with the given id string and its index, if it exists.
+    pub fn tech_by_id(&self, id: &str) -> Option<(u16, &Tech)> {
+        self.techs
+            .iter()
+            .position(|t| t.id == id)
+            .map(|i| (u16::try_from(i).expect("validated len"), &self.techs[i]))
+    }
+
+    /// The tech one level below `tech` in its line, if `tech` is above
+    /// level 1 (and exists).
+    pub fn tech_predecessor(&self, tech: u16) -> Option<u16> {
+        let t = self.tech(tech)?;
+        self.techs
+            .iter()
+            .position(|o| o.line == t.line && o.level + 1 == t.level)
+            .map(|i| u16::try_from(i).expect("validated len"))
+    }
+
+    /// The index of the age with the given id, if it exists.
+    pub fn age_index(&self, id: &str) -> Option<u8> {
+        self.ages
+            .iter()
+            .position(|a| a.id == id)
+            .map(|i| u8::try_from(i).expect("at most 255 ages"))
+    }
+
+    fn unlocked_in(&self, kind: Unlock, id: &str) -> u8 {
+        let (i, _) = self
+            .unlock_position(kind, id)
+            .unwrap_or_else(|| panic!("{id:?} is unlocked by no age"));
+        u8::try_from(i).expect("at most 255 ages")
+    }
+
+    /// The age that unlocks unit kind `kind` (the sim's `UnitKindId.0`).
+    ///
+    /// # Panics
+    ///
+    /// If the kind does not exist; `Rules::load` guarantees every kind is
+    /// unlocked by exactly one age.
+    pub fn age_of_unit(&self, kind: u16) -> u8 {
+        let id = &self.unit_kind(kind).expect("unit kind exists").id;
+        self.unlocked_in(Unlock::Units, id)
+    }
+
+    /// The age that unlocks building kind `kind` (the sim's
+    /// `BuildingKindId.0`).
+    ///
+    /// # Panics
+    ///
+    /// If the kind does not exist.
+    pub fn age_of_building(&self, kind: u16) -> u8 {
+        let id = &self.building_kind(kind).expect("building kind exists").id;
+        self.unlocked_in(Unlock::Buildings, id)
+    }
+
+    /// The age that unlocks tech `tech` (the sim's `TechId.0`).
+    ///
+    /// # Panics
+    ///
+    /// If the tech does not exist.
+    pub fn age_of_tech(&self, tech: u16) -> u8 {
+        let id = &self.tech(tech).expect("tech exists").id;
+        self.unlocked_in(Unlock::Techs, id)
+    }
+
+    /// Every Modifier row that applies to a player of faction `faction`
+    /// with the techs `researched`, in collection order: the faction's rows,
+    /// then each researched tech's rows in file order. Pass `researched` in
+    /// ascending `TechId` order (a `BTreeSet` iterates that way); an index
+    /// with no tech is skipped. Filter the result to one stat and pass it to
+    /// [`modifiers::resolve`].
+    ///
+    /// # Panics
+    ///
+    /// If `faction` is not an index into `factions`.
+    pub fn modifier_rows<'a, I>(
+        &'a self,
+        faction: usize,
+        researched: I,
+    ) -> impl Iterator<Item = &'a Modifier> + Clone + 'a
+    where
+        I: IntoIterator<Item = u16>,
+        I::IntoIter: Clone + 'a,
+    {
+        self.factions[faction].modifiers.iter().chain(
+            researched
+                .into_iter()
+                .filter_map(|t| self.tech(t))
+                .flat_map(|t| t.modifiers.iter()),
+        )
+    }
+
     /// The visual for a unit kind index (the sim's `UnitKindId.0`), if the
     /// kind exists. `Rules::load` guarantees every kind has one.
     pub fn visual(&self, kind: u16) -> Option<&Visual> {
         self.unit_kind(kind).and_then(|k| self.visuals.get(&k.id))
     }
 
-    /// Content hash of the loaded rules (match rules, resources, units,
-    /// buildings, maps and visuals); stored in replay headers so a changed RON file is
-    /// reported as `RULES CHANGED` instead of a sim divergence.
+    /// Content hash of the loaded rules (match rules, resources, units and
+    /// their counter table, buildings, techs, ages, factions, maps and
+    /// visuals); stored in replay headers so a changed RON file is reported
+    /// as `RULES CHANGED` instead of a sim divergence.
     pub fn rules_hash(&self) -> u64 {
         let bytes = postcard::to_allocvec(self).expect("Rules serialises");
         xxhash_rust::xxh3::xxh3_64(&bytes)
@@ -688,10 +1379,24 @@ mod tests {
         let rules = Rules::load(data_dir()).expect("data/ loads");
         assert_eq!(rules.tick_rate_hz, 20);
         assert_eq!(rules.resources.resources.len(), 4);
-        assert_eq!(rules.units.len(), 3);
+        assert_eq!(rules.units.len(), 8);
         assert_eq!(rules.unit_kind(0).unwrap().id, "yeoman");
         assert_eq!(rules.unit_kind(0).unwrap().speed_tiles_per_s_x100, 180);
-        assert!(rules.unit_kind(3).is_none());
+        let ids: Vec<&str> = rules.units.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "yeoman",
+                "scribe",
+                "skirmisher",
+                "shieldbearer",
+                "bowman",
+                "outrider",
+                "mangonel",
+                "supply_wain"
+            ]
+        );
+        assert!(rules.unit_kind(8).is_none());
         assert!(rules.unit_kind_by_id("yeoman").is_some());
         assert_eq!(rules.buildings.len(), 8);
         assert_eq!(rules.town_kind(), 0);
@@ -703,12 +1408,22 @@ mod tests {
                 .map(|(i, b)| (i, b.border_radius_tiles)),
             Some((6, Some(2)))
         );
+        assert_eq!(rules.ages.len(), 3);
+        assert_eq!(rules.techs.len(), 12);
+        assert_eq!(rules.factions.len(), 1);
+        assert!(rules.factions[0].modifiers.is_empty());
+        assert_eq!(rules.yield_cap_base, 70);
+        assert_eq!(rules.pop_cap_base, 25);
         assert!(rules.map("plains_1v1").is_some());
         assert_eq!(
             rules.visual(0),
             Some(&Visual::Primitive(visuals::Primitive::Capsule))
         );
-        assert!(rules.visual(3).is_none());
+        assert_eq!(
+            rules.visual(3),
+            Some(&Visual::Primitive(visuals::Primitive::Cuboid))
+        );
+        assert!(rules.visual(8).is_none());
         assert_eq!(rules.ticks_from_ds(32), 64);
         assert_eq!(rules.attrition_interval_ticks(), 64);
         assert_eq!(rules.annexation_ticks(), 1200);
@@ -726,13 +1441,8 @@ mod tests {
             rules.unit_kind(0).unwrap().return_to_post_radius_tiles_x100,
             100
         );
-        assert_eq!(rules.yield_cap(0), 70);
-        assert_eq!(rules.yield_cap(99), 200);
-        assert_eq!(rules.pop_cap(2), 75);
-        assert_eq!(rules.town_limit(0), rules.town_limit_base);
-        assert_eq!(rules.town_limit(3), rules.town_limit_base + 3);
-        assert_eq!(rules.town_radius_for(1, 0), 20);
-        assert_eq!(rules.town_radius_for(2, 3), 27);
+        assert_eq!(rules.town_radius_base(1), 20);
+        assert_eq!(rules.town_radius_base(2), 24);
         assert_eq!(rules.idle_seek_delay_ticks(), 100);
         assert_eq!(rules.idle_seek_retry_ticks(), 100);
         let (_, town) = rules.building_kind_by_id("town").unwrap();
@@ -742,6 +1452,124 @@ mod tests {
             rules.amounts(&rules.standard_start.stockpile),
             [150, 150, 0, 0]
         );
+    }
+
+    #[test]
+    fn tech_and_age_accessors_read_the_repo_data() {
+        let r = Rules::load(data_dir()).unwrap();
+        let techs: Vec<&str> = r.techs.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            techs,
+            [
+                "arms_1",
+                "arms_2",
+                "arms_3",
+                "statecraft_1",
+                "statecraft_2",
+                "statecraft_3",
+                "trade_1",
+                "trade_2",
+                "trade_3",
+                "letters_1",
+                "letters_2",
+                "letters_3"
+            ]
+        );
+        assert!(r.techs.iter().all(|t| t.host == "scriptorium"));
+        assert_eq!(r.tech(11).unwrap().id, "letters_3");
+        assert!(r.tech(12).is_none());
+        assert_eq!(r.ages[2].unlocks.techs[3], "letters_3");
+        assert_eq!(r.tech_by_id("trade_2").map(|(i, _)| i), Some(7));
+        assert!(r.tech_by_id("trade_4").is_none());
+        assert_eq!(r.tech_predecessor(0), None);
+        assert_eq!(r.tech_predecessor(1), Some(0));
+        assert_eq!(r.tech_predecessor(11), Some(10));
+        assert_eq!(r.age_index("hearth"), Some(0));
+        assert_eq!(r.age_index("masonry"), Some(1));
+        assert_eq!(r.age_index("powder"), None);
+        assert_eq!(r.town_growth_age.as_deref(), Some("masonry"));
+        let (age, unit, building) = (
+            |id: &str| r.age_of_tech(r.tech_by_id(id).unwrap().0),
+            |id: &str| {
+                let i = r.units.iter().position(|u| u.id == id).unwrap();
+                r.age_of_unit(u16::try_from(i).unwrap())
+            },
+            |id: &str| r.age_of_building(r.building_kind_by_id(id).unwrap().0),
+        );
+        assert_eq!((age("arms_1"), age("letters_2"), age("trade_3")), (0, 1, 2));
+        assert_eq!(
+            (unit("bowman"), unit("outrider"), unit("supply_wain")),
+            (0, 1, 1)
+        );
+        assert_eq!((building("watchtower"), building("engine_yard")), (0, 1));
+        let gates: Vec<(u32, Vec<i64>)> = r
+            .ages
+            .iter()
+            .map(|a| (a.techs_required, r.amounts(&a.cost)))
+            .collect();
+        assert_eq!(
+            gates,
+            [
+                (0, vec![0, 0, 0, 0]),
+                (2, vec![250, 0, 0, 100]),
+                (5, vec![500, 300, 0, 300])
+            ]
+        );
+        // Collection order: the faction's rows, then each researched tech in
+        // the order given, each with its rows in file order.
+        let rows: Vec<&StatPath> = r.modifier_rows(0, [3u16, 6]).map(|m| &m.target).collect();
+        assert_eq!(
+            rows,
+            [
+                &StatPath::TownLimit,
+                &StatPath::TownBorderRadius,
+                &StatPath::YieldCap
+            ]
+        );
+        let cap = modifiers::resolve(
+            i64::from(r.yield_cap_base),
+            r.modifier_rows(0, [6u16, 7])
+                .filter(|m| m.target == StatPath::YieldCap),
+        );
+        assert_eq!(cap, 150);
+    }
+
+    #[test]
+    fn combat_accessors_read_the_repo_data() {
+        let r = Rules::load(data_dir()).unwrap();
+        let kind = |id: &str| Defender::Kind(id.into());
+        assert_eq!(r.counter_permille("skirmisher", &kind("bowman")), 2500);
+        assert_eq!(r.counter_permille("bowman", &kind("shieldbearer")), 3000);
+        assert_eq!(r.counter_permille("mangonel", &Defender::Buildings), 4000);
+        assert_eq!(r.counter_permille("bowman", &Defender::Buildings), 250);
+        assert_eq!(r.counter_permille("bowman", &kind("bowman")), 1000);
+        let attack = |id: &str| r.unit_kind_by_id(id).unwrap().attack.clone();
+        assert!(attack("yeoman").is_none() && attack("supply_wain").is_none());
+        let bowman = attack("bowman").unwrap();
+        assert_eq!(r.cooldown_ticks(&bowman), 30);
+        assert_eq!(r.acquire_reach(&bowman), 600);
+        assert_eq!(r.acquire_reach(&attack("skirmisher").unwrap()), 600);
+        let mangonel = attack("mangonel").unwrap();
+        assert_eq!(
+            (r.acquire_reach(&mangonel), mangonel.prefer),
+            (800, Prefer::Buildings)
+        );
+        let shooter = |id: &str| r.building_kind_by_id(id).unwrap().1.attack.clone();
+        assert_eq!(shooter("town"), shooter("watchtower"));
+        assert_eq!(
+            shooter("watchtower").map(|a| (a.damage, a.range_tiles_x100, a.cooldown_ds)),
+            Some((15, 700, 15))
+        );
+        assert!(shooter("croft").is_none());
+        assert_eq!(
+            (
+                r.damage_variance_permille,
+                r.acquire_range_tiles,
+                r.chase_regoal_tiles
+            ),
+            (0, 6, 2)
+        );
+        assert!(r.units.iter().all(|u| u.requires_tech.is_none()));
     }
 
     #[test]
@@ -755,7 +1583,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "tier 3")]
     fn town_radius_rejects_unknown_tiers() {
-        Rules::load(data_dir()).unwrap().town_radius_for(3, 0);
+        Rules::load(data_dir()).unwrap().town_radius_base(3);
     }
 
     #[test]
@@ -795,6 +1623,50 @@ mod tests {
             a.rules_hash(),
             f.rules_hash(),
             "buildings.ron is part of the hash"
+        );
+    }
+
+    #[test]
+    fn rules_hash_covers_techs_ages_factions() {
+        let a = Rules::load(data_dir()).unwrap();
+        let mut b = Rules::load(data_dir()).unwrap();
+        b.techs[0].research_time_ds += 1;
+        assert_ne!(
+            a.rules_hash(),
+            b.rules_hash(),
+            "techs.ron is part of the hash"
+        );
+        let mut c = Rules::load(data_dir()).unwrap();
+        c.ages[1].techs_required += 1;
+        assert_ne!(
+            a.rules_hash(),
+            c.rules_hash(),
+            "ages.ron is part of the hash"
+        );
+        let mut d = Rules::load(data_dir()).unwrap();
+        d.factions[0].modifiers.push(Modifier {
+            target: StatPath::YieldCap,
+            op: ModOp::Mul,
+            value: 1250,
+        });
+        assert_ne!(
+            a.rules_hash(),
+            d.rules_hash(),
+            "factions.ron is part of the hash"
+        );
+        let mut e = Rules::load(data_dir()).unwrap();
+        e.counters[0].permille += 1;
+        assert_ne!(
+            a.rules_hash(),
+            e.rules_hash(),
+            "the counter table is part of the hash"
+        );
+        let mut f = Rules::load(data_dir()).unwrap();
+        f.town_growth_age = None;
+        assert_ne!(
+            a.rules_hash(),
+            f.rules_hash(),
+            "rules.ron is part of the hash"
         );
     }
 
@@ -855,18 +1727,29 @@ mod tests {
     #[test]
     fn validator_rejects_bad_ranges() {
         let mut r = Rules::load(data_dir()).unwrap();
-        r.yield_cap_table = vec![70, 70];
-        let err = r.validate_match_rules(Path::new("x.ron")).unwrap_err();
-        assert!(err.to_string().contains("yield_cap_table"), "{err}");
-        let mut r = Rules::load(data_dir()).unwrap();
         r.town_radius_grown_tiles = 1;
         let err = r.validate_match_rules(Path::new("x.ron")).unwrap_err();
         assert!(err.to_string().contains("town_radius_grown_tiles"), "{err}");
         for (field, set) in [
             (
-                "repath_interval_ds",
-                (|r: &mut Rules| r.repath_interval_ds = 0) as fn(&mut Rules),
+                "yield_cap_base",
+                (|r: &mut Rules| r.yield_cap_base = 0) as fn(&mut Rules),
             ),
+            ("damage_variance_permille", |r| {
+                r.damage_variance_permille = MAX_DAMAGE_VARIANCE_PERMILLE + 1
+            }),
+            ("acquire_range_tiles", |r| r.acquire_range_tiles = 0),
+            ("acquire_range_tiles", |r| {
+                r.acquire_range_tiles = MAX_COMBAT_TILES + 1
+            }),
+            ("chase_regoal_tiles", |r| r.chase_regoal_tiles = 0),
+            ("chase_regoal_tiles", |r| {
+                r.chase_regoal_tiles = MAX_COMBAT_TILES + 1
+            }),
+            ("town_growth_age", |r| {
+                r.town_growth_age = Some(String::new())
+            }),
+            ("repath_interval_ds", |r| r.repath_interval_ds = 0),
             ("separation_push_moving_div", |r| {
                 r.separation_push_moving_div = 0
             }),
@@ -909,14 +1792,35 @@ mod tests {
     /// Replace the first `from` in the copied `file` with `to`, asserting
     /// that it was there, then load and return the error message.
     fn load_error_after_edit(name: &str, file: &str, from: &str, to: &str) -> String {
+        load_error_after_edits(name, &[(file, from, to)])
+    }
+
+    /// `load_error_after_edit` with several `(file, from, to)` edits.
+    fn load_error_after_edits(name: &str, edits: &[(&str, &str, &str)]) -> String {
         let dir = copied_data_dir(name);
-        let path = dir.join(file);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(from), "{file} no longer contains {from:?}");
-        std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+        for (file, from, to) in edits {
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(from), "{file} no longer contains {from:?}");
+            std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+        }
         let msg = Rules::load(&dir).unwrap_err().to_string();
         let _ = std::fs::remove_dir_all(&dir);
         msg
+    }
+
+    /// Apply text edits to a copy of `data/` and load it, expecting success.
+    fn loads_after_edits(name: &str, edits: &[(&str, &str, &str)]) -> Rules {
+        let dir = copied_data_dir(name);
+        for (file, from, to) in edits {
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains(from), "{file} no longer contains {from:?}");
+            std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+        }
+        let rules = Rules::load(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        rules.unwrap()
     }
 
     #[test]
@@ -945,21 +1849,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_pop_cap_per_arms_level() {
-        let dir = copied_data_dir("pop-cap-per-arms-zero");
-        let path = dir.join("rules/rules.ron");
-        let text = std::fs::read_to_string(&path).unwrap();
-        let text = text.replacen(
-            "pop_cap_per_arms_level: 25,",
-            "pop_cap_per_arms_level: 0,",
-            1,
+    fn rejects_zero_yield_cap_base_and_the_removed_cap_fields() {
+        let msg = load_error_after_edit(
+            "yield-cap-zero",
+            "rules/rules.ron",
+            "yield_cap_base: 70,",
+            "yield_cap_base: 0,",
         );
-        std::fs::write(&path, text).unwrap();
-        let err = Rules::load(&dir).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("rules.ron"), "{msg}");
-        assert!(msg.contains("pop_cap_per_arms_level"), "{msg}");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            msg.contains("rules.ron") && msg.contains("yield_cap_base"),
+            "{msg}"
+        );
+        // The M3a cap fields are gone: the Trade and Arms rows in techs.ron
+        // are the only source, so an old file fails naming the field.
+        for old in [
+            "yield_cap_table: [70, 100, 150, 200],",
+            "pop_cap_per_arms_level: 25,",
+        ] {
+            let msg = load_error_after_edit(
+                "cap-field-removed",
+                "rules/rules.ron",
+                "pop_cap_base: 25,",
+                &format!("pop_cap_base: 25,\n  {old}"),
+            );
+            let name = old.split(':').next().unwrap();
+            assert!(msg.contains("rules.ron") && msg.contains(name), "{msg}");
+        }
     }
 
     #[test]
@@ -1206,14 +2121,532 @@ mod tests {
         assert!(msg.contains("idle_seek_retry_ds"), "{msg}");
     }
 
+    /// Parse `file` of the repo data as `T`, apply `edit`, write it back
+    /// serialised into a copy of `data/` and load that copy: the error.
+    fn load_error_with<T>(name: &str, file: &str, edit: impl FnOnce(&mut T)) -> String
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let dir = copied_data_dir(name);
+        let path = dir.join(file);
+        let mut value: T = load_ron(&path).unwrap();
+        edit(&mut value);
+        let text = ron::ser::to_string_pretty(&value, ron::ser::PrettyConfig::default()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let msg = Rules::load(&dir).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        msg
+    }
+
+    /// `load_error_with`, expecting the copy to load.
+    fn loads_with<T>(name: &str, file: &str, edit: impl FnOnce(&mut T)) -> Rules
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let dir = copied_data_dir(name);
+        let path = dir.join(file);
+        let mut value: T = load_ron(&path).unwrap();
+        edit(&mut value);
+        let text = ron::ser::to_string_pretty(&value, ron::ser::PrettyConfig::default()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let rules = Rules::load(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        rules.unwrap()
+    }
+
     #[test]
-    fn town_radius_leaves_room_for_statecraft() {
+    fn serialised_copies_of_every_file_load_unchanged() {
+        let a = Rules::load(data_dir()).unwrap();
+        let b = loads_with::<Techs>("ser-techs", "rules/techs.ron", |_| {});
+        let c = loads_with::<Ages>("ser-ages", "rules/ages.ron", |_| {});
+        let d = loads_with::<Factions>("ser-factions", "rules/factions.ron", |_| {});
+        let e = loads_with::<Units>("ser-units", "rules/units.ron", |_| {});
+        for r in [b, c, d, e] {
+            assert_eq!(a.rules_hash(), r.rules_hash());
+        }
+    }
+
+    #[test]
+    fn town_radius_worst_case_fits() {
+        // 61 plus the three Statecraft rows is exactly 64.
         let msg = load_error_after_edit(
-            "t-radius",
+            "t-radius-62",
             "rules/rules.ron",
             "town_radius_grown_tiles: 24,",
-            "town_radius_grown_tiles: 61,",
+            "town_radius_grown_tiles: 62,",
         );
-        assert!(msg.contains("town_radius_grown_tiles"), "{msg}");
+        assert!(
+            msg.contains("rules.ron")
+                && msg.contains("town_radius_grown_tiles")
+                && msg.contains("can reach 65")
+                && msg.contains("<= 64"),
+            "{msg}"
+        );
+        let r = loads_after_edits(
+            "t-radius-61",
+            &[(
+                "rules/rules.ron",
+                "town_radius_grown_tiles: 24,",
+                "town_radius_grown_tiles: 61,",
+            )],
+        );
+        assert_eq!(r.town_radius_base(2), 61);
+        // A faction row counts too.
+        let msg = load_error_with::<Factions>("t-radius-faction", "rules/factions.ron", |f| {
+            f.factions[0].modifiers.push(Modifier {
+                target: StatPath::TownBorderRadius,
+                op: ModOp::Add,
+                value: 38,
+            });
+        });
+        assert!(
+            msg.contains("town_radius_grown_tiles") && msg.contains("freeholders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn worst_case_bounds_cover_every_stat() {
+        let msg = load_error_with::<Factions>("w-pop", "rules/factions.ron", |f| {
+            for _ in 0..2 {
+                f.factions[0].modifiers.push(Modifier {
+                    target: StatPath::PopCap,
+                    op: ModOp::Mul,
+                    value: modifiers::MAX_MUL_PERMILLE,
+                });
+            }
+            f.factions[0].modifiers.push(Modifier {
+                target: StatPath::PopCap,
+                op: ModOp::Set,
+                value: modifiers::MAX_ADD_SET,
+            });
+        });
+        assert!(
+            msg.contains("rules.ron") && msg.contains("pop_cap_base"),
+            "{msg}"
+        );
+        let msg = load_error_with::<Techs>("w-hp", "rules/techs.ron", |t| {
+            for _ in 0..2 {
+                t.techs[0].modifiers.push(Modifier {
+                    target: StatPath::UnitHp(UnitSel::Kind("supply_wain".into())),
+                    op: ModOp::Mul,
+                    value: modifiers::MAX_MUL_PERMILLE,
+                });
+            }
+        });
+        assert!(
+            msg.contains("units.ron") && msg.contains("units[7].hp"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn techs_reject_a_float_mul_naming_the_file() {
+        let msg = load_error_after_edit("t-float", "rules/techs.ron", "value: 900", "value: 1.25");
+        assert!(msg.contains("rules/techs.ron"), "{msg}");
+        // The parse error carries the span, `line:col`.
+        let span = msg.split("techs.ron: ").nth(1).unwrap_or("");
+        assert!(
+            span.split(':')
+                .next()
+                .is_some_and(|l| l.parse::<u32>().is_ok()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn techs_reject_non_positive_mul() {
+        for bad in ["0", "-900"] {
+            let msg = load_error_after_edit(
+                "t-mul",
+                "rules/techs.ron",
+                "value: 900",
+                &format!("value: {bad}"),
+            );
+            assert!(
+                msg.contains("rules/techs.ron") && msg.contains("techs[9].modifiers[0].value"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn techs_reject_unknown_stat_path_naming_the_file() {
+        let msg = load_error_after_edit(
+            "t-stat",
+            "rules/techs.ron",
+            "target: ResearchCost",
+            "target: ResearchSpeed",
+        );
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains("StatPath"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "t-sel",
+            "rules/techs.ron",
+            "target: UnitHp(Military)",
+            "target: UnitHp(Soldiers)",
+        );
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains("UnitSel"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "t-kind",
+            "rules/techs.ron",
+            "target: UnitHp(Military)",
+            r#"target: UnitHp(Kind("dragon"))"#,
+        );
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains("techs[0].modifiers[1].target"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn techs_need_each_level_after_its_predecessor() {
+        let msg = load_error_with::<Techs>("t-order", "rules/techs.ron", |t| {
+            t.techs.swap(0, 1);
+        });
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains("techs[0].level"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit("t-level", "rules/techs.ron", "level: 3,", "level: 4,");
+        assert!(msg.contains("techs[2].level"), "{msg}");
+        let msg = load_error_after_edit("t-dup", "rules/techs.ron", "level: 3,", "level: 2,");
+        assert!(
+            msg.contains("techs[2].level") && msg.contains("arms_2"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "t-host",
+            "rules/techs.ron",
+            r#"host: "scriptorium""#,
+            r#"host: "library""#,
+        );
+        assert!(msg.contains("techs[0].host"), "{msg}");
+    }
+
+    #[test]
+    fn removing_any_referenced_tech_names_ages_ron_and_field() {
+        for (id, field) in [
+            ("arms_1", "ages[0].unlocks.techs[0]"),
+            ("statecraft_2", "ages[1].unlocks.techs[1]"),
+            ("letters_3", "ages[2].unlocks.techs[3]"),
+        ] {
+            let msg = load_error_with::<Techs>("t-remove", "rules/techs.ron", |t| {
+                t.techs.retain(|t| t.id != id);
+            });
+            assert!(
+                msg.contains("rules/ages.ron") && msg.contains(field) && msg.contains(id),
+                "{id}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn ages_gates_must_be_monotonic() {
+        let msg = load_error_after_edit(
+            "a-techs",
+            "rules/ages.ron",
+            "techs_required: 5,",
+            "techs_required: 1,",
+        );
+        assert!(
+            msg.contains("rules/ages.ron") && msg.contains("ages[2].techs_required"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "a-cost",
+            "rules/ages.ron",
+            r#"cost: {"grain": 500, "lumber": 300, "lore": 300}"#,
+            r#"cost: {"grain": 500, "lumber": 300, "lore": 99}"#,
+        );
+        assert!(msg.contains(r#"ages[2].cost["lore"]"#), "{msg}");
+        // A gate the ages before it cannot meet.
+        let msg = load_error_after_edit(
+            "a-reach",
+            "rules/ages.ron",
+            "techs_required: 2,",
+            "techs_required: 5,",
+        );
+        assert!(
+            msg.contains("ages[1].techs_required") && msg.contains("unlock 4"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn ages_first_age_is_free() {
+        let msg = load_error_after_edit(
+            "a-first",
+            "rules/ages.ron",
+            "techs_required: 0,",
+            "techs_required: 1,",
+        );
+        assert!(
+            msg.contains("rules/ages.ron") && msg.contains("ages[0].techs_required"),
+            "{msg}"
+        );
+        let msg = load_error_with::<Ages>("a-first-cost", "rules/ages.ron", |a| {
+            a.ages[0].cost.insert("grain".into(), 1);
+        });
+        assert!(msg.contains("ages[0].cost"), "{msg}");
+    }
+
+    #[test]
+    fn ages_unlock_every_id_exactly_once() {
+        let msg = load_error_after_edit(
+            "a-twice",
+            "rules/ages.ron",
+            r#"techs: ["arms_2","#,
+            r#"techs: ["arms_1", "arms_2","#,
+        );
+        assert!(
+            msg.contains("rules/ages.ron")
+                && msg.contains("ages[1].unlocks.techs[0]")
+                && msg.contains("ages[0]"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit("a-missing", "rules/ages.ron", r#", "bowman"]"#, "]");
+        assert!(
+            msg.contains("rules/ages.ron")
+                && msg.contains("unlocks.units")
+                && msg.contains("bowman"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "a-unknown",
+            "rules/ages.ron",
+            r#"buildings: ["engine_yard"]"#,
+            r#"buildings: ["engine_yard", "harbour"]"#,
+        );
+        assert!(msg.contains("ages[1].unlocks.buildings[1]"), "{msg}");
+        let msg = load_error_after_edit(
+            "a-unknown-unit",
+            "rules/ages.ron",
+            r#"units: ["outrider","#,
+            r#"units: ["knight", "outrider","#,
+        );
+        assert!(msg.contains("ages[1].unlocks.units[0]"), "{msg}");
+    }
+
+    #[test]
+    fn unlock_order_respects_trainer_host_and_predecessor() {
+        // A unit before its trainer.
+        let msg = load_error_with::<Ages>("o-trainer", "rules/ages.ron", |a| {
+            a.ages[0].unlocks.buildings.retain(|b| b != "muster_hall");
+            a.ages[1].unlocks.buildings.push("muster_hall".into());
+        });
+        assert!(
+            msg.contains("rules/ages.ron")
+                && msg.contains("ages[0].unlocks.units[2]")
+                && msg.contains("trainer"),
+            "{msg}"
+        );
+        // A tech before its host.
+        let msg = load_error_with::<Ages>("o-host", "rules/ages.ron", |a| {
+            a.ages[0].unlocks.buildings.retain(|b| b != "scriptorium");
+            a.ages[1].unlocks.buildings.push("scriptorium".into());
+        });
+        assert!(
+            msg.contains("ages[0].unlocks.techs[0]") && msg.contains("host"),
+            "{msg}"
+        );
+        // A level before the level below it.
+        let msg = load_error_with::<Ages>("o-pred", "rules/ages.ron", |a| {
+            a.ages[0].unlocks.techs[0] = "arms_2".into();
+            a.ages[1].unlocks.techs[0] = "arms_1".into();
+        });
+        assert!(
+            msg.contains("ages[0].unlocks.techs[0]") && msg.contains("predecessor"),
+            "{msg}"
+        );
+        // A unit before its requires_tech, and one naming no tech.
+        let msg = load_error_with::<Units>("o-requires", "rules/units.ron", |u| {
+            u.units[5].requires_tech = Some("arms_3".into());
+        });
+        assert!(
+            msg.contains("ages[1].unlocks.units[0]") && msg.contains("requires_tech"),
+            "{msg}"
+        );
+        let msg = load_error_with::<Units>("o-requires-none", "rules/units.ron", |u| {
+            u.units[5].requires_tech = Some("arms_9".into());
+        });
+        assert!(
+            msg.contains("rules/units.ron") && msg.contains("units[5].requires_tech"),
+            "{msg}"
+        );
+        // The same age is fine: Arms I gates the Outrider by data alone.
+        let r = loads_with::<Units>("o-requires-ok", "rules/units.ron", |u| {
+            u.units[5].requires_tech = Some("arms_1".into());
+        });
+        assert_eq!(r.units[5].requires_tech.as_deref(), Some("arms_1"));
+        // town_growth_age names an age.
+        let msg = load_error_after_edit(
+            "o-growth",
+            "rules/rules.ron",
+            r#"town_growth_age: Some("masonry"),"#,
+            r#"town_growth_age: Some("bronze"),"#,
+        );
+        assert!(
+            msg.contains("rules.ron") && msg.contains("town_growth_age"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn costs_fit_capped_stockpiles() {
+        let msg = load_error_after_edit(
+            "c-tech",
+            "rules/techs.ron",
+            r#"cost: {"ore": 150, "lore": 250}"#,
+            r#"cost: {"ore": 150, "lore": 1000}"#,
+        );
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains(r#"techs[2].cost["lore"]"#),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "c-age",
+            "rules/ages.ron",
+            r#""lumber": 300, "lore": 300}"#,
+            r#""lumber": 300, "lore": 1000}"#,
+        );
+        assert!(
+            msg.contains("rules/ages.ron") && msg.contains(r#"ages[2].cost["lore"]"#),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn every_hit_does_at_least_one_damage() {
+        // Skirmisher on buildings: 10 * 250 / 1000 = 2, at variance 500 -> 1.
+        let r = loads_after_edits(
+            "h-ok",
+            &[(
+                "rules/rules.ron",
+                "damage_variance_permille: 0,",
+                "damage_variance_permille: 500,",
+            )],
+        );
+        assert_eq!(r.damage_variance_permille, 500);
+        // A counter row that floors a hit to 0 is named.
+        let msg = load_error_with::<Units>("h-counter", "rules/units.ron", |u| {
+            u.counters[7].permille = 99;
+        });
+        assert!(
+            msg.contains("rules/units.ron") && msg.contains("counters[7].permille"),
+            "{msg}"
+        );
+        // So is a faction row that shrinks the damage: 10 -> 1, and 1 * 250
+        // / 1000 floors to 0 on buildings.
+        let msg = load_error_with::<Factions>("h-faction", "rules/factions.ron", |f| {
+            f.factions[0].modifiers.push(Modifier {
+                target: StatPath::UnitDamage(UnitSel::Military),
+                op: ModOp::Mul,
+                value: 100,
+            });
+        });
+        assert!(
+            msg.contains("units.ron")
+                && msg.contains("counters[7].permille")
+                && msg.contains("freeholders"),
+            "{msg}"
+        );
+        // So is a tech row that shrinks it once researched (the Arms rows
+        // raise damage and never count against the bound).
+        let msg = load_error_with::<Techs>("h-tech", "rules/techs.ron", |t| {
+            t.techs[0].modifiers.push(Modifier {
+                target: StatPath::UnitDamage(UnitSel::Military),
+                op: ModOp::Mul,
+                value: 100,
+            });
+        });
+        assert!(
+            msg.contains("units.ron")
+                && msg.contains("counters[7].permille")
+                && msg.contains("with any research"),
+            "{msg}"
+        );
+        // And a shooter whose hit vanishes at the lowest variance draw:
+        // 1 * 999 / 1000 = 0.
+        let msg = load_error_after_edits(
+            "h-town",
+            &[
+                (
+                    "rules/rules.ron",
+                    "damage_variance_permille: 0,",
+                    "damage_variance_permille: 1,",
+                ),
+                (
+                    "rules/buildings.ron",
+                    "damage: 15, range_tiles_x100: 700",
+                    "damage: 1, range_tiles_x100: 700",
+                ),
+            ],
+        );
+        assert!(
+            msg.contains("rules/buildings.ron") && msg.contains("buildings[0].attack.damage"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn cooldowns_and_research_last_at_least_one_tick() {
+        let msg = load_error_after_edit(
+            "k-research",
+            "rules/techs.ron",
+            "research_time_ds: 250,",
+            "research_time_ds: 1,",
+        );
+        assert!(
+            msg.contains("rules/techs.ron") && msg.contains("techs[9].research_time_ds"),
+            "{msg}"
+        );
+        // At 4 Hz one decisecond is 0.4 ticks, which rounds to 0.
+        let msg = load_error_after_edits(
+            "k-cooldown",
+            &[
+                ("rules/rules.ron", "tick_rate_hz: 20,", "tick_rate_hz: 4,"),
+                ("rules/units.ron", "cooldown_ds: 10", "cooldown_ds: 1"),
+            ],
+        );
+        assert!(
+            msg.contains("rules/units.ron") && msg.contains("units[2].attack.cooldown_ds"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn counters_and_attacks_are_checked_in_the_repo_files() {
+        let msg = load_error_after_edit(
+            "u-counter",
+            "rules/units.ron",
+            r#"(attacker: "skirmisher", defender: Kind("bowman")"#,
+            r#"(attacker: "scribe", defender: Kind("bowman")"#,
+        );
+        assert!(
+            msg.contains("rules/units.ron") && msg.contains("counters[0].attacker"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "u-radius",
+            "rules/units.ron",
+            "radius_tiles_x100: 45,",
+            "radius_tiles_x100: 51,",
+        );
+        assert!(msg.contains("units[5].radius_tiles_x100"), "{msg}");
+        let msg = load_error_after_edit("u-hp", "rules/units.ron", "hp: 46,", "hp: 0,");
+        assert!(msg.contains("units[4].hp"), "{msg}");
+        let msg = load_error_after_edit(
+            "b-prefer",
+            "rules/buildings.ron",
+            "cooldown_ds: 15)),",
+            "cooldown_ds: 15, prefer: Buildings)),",
+        );
+        assert!(msg.contains("buildings[0].attack.prefer"), "{msg}");
     }
 }

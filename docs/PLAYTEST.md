@@ -24,7 +24,7 @@ Run `cargo run -p game --features dev -- --scenario units200` from `main` (200 Y
 | Right-click on ground | Issues Move; a short-lived marker ring appears at the click point; units arrive | `units200_auto` (scripted Move, frame stats) | | | | | |
 | Shift+right-click | Queues a Move after the current one | owner | | | | | |
 | S | Stop for the selection | `scripted_moves` (Stop during tick 400) | | | | | |
-| A, then left click on ground | Attack-move placeholder: the units move exactly as with Move (the sim treats `AttackMove` like `Move` until M4a); Esc or a right click before the click cancels the mode | `scripted_moves` (AttackMove during tick 450) | | | | | |
+| A, then left click on ground | Attack-move: Yeomen move exactly as with Move (they have no attack; through M3b the sim treated every `AttackMove` like `Move`), and from M4a armed units fight the enemies they meet on the way and then walk on; Esc or a right click before the click cancels the mode | `scripted_moves` (AttackMove during tick 450) | | | | | |
 | Esc | Clears the selection and leaves attack-move mode (the pause menu arrives in M6) | owner | | | | | |
 | Right-click with the pointer over the bottom bar | No Move is issued, no marker appears | `hud_click` | | | | | |
 | Click the Stop button | The selection is unchanged; the units stop | `hud_click` | | | | | |
