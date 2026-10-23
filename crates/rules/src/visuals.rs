@@ -229,6 +229,8 @@ mod tests {
             requires_tech: None,
             builder: true,
             vision_tiles: 8,
+            immune_to_attrition: false,
+            supplies: false,
         }]
     }
 

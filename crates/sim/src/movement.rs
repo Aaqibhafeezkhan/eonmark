@@ -637,6 +637,7 @@ mod tests {
             ready_at: 0,
             target: None,
             intent: crate::state::Intent::Plain,
+            exposed_ticks: 0,
         }
     }
 

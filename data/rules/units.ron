@@ -15,6 +15,10 @@
 // unlocks the kind (ages.ron), None when absent. The sim reads them from
 // the M4a tech and combat slices. The counter table at the end scales hits
 // by attacker and defender in permille; a pair not listed is 1000.
+// Attrition (M5a): immune_to_attrition (false when absent) spares the kind
+// from attrition (the Scribe and the Supply Wain); supplies (false when
+// absent) makes the kind cover its owner's units within
+// supply_radius_tiles of rules.ron (the Supply Wain).
 (
   units: [
     (
@@ -54,6 +58,7 @@
       train_time_ds: 150,
       trainer: "scriptorium",
       vision_tiles: 8,
+      immune_to_attrition: true,
     ),
     (
       id: "skirmisher",
@@ -173,6 +178,8 @@
       train_time_ds: 300,
       trainer: "engine_yard",
       vision_tiles: 8,
+      immune_to_attrition: true,
+      supplies: true,
     ),
   ],
   // Counter table (permille). Skirmishers beat Bowmen, Bowmen beat

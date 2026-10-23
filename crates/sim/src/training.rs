@@ -16,6 +16,7 @@
 //! Scribe at a Scriptorium); otherwise it starts idle, and a worker kind
 //! then seeks work like any idle worker while any other kind stands.
 
+use crate::annexation;
 use crate::construction::{building_rect, centre_tile, order_move, ring};
 use crate::economy::{self, building_kind, first_short};
 use crate::fx::FxVec2;
@@ -94,7 +95,8 @@ pub(crate) fn unit_cost_for(
 
 /// Validate `Train { building, kind }` for `p` without changing anything.
 /// Checks, first failure wins: the building is `p`'s (`UnknownBuilding`)
-/// and complete (`UnderConstruction`); the unit kind exists
+/// and complete (`UnderConstruction`) and not a Town whose annexation
+/// timer runs (`TownContested`, M5a); the unit kind exists
 /// (`UnknownUnitKind`) and is trained by this building's kind
 /// (`CannotTrainHere`); `p` has reached the age that unlocks it
 /// (`AgeRequired`) and researched its `requires_tech`, if any
@@ -116,6 +118,9 @@ pub(crate) fn validate_train(
         .ok_or(RejectReason::UnknownBuilding)?;
     if b.construction != Construction::Complete {
         return Err(RejectReason::UnderConstruction);
+    }
+    if annexation::is_contested(b) {
+        return Err(RejectReason::TownContested);
     }
     let def = rules
         .unit_kind(kind.0)
@@ -189,17 +194,52 @@ pub(crate) fn cancel_slot(
     events.push(SimEvent::TrainingCancelled { building, slot });
 }
 
+/// Refund and clear every entry of `building`'s queue, head first, to its
+/// owner, each clamped to the stockpile caps like `Cancel`
+/// ([`cancel_slot`]'s refund), with a `TrainingCancelled` per entry naming
+/// its slot. The head's progress is lost. An annexed building's queue goes
+/// this way before the building changes hands (M5a).
+pub(crate) fn refund_queue(
+    state: &mut State,
+    rules: &Rules,
+    building: BuildingId,
+    events: &mut Vec<SimEvent>,
+) {
+    let b = state
+        .buildings
+        .get_mut(&building)
+        .expect("refund_queue on an existing building");
+    let owner = b.owner;
+    let queue = std::mem::take(&mut b.queue);
+    for (slot, entry) in queue.into_iter().enumerate() {
+        economy::refund(
+            rules,
+            &mut state.economy.player_mut(owner).stock,
+            &entry.paid,
+        );
+        events.push(SimEvent::TrainingCancelled {
+            building,
+            slot: u8::try_from(slot).expect("train_queue_max fits u8"),
+        });
+    }
+}
+
 /// Step 6b: every complete building's queue head gains one tick, in id
 /// order; a unit head that reaches its kind's training time becomes a
 /// unit, and a research head that reaches the time fixed when it was
 /// queued completes its tech (`tech::complete`). The entry behind it
 /// becomes the head and gains its first tick in the next step, so a busy
-/// building turns out one unit every `train_time` steps.
+/// building turns out one unit every `train_time` steps. A Town whose
+/// annexation timer runs is paused: its head gains nothing (M5a).
 pub(crate) fn step(state: &mut State, rules: &Rules, tick: u32, events: &mut Vec<SimEvent>) {
     let ids: Vec<BuildingId> = state
         .buildings
         .values()
-        .filter(|b| b.construction == Construction::Complete && !b.queue.is_empty())
+        .filter(|b| {
+            b.construction == Construction::Complete
+                && !b.queue.is_empty()
+                && !annexation::is_contested(b)
+        })
         .map(|b| b.id)
         .collect();
     for id in ids {

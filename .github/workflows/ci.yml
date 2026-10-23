@@ -95,11 +95,13 @@ jobs:
           cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay | tail -n 1 | tee hash-macos.txt
           grep -q '^tick=1200 hash=0x[0-9a-f]\{16\}$' hash-macos.txt
 
-      - name: verify golden fixtures move_500, combat_skirmish and enemy_outpost_walkthrough (release)
+      - name: verify golden fixtures move_500, combat_skirmish, enemy_outpost_walkthrough, capture_seat and stalemate_45min (release)
         # The same commands run in the headless job on Linux; hash-parity
         # diffs each pair of `OK final_hash=...` lines (combat_skirmish puts
         # acquisition, shooters, hits and destruction under the parity
-        # check). enemy_outpost_walkthrough (M4b: a 200 vs 200 prologue, then
+        # check; capture_seat (M5a) attrition, annexation and the outcome;
+        # stalemate_45min (M5a) 54000 ticks of income and the territory
+        # cap). enemy_outpost_walkthrough (M4b: a 200 vs 200 prologue, then
         # the line-1 build-up and siege) is verified on both OSes against
         # the hashes recorded in it. `verify` exits 1 on any other outcome
         # and pipefail propagates it through grep and tee.
@@ -109,6 +111,10 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-macos-combat.txt
           test -s hash-macos-combat.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/capture_seat.eonreplay | grep '^OK' | tee hash-macos-capture-seat.txt
+          test -s hash-macos-capture-seat.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/stalemate_45min.eonreplay | grep '^OK' | tee hash-macos-stalemate.txt
+          test -s hash-macos-stalemate.txt
 
       - uses: actions/upload-artifact@v7
         with:
@@ -117,6 +123,8 @@ jobs:
             hash-macos.txt
             hash-macos-fixture.txt
             hash-macos-combat.txt
+            hash-macos-capture-seat.txt
+            hash-macos-stalemate.txt
           if-no-files-found: error
 
   headless:
@@ -159,10 +167,12 @@ jobs:
 
       - name: verify golden fixtures (release)
         # Long goldens are verified here in release rather than by
-        # `cargo test -- --ignored`. move_500 and combat_skirmish are the
-        # hash-parity fixtures: only their `OK final_hash=...` lines are
-        # kept so the diffs are clean; `verify` exits 1 on any other outcome
-        # and pipefail propagates it.
+        # `cargo test -- --ignored` (move_500, enemy_outpost_walkthrough and
+        # M5a's 54000-tick stalemate_45min). move_500, combat_skirmish,
+        # capture_seat and stalemate_45min are the hash-parity fixtures:
+        # only their `OK final_hash=...` lines are kept so the diffs are
+        # clean; `verify` exits 1 on any other outcome and pipefail
+        # propagates it.
         # M5b: `cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --jobs 2`
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-linux-fixture.txt
@@ -174,6 +184,10 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-linux-combat.txt
           test -s hash-linux-combat.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay | tee verify-enemy-outpost-walkthrough.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/capture_seat.eonreplay | grep '^OK' | tee hash-linux-capture-seat.txt
+          test -s hash-linux-capture-seat.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/stalemate_45min.eonreplay | grep '^OK' | tee hash-linux-stalemate.txt
+          test -s hash-linux-stalemate.txt
 
       - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
         run: |
@@ -220,6 +234,8 @@ jobs:
             hash-linux.txt
             hash-linux-fixture.txt
             hash-linux-combat.txt
+            hash-linux-capture-seat.txt
+            hash-linux-stalemate.txt
           if-no-files-found: error
 
   game-linux:
@@ -324,3 +340,23 @@ jobs:
           test -s hashes/macos/hash-macos-combat.txt
           test -s hashes/linux/hash-linux-combat.txt
           diff hashes/macos/hash-macos-combat.txt hashes/linux/hash-linux-combat.txt
+
+      - name: compare golden fixture capture_seat
+        # The M5a capture golden (attrition, annexation, the Seat flip and
+        # the outcome), verified the same way on each OS.
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos-capture-seat.txt
+          echo "Linux:"; cat hashes/linux/hash-linux-capture-seat.txt
+          test -s hashes/macos/hash-macos-capture-seat.txt
+          test -s hashes/linux/hash-linux-capture-seat.txt
+          diff hashes/macos/hash-macos-capture-seat.txt hashes/linux/hash-linux-capture-seat.txt
+
+      - name: compare golden fixture stalemate_45min
+        # The M5a 45-minute golden (54000 ticks to the territory cap),
+        # verified the same way on each OS.
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos-stalemate.txt
+          echo "Linux:"; cat hashes/linux/hash-linux-stalemate.txt
+          test -s hashes/macos/hash-macos-stalemate.txt
+          test -s hashes/linux/hash-linux-stalemate.txt
+          diff hashes/macos/hash-macos-stalemate.txt hashes/linux/hash-linux-stalemate.txt

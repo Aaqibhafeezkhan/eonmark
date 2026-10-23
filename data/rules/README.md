@@ -46,7 +46,7 @@ when you can; the validator does not require it.
 
 | Field | Meaning | Value | Used from |
 |-------|---------|-------|-----------|
-| `rules_version` | Bump whenever golden replays are regenerated; the comment above it gives the reason for the current number | 16 | M0 |
+| `rules_version` | Bump whenever golden replays are regenerated; the comment above it gives the reason for the current number | 20 | M0 |
 | `tick_rate_hz` | Simulation ticks per second | 20 | M0 |
 | `cmd_delay_ticks` | A command issued at tick N applies at N + this | 2 | M0 |
 | `default_map` | Map for `MatchSetup::skirmish`; must exist under `data/maps/` | `"plains_1v1"` | M0 |
@@ -67,9 +67,21 @@ when you can; the validator does not require it.
 | `damage_variance_permille` | Every hit is scaled by a seeded draw in `1000 - v ..= 1000 + v` permille; 0 makes combat exactly reproducible from stats and draws nothing | 0 | M4a |
 | `acquire_range_tiles` | Units acquire enemies within this many tiles, or within their weapon range when that is longer | 6 | M4a |
 | `chase_regoal_tiles` | An explicit chase re-goals its path once the target's tile is more than this many tiles (Chebyshev) from the path's goal | 2 | M4a |
-| `supply_radius_tiles` | A Supply Wain cancels attrition within this radius | 14 | M5a |
-| `attrition_interval_ds` | Deciseconds between 1 HP attrition pulses at Harrying I (32 = 3.2 s = 64 ticks) | 32 | M5a |
+| `supply_radius_tiles` | A Supply Wain (a kind with `supplies` in `units.ron`) cancels attrition for its owner's units within this radius; `1..=64` | 14 | M5a |
+| `attrition_interval_ds` | Deciseconds between attrition pulses at Harrying I (32 = 3.2 s = 64 ticks); each Harrying level above 1 halves it | 32 | M5a |
 | `annexation_ds` | Uncontested time before a Town at 0 HP flips | 600 | M5a |
+| `attrition_age_gap_hp` | HP one pulse takes by age gap, `max(0, territory owner's age - intruder's age)`; the last entry covers every larger gap. Non-empty, each entry in `1..=1000`, never decreasing | `[1, 2]` | M5a |
+| `harrying_bonus_age` | `Some("<ages.ron id>")`: from this age of the territory owner on, each pulse takes `harrying_bonus_hp` more (the late-game pressure knob); `None` for no bonus | `Some("charter")` | M5a |
+| `harrying_bonus_hp` | Extra HP per pulse from `harrying_bonus_age` on; `0..=1000`, 0 until the M6 fun gate | 0 | M5a |
+| `annexation_adjacent_tiles` | An attacker counts toward annexing a Town within this many tiles (Chebyshev, from its tile to the footprint); `1..=4` | 1 | M5a |
+| `annexation_defender_radius_tiles` | A defender within this many tiles of the Town's centre (centre to centre, inclusive) blocks or resets the annexation; `1..=16` | 6 | M5a |
+| `annexation_attackers` | Unit selectors (`Military`, `Class(..)`, `Kind("<unit id>")`, as in "Modifier rows") whose units annex an enemy Town; every `Kind` names a unit, the list reaches at least one kind and no `Civilian` kind | `[Class(Infantry), Class(Cavalry)]` | M5a |
+| `annexation_defenders` | Unit selectors whose units defend their own Town; every `Kind` names a unit and the list reaches at least one kind | `[Military]` | M5a |
+| `annexation_town_hp_permille` | A flipped Town's HP in permille of its kind's `hp`; `0..=1000` (250 is 500 of 2000) | 250 | M5a |
+| `match_cap_ds` | The match ends at this time with the territory tiebreak (27000 = 45 min = 54000 ticks); longer than `annexation_ds` | 27000 | M5a |
+| `yield_cap_decay_after_ds` | The late-game Yield Cap decay starts at this match time (18000 = minute 30 = tick 36000); 0 or more (0 starts it at tick 0), and its tick count must fit `u32` | 18000 | M5a |
+| `yield_cap_decay_every_ds` | The decay steps once per this long from then on (3000 = 5 min); at least one tick | 3000 | M5a |
+| `yield_cap_decay_step` | How much each decay step lowers the Yield Cap, at most `yield_cap_base`; 0 turns the knob off until an M6 fun-gate iteration | 0 | M5a |
 | `path_budget_expansions` | A* expansions shared per tick | 4000 | M1 |
 | `path_cache_entries` | Bounded path cache size | 1024 | M1 |
 | `repath_interval_ds` | Deciseconds between periodic repaths while a unit is moving (30 = 3 s = 60 ticks) | 30 | M1 |
@@ -104,39 +116,61 @@ removed at `rules_version` 6: vision is now `vision_tiles` on every kind in
 fails to load naming `vision`.
 
 Validation: every plain count, radius and timer in the table is > 0
-(`rules_version` and `yield_cap_base` included) and `tick_rate_hz` is at
-most 1000; `town_radius_grown_tiles >= town_radius_tiles`; `default_map`
-resolves to a file; `town_growth_age` is not `Some("")`. The ramp, queue,
+(`rules_version` and `yield_cap_base` included; `yield_cap_decay_after_ds`
+may be 0) and `tick_rate_hz` is at most 1000;
+`town_radius_grown_tiles >= town_radius_tiles`; `default_map` resolves to a
+file; `town_growth_age` is not `Some("")`. The ramp, queue,
 idle-seek and combat fields have ranges instead:
 `building_ramp_step_permille` and `military_ramp_step_permille` in
 `0..=10000`, `military_ramp_cap_permille` in `1000..=100000`,
 `train_queue_max` in `1..=255`, `idle_seek_delay_ds` and
 `idle_seek_retry_ds` in `1..=36000` (one hour),
 `damage_variance_permille` in `0..=500`, `acquire_range_tiles` and
-`chase_regoal_tiles` in `1..=16`.
+`chase_regoal_tiles` in `1..=16`. The M5a fields have the ranges in the
+table above; `attrition_age_gap_hp` errors name the entry
+(`attrition_age_gap_hp[1]`); `harrying_bonus_age` is not `Some("")`; every
+timer converts to a tick count that fits `u32` (an error, not a panic, at
+1000 Hz), `annexation_ds` and `yield_cap_decay_every_ds` to at least one
+tick, and `match_cap_ds` to more ticks than `annexation_ds`.
 
 Checks that need the other files run once every file under `rules/` is
 loaded, and name `rules.ron` and the field:
 
 - `town_growth_distinct_buildings` is at most the number of non-Town kinds
   in `buildings.ron` (7).
-- `town_growth_age` names an age in `ages.ron`.
+- `town_growth_age` names an age in `ages.ron`, and so does
+  `harrying_bonus_age`.
+- `annexation_attackers` and `annexation_defenders`: every `Kind` names a
+  unit kind in `units.ron` (`annexation_attackers[j]`), each list reaches
+  at least one kind, and no attacker selector reaches a `Civilian` kind.
 - The worst case of every player-wide stat fits: `yield_cap_base`,
   `pop_cap_base` and `town_limit_base` stay within `u32` with every row of
   that stat in `techs.ron` and the faction, and the larger Town radius
   stays within 64 tiles (`town_radius_grown_tiles` 24 plus the three
   Statecraft rows is 27). The worst case is
   `(|base| + max |Set| + sum |Add|)`, then each `Mul` above 1000 applied and
-  rounded up, so it bounds every research order.
+  rounded up, so it bounds every research order. The `HarryingLevel` rows
+  (base 0; the two Harrying techs reach 2) may reach at most 8, an error
+  naming `techs.ron`, and `attrition_interval_ds` in ticks, halved once per
+  level above 1, must stay at least one tick at the highest level reachable
+  (64 ticks allow level 7), an error naming `attrition_interval_ds`.
 - `standard_start.units`: every key is a unit id in `units.ron`, every
   count is in `1..=255`, and the units' total `pop` fits `pop_cap_base`.
 - `standard_start.stockpile`: lists every resource id in `resources.ron`,
   zeros included, and no other key; each value is at most the resource's
   `stockpile_cap` (999 for Lore) and at most 1000000.
 
-Fields the design names for later milestones (Harrying doubling, age-gap
-table, late-game pressure knobs, the 45-minute cap) are added when those
-milestones land, each with a validator rule.
+M5a's rules data (`rules_version` 18) added the fields the design named
+for it: the age-gap table, the late Harrying bonus, the annexation knobs,
+the 45-minute cap and the Yield Cap decay, each with its validator rules.
+The attrition slice (`rules_version` 19) reads the attrition fields: the
+age-gap table and the late Harrying bonus, besides `supply_radius_tiles`
+and `attrition_interval_ds`. The annexation slice (`rules_version` 20)
+reads the rest: `annexation_ds`, the annexation knobs and selectors,
+`annexation_town_hp_permille`, `match_cap_ds` and the Yield Cap decay
+(`docs/design/towns.md` and `docs/design/economy.md`, "M5a implementation
+notes"). `stays_on_annexation` in `buildings.ron` is read from the same
+slice.
 
 ## resources.ron
 
@@ -203,6 +237,8 @@ acquisition.
 | `requires_tech` | `Some("<techs.ron id>")`: training also needs that tech researched, on top of the age that unlocks the kind in `ages.ron`; `None` when absent, as for every kind in the starting data (M4a) |
 | `builder` | Whether the kind can construct buildings; `false` when absent |
 | `vision_tiles` | Vision radius in tiles (fog of war, M7) |
+| `immune_to_attrition` | Whether attrition never damages the kind (M5a); `false` when absent. `true` on the Scribe and the Supply Wain; Yeomen are exposed (ROADMAP M5a Notes, decision 11) |
+| `supplies` | Whether the kind covers its owner's units against attrition within `supply_radius_tiles` of `rules.ron` (M5a); `false` when absent. `true` on the Supply Wain only |
 
 Every kind uses `arrive_radius_tiles_x100: 25`,
 `arrive_slowdown_radius_tiles_x100: 50`, `waypoint_radius_tiles_x100: 50`,
@@ -318,6 +354,7 @@ at 0.
 | `max_per_town` | `Some(n)`: at most `n` of this kind per Town (each building counts for its nearest own Town), sites included. `None` when absent. The Croft limit lives here |
 | `border_radius_tiles` | `Some(r)`: the complete building is a border source of radius `r` (the Watchtower). `None` when absent. The Town's radius is `town_radius_tiles` in `rules.ron` instead |
 | `attack` | `Some((damage, range_tiles_x100, cooldown_ds))`: the complete building shoots enemy units, with the same block and ranges as `units.ron`; `prefer` must stay `Units` (or be omitted). `None` when absent (M4a) |
+| `stays_on_annexation` | `true`: buildings and sites of the kind stay with their owner when the Town they belong to is annexed, and are re-attributed to another of the owner's Towns (M5a; the Watchtower). Every other kind changes hands with the Town, and one with `border_radius_tiles` takes its border with it (its source moves to the new owner's layer). `false` when absent; never `true` on the Town kind |
 
 | Kind (`id`) | Footprint | Cost | `build_time_ds` | HP | Vision | Base yield per 30 s | Gather (resource, worker, rate, slots) | Other |
 |---|---|---|---|---|---|---|---|---|
@@ -327,7 +364,7 @@ at 0.
 | Ore Pit (`ore_pit`) | 2x2 | 50 Lumber | 200 | 400 | 6 | none | Ore, Yeoman, 10, `Adjacent(terrain: Mountain, max: 6)` | |
 | Scriptorium (`scriptorium`) | 3x3 | 80 Lumber | 300 | 600 | 8 | 10 Lore | Lore, Scribe, 5, `Fixed(3)` | trains the Scribe |
 | Muster Hall (`muster_hall`) | 3x3 | 100 Lumber | 400 | 800 | 8 | none | none | trains the Skirmisher, Shieldbearer, Bowman and Outrider |
-| Watchtower (`watchtower`) | 1x1 | 40 Ore | 300 | 500 | 12 | none | none | `border_radius_tiles: Some(2)`; `attack` 15 damage, range 700, cooldown 15 ds |
+| Watchtower (`watchtower`) | 1x1 | 40 Ore | 300 | 500 | 12 | none | none | `border_radius_tiles: Some(2)`; `attack` 15 damage, range 700, cooldown 15 ds; `stays_on_annexation: true`; researches Harrying I and II (`techs.ron`) |
 | Engine Yard (`engine_yard`) | 3x3 | 150 Lumber | 500 | 900 | 8 | none | none | trains the Mangonel and Supply Wain |
 
 With the 200 permille building ramp the second Town costs 120 Lumber
@@ -352,7 +389,9 @@ Validation (`Buildings::validate`, then the checks that span files):
   `Mountain`.
 - `max_per_town` in `1..=255` and `border_radius_tiles` in `1..=64`;
   neither is allowed on the Town kind, which the town limit and
-  `town_radius_tiles` in `rules.ron` cover instead.
+  `town_radius_tiles` in `rules.ron` cover instead. Nor is
+  `stays_on_annexation: true`: an annexed Town is the building that
+  changes hands.
 - A border source (the Town, or any kind with `border_radius_tiles`) has
   odd width and height, so its centre is a tile.
 - `attack`: `damage` in `1..=10000`, `range_tiles_x100` in `1..=1600`,
@@ -382,6 +421,7 @@ Mul, value: n)` with an integer `value` (`crates/rules/src/modifiers.rs`).
 | `ResearchCost` | every resource of a tech's `cost` |
 | `ResearchTime` | a tech's `research_time_ds`, before the tick conversion |
 | `UnitHp(sel)`, `UnitDamage(sel)` | a unit kind's `hp` or `attack.damage`, for the kinds `sel` reaches: `Military` (every class but `Civilian`), `Class(Infantry)` (one class) or `Kind("bowman")` (one kind) |
+| `HarryingLevel` | the attrition level a player's borders impose on intruders (M5a): base 0, each Harrying tech `Add 1`, at most 8 in the worst case |
 
 `Set` and `Add` values are amounts in the stat's own unit, within
 `±1000000`. `Mul` values are permille in `1..=100000` (`900` is x0.9). One
@@ -398,6 +438,8 @@ float such as `value: 1.25` fails to parse with the file and the span.
 
 A list of techs; the list index is the sim's `TechId`. M4a ships the 12
 Scriptorium techs, four lines of three levels, each line's levels in order.
+M5a appends the Watchtower's Harrying I and II (`TechId` 12 and 13), side
+techs that count toward no age gate.
 
 | Field | Meaning |
 |-------|---------|
@@ -409,6 +451,7 @@ Scriptorium techs, four lines of three levels, each line's levels in order.
 | `cost` | Cost per resource id before the `ResearchCost` rows; zero entries are omitted |
 | `research_time_ds` | Research time before the `ResearchTime` rows |
 | `modifiers` | The rows researching it adds |
+| `counts_toward_age` | Whether the tech counts toward an age's `techs_required` (M5a); `true` when absent, `false` for the Harrying side techs |
 
 | Line | Rows per level | Cost, levels 1 / 2 / 3 | `research_time_ds` |
 |---|---|---|---|
@@ -416,9 +459,12 @@ Scriptorium techs, four lines of three levels, each line's levels in order.
 | `statecraft` | `TownLimit Add 1`, `TownBorderRadius Add 1` | 80 Lore / 160 / 260 | 300 / 450 / 600 |
 | `trade` | `YieldCap Set 100` / `Set 150` / `Set 200` | 70 Lore / 150 / 250 | 300 / 450 / 600 |
 | `letters` | `ResearchCost Mul 900`, `ResearchTime Mul 900` | 60 Lore / 120 / 200 | 250 / 400 / 550 |
+| `harrying` (M5a, levels 1 and 2 only) | `HarryingLevel Add 1` | 75 Ore + 100 Lore / 150 Ore + 200 Lore | 400 / 600 |
 
-Every host is `scriptorium`. The file order is arms 1 to 3, statecraft,
-trade, letters, so `letters_3` is `TechId` 11. Arms I at Letters III costs
+Every host is `scriptorium` except the Harrying line's, `watchtower`, and
+only the Harrying techs set `counts_toward_age: false`. The file order is
+arms 1 to 3, statecraft, trade, letters, then harrying 1 and 2, so
+`letters_3` is `TechId` 11 and `harrying_2` is 13. Arms I at Letters III costs
 75 x 0.9 x 0.9 x 0.9, floored after each row: 67, 60, 54 Lore. The sim
 reads this file from the M4a tech slice.
 
@@ -443,17 +489,18 @@ starts in `ages[0]`.
 |-------|---------|
 | `id` | Lowercase identifier (`hearth`, `masonry`, `charter`); `town_growth_age` in `rules.ron` names one |
 | `name` | Display name |
-| `techs_required` | Researched techs needed to advance into the age (queued ones do not count) |
+| `techs_required` | Researched techs needed to advance into the age (queued ones do not count, nor, from M5a, the side techs with `counts_toward_age: false`) |
 | `cost` | Cost of advancing into the age per resource id; empty when absent |
 | `unlocks` | `(units: [...], buildings: [...], techs: [...])`: the ids that become available in the age; each list is empty when absent |
 
 | Age (`id`) | `techs_required` | Cost | Unlocks |
 |---|---|---|---|
 | Hearth Age (`hearth`) | 0 | none | units `yeoman`, `scribe`, `skirmisher`, `shieldbearer`, `bowman`; buildings `town`, `croft`, `lumber_yard`, `ore_pit`, `scriptorium`, `muster_hall`, `watchtower`; techs `arms_1`, `statecraft_1`, `trade_1`, `letters_1` |
-| Masonry Age (`masonry`) | 2 | 250 Grain, 100 Lore | units `outrider`, `mangonel`, `supply_wain`; building `engine_yard`; techs `arms_2`, `statecraft_2`, `trade_2`, `letters_2` |
-| Charter Age (`charter`) | 5 | 500 Grain, 300 Lumber, 300 Lore | techs `arms_3`, `statecraft_3`, `trade_3`, `letters_3` |
+| Masonry Age (`masonry`) | 2 | 250 Grain, 100 Lore | units `outrider`, `mangonel`, `supply_wain`; building `engine_yard`; techs `arms_2`, `statecraft_2`, `trade_2`, `letters_2`, `harrying_1` |
+| Charter Age (`charter`) | 5 | 500 Grain, 300 Lumber, 300 Lore | techs `arms_3`, `statecraft_3`, `trade_3`, `letters_3`, `harrying_2` |
 
-Level k of every line is unlocked in age k. The cheapest route to Masonry
+Level k of every Scriptorium line is unlocked in age k; the Watchtower's
+Harrying line starts in the Masonry Age (M5a). The cheapest route to Masonry
 is Letters I (60 Lore), then Trade I at the Letters price (63), plus the
 age's 100 Lore: 223 Lore in all (230 if Trade I is queued before Letters I
 completes). The sim
@@ -471,7 +518,7 @@ and that entry; every unit kind, building kind and tech is unlocked by
 exactly one age; nothing is unlocked before what it needs (a tech after
 its host and the level below it, a unit after its trainer and its
 `requires_tech`); and an age's `techs_required` can be met with the techs
-the ages before it unlock.
+the ages before it unlock, counting only those that count toward an age.
 
 ## factions.ron
 
@@ -500,7 +547,7 @@ fails. The data-only path is the same for every RON file and touches no
 Rust:
 
 1. Edit the value, as above.
-2. Bump `rules_version` in `rules.ron` (17 to 18), update the one-line
+2. Bump `rules_version` in `rules.ron` (20 to 21), update the one-line
    reason in the comment above it and put the same reason in the commit
    message.
 3. Check the data, re-record the golden fixtures and run the sim tests:
@@ -512,8 +559,8 @@ cargo test -p sim
 ```
 
 `data-check` prints
-`OK rules_version=18 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 factions=1 maps=plains_1v1 strings=en`
-(the repository is at 17, so before the edit it prints `rules_version=17`;
+`OK rules_version=21 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 maps=plains_1v1 strings=en`
+(the repository is at 20, so before the edit it prints `rules_version=20`;
 the hash is new because a file changed).
 `just rerecord` runs `scripts/rerecord_fixtures.sh`: it re-records every
 fixture under `crates/sim/tests/fixtures/` in release, writes each `.hash`
@@ -521,15 +568,27 @@ from an independent `sim-cli verify` OK line, then fails if a fixture
 differs from the merge base with main while the working-tree
 `rules_version` is not larger than the base's (CI runs the same check,
 `scripts/check_fixture_policy.sh`, on the commits of every pull request).
-While the sim does not read the edited value yet (attrition arrives
-in M5a) every `.hash` stays the same and only the replay headers change;
-once it does, the `.hash` files change too, and the bump in the same commit
-is what makes that legal. `just rerecord move_500 group_spiral` re-records
+The sim reads `attrition_interval_ds` since M5a's attrition slice, and
+one golden fixture researches Harrying: in `capture_seat` P1 has Harrying
+I and P0's Bowman bleeds on its land until the annexation timer turns it
+neutral, so its pulses land every 80 ticks instead of 64 and
+`capture_seat.hash` changes. Every other fixture has no Harrying, so
+attrition never bites in them: their `.hash` files stay the same and only
+the replay headers change. `cargo test -p sim` passes too, because the
+attrition tests read the interval from `Rules` (64 ticks at 32 ds, 80 at
+40) instead of hard-coding it, and the annexation and outcome tests read
+`annexation_ds`, the defender radius, the flipped Town's hit points and
+the match cap the same way. `cargo test -p rules` passes but for one
+test, `loads_repo_data`, which pins the shipped values on purpose
+(`attrition_interval_ticks() == 64` among them): it is the one test a
+data edit must update, in the same commit, to the new value (80). A
+change that a fixture does exercise, such as a unit's speed, changes its
+`.hash` too, and the bump in the same commit is what makes that legal. `just rerecord move_500 group_spiral` re-records
 only the fixtures named.
 
 A typo such as `attrition_interval_s` fails `data-check` with the file
 path, the span and the field:
 
 ```text
-error: data/rules/rules.ron: 58:3-58:23: Unexpected field named `attrition_interval_s` in `Rules`, expected one of `rules_version`, ... instead
+error: data/rules/rules.ron: 63:3-63:23: Unexpected field named `attrition_interval_s` in `Rules`, expected one of `rules_version`, ... instead
 ```

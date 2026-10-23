@@ -17,6 +17,16 @@
 //! wait, so Cmd-Q (through `macos_menu`), the close button and
 //! `--exit-after-seconds` all leave a replay with the clean-exit trailer.
 //!
+//! At the outcome (M5a): in the step that decides the match (the sim's
+//! `MatchDecided` event) `step_sim` finishes the recorder at once
+//! ([`finish_recorder`]), so the replay ends at the deciding tick with its
+//! trailer and a later `kill -9` still leaves a verified file; it prints
+//! the [`outcome_line`] and inserts [`MatchOver`], which the overlay
+//! (`outcome.rs`) shows and which turns world input off. From then on
+//! [`drive_tick`] returns [`TickOutcome::Decided`] for a live source (local
+//! or scenario input) without stepping: the live game freezes at the
+//! outcome. A replay never freezes; it plays to its recorded end.
+//!
 //! The headless replay runner (`headless.rs`) reuses [`drive_tick`],
 //! [`ReplayInput`] and [`ReplayFinished`] without the fixed clock or the
 //! recorder; `frame_stats.rs` reads [`DriverStats::flushes_sent`] to
@@ -38,8 +48,8 @@ use sim::replay::{
 };
 use sim::scenarios::{self, Stream};
 use sim::{
-    AiController, Command, MatchSetup, PlayerCommand, PlayerId, Sim, SimView, SubHashes,
-    sort_commands,
+    AiController, Command, MatchResult, MatchSetup, Outcome, OutcomeReason, PlayerCommand,
+    PlayerId, Sim, SimView, SubHashes, sort_commands,
 };
 
 /// Hard cap on simulation ticks stepped in one rendered frame.
@@ -112,6 +122,17 @@ impl SimHandle {
     /// Completed ticks.
     pub fn tick(&self) -> u32 {
         self.sim.tick()
+    }
+
+    /// How the match ended, once the sim decided it (M5a); `None` while it
+    /// runs.
+    pub fn outcome(&self) -> Option<Outcome> {
+        self.sim.outcome()
+    }
+
+    /// The match result (outcome, reason and deciding tick), once decided.
+    pub fn result(&self) -> Option<MatchResult> {
+        self.sim.result()
     }
 
     /// Hash of the current simulation state.
@@ -547,6 +568,54 @@ impl ReplayFinished {
     }
 }
 
+/// The match is decided (M5a): inserted once by `step_sim` in the step
+/// that decides it, after the recorder was finished at that tick. The
+/// overlay (`outcome.rs`) shows it, world input stops
+/// (`run_if(not(resource_exists::<MatchOver>))`), and a live source steps
+/// no further ([`TickOutcome::Decided`]).
+#[derive(Resource, Debug, Clone, PartialEq, Eq)]
+pub struct MatchOver {
+    /// The sim's result: who won or a draw, why, and the deciding tick.
+    pub result: MatchResult,
+    /// `Sim::hash()` after the deciding step: the recorded replay's final
+    /// hash, which `sim-cli verify` prints for it.
+    pub hash: u64,
+    /// The finished replay, or `None` when this session was not recording.
+    pub replay: Option<PathBuf>,
+}
+
+/// The snake-case name of an outcome reason, as the `outcome:` line and
+/// `sim-cli record`'s summary write it.
+pub fn reason_name(reason: OutcomeReason) -> &'static str {
+    match reason {
+        OutcomeReason::SeatCaptured => "seat_captured",
+        OutcomeReason::AllTownsLost => "all_towns_lost",
+        OutcomeReason::Surrender => "surrender",
+        OutcomeReason::Territory => "territory",
+    }
+}
+
+/// The line the game prints on stdout in the step that decides the match:
+/// `outcome: victory player=0 decisive=true reason=seat_captured tick=1628
+/// hash=0x2c9a9ef52a5184d0`, or `outcome: draw reason=territory tick=54000
+/// hash=0x...`. `tick` is the deciding tick (`MatchResult::tick`, the
+/// recorded replay's last tick) and `hash` the state hash there, so the
+/// line can be compared with `sim-cli verify`'s `OK final_hash=<hash>
+/// ticks=<tick>` for the replay (`scripts/m5a_checks.sh` does).
+pub fn outcome_line(result: &MatchResult, hash: u64) -> String {
+    let who = match result.outcome {
+        Outcome::Victory { player, decisive } => {
+            format!("victory player={} decisive={decisive}", player.0)
+        }
+        Outcome::Draw => "draw".to_owned(),
+    };
+    format!(
+        "outcome: {who} reason={} tick={} hash={hash:#018x}",
+        reason_name(result.reason),
+        result.tick
+    )
+}
+
 /// Message to the recorder thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecorderMessage {
@@ -923,11 +992,22 @@ pub enum TickOutcome {
     Stalled,
     /// The source is finite and the sim is at its end.
     Finished(ReplayFinished),
+    /// The source is live (no [`InputSource::end_of_input`]) and the match
+    /// is decided: nothing was stepped and nothing ever will be (M5a). A
+    /// replay never returns this.
+    Decided {
+        /// The tick the sim stopped at (`sim.tick()`, the deciding tick).
+        tick: u32,
+    },
 }
 
 /// Ask `input` for the current tick's commands, step, record. Shared by the
 /// fixed-step system and the headless replay runner (agent A), so both
-/// record and finish identically.
+/// record and finish identically. A finite source (a replay) at its end is
+/// [`TickOutcome::Finished`]; a live source once the sim has an outcome is
+/// [`TickOutcome::Decided`] (the live game freezes at the outcome, M5a),
+/// in both cases without asking the source or stepping. A replay plays on
+/// past an outcome to its recorded end.
 pub fn drive_tick(
     sim: &mut SimHandle,
     input: &mut dyn InputSource,
@@ -945,6 +1025,9 @@ pub fn drive_tick(
             recorded_hash: end.final_hash,
             sim_hash: sim.hash(),
         });
+    }
+    if input.end_of_input().is_none() && sim.outcome().is_some() {
+        return TickOutcome::Decided { tick };
     }
     let Some(cmds) = input.commands_for(tick, pending) else {
         stats.stalled_ticks += 1;
@@ -975,7 +1058,7 @@ fn step_sim(
     mut sim: NonSendMut<SimHandle>,
     mut input: ResMut<ActiveInput>,
     mut pending: ResMut<PendingCommands>,
-    recorder: Res<ReplayRecorder>,
+    mut recorder: ResMut<ReplayRecorder>,
     cadence: Res<HashCadence>,
     mut stats: ResMut<DriverStats>,
     mut budget: ResMut<FrameBudget>,
@@ -983,6 +1066,7 @@ fn step_sim(
     mut finished: MessageWriter<ReplayFinished>,
     mut events: MessageWriter<SimEventMsg>,
     mut stepped: ResMut<SimStepped>,
+    mut commands: Commands,
 ) {
     stepped.0 = false;
     if budget.used >= MAX_TICKS_PER_FRAME {
@@ -995,28 +1079,47 @@ fn step_sim(
         return;
     }
     budget.used += 1;
-    match drive_tick(
+    let outcome = drive_tick(
         &mut sim,
         input.0.as_mut(),
         &mut pending,
         recorder.0.as_ref(),
         *cadence,
         &mut stats,
-    ) {
+    );
+    match outcome {
         TickOutcome::Stepped { tick } => {
             stepped.0 = true;
             // Events are not hashed state: drain them every tick so the
             // buffer never grows, count them, and forward them as
             // `SimEventMsg` for the HUD.
+            let mut decided = None;
             for event in sim.drain_events() {
                 stats.events_seen += 1;
-                if matches!(event, sim::SimEvent::CommandRejected { .. }) {
-                    stats.commands_rejected += 1;
+                match &event {
+                    sim::SimEvent::CommandRejected { .. } => stats.commands_rejected += 1,
+                    // Emitted once per match, in the deciding step.
+                    sim::SimEvent::MatchDecided { result } => decided = Some(*result),
+                    _ => {}
                 }
                 events.write(SimEventMsg { tick, event });
             }
+            if let Some(result) = decided {
+                // The replay ends here, trailer included, before anything
+                // else can happen to the session (a kill after the overlay
+                // still leaves a verified file).
+                let hash = sim.hash();
+                let replay = finish_recorder(&sim, &mut recorder);
+                println!("{}", outcome_line(&result, hash));
+                info!("match decided: {result:?}");
+                commands.insert_resource(MatchOver {
+                    result,
+                    hash,
+                    replay,
+                });
+            }
         }
-        TickOutcome::Stalled => {}
+        TickOutcome::Stalled | TickOutcome::Decided { .. } => {}
         TickOutcome::Finished(end) => {
             if !budget.finished {
                 budget.finished = true;
@@ -1044,9 +1147,22 @@ pub fn finish_recorder_on_exit(
         return;
     }
     exits.clear();
-    let Some(mut rec) = recorder.0.take() else {
-        return;
-    };
+    // `None` when nothing records, or when the recorder was already
+    // finished at the match's outcome (M5a).
+    finish_recorder(&sim, &mut recorder);
+}
+
+/// Take the session's recorder, if it still has one, record a final hash
+/// checkpoint at `sim.tick()`, send `Finish` and join the writer (bounded
+/// wait). Returns the replay's path, or `None` when nothing was recording
+/// (headless runs, or already finished). Called on `AppExit` by
+/// [`finish_recorder_on_exit`] and in the step that decides the match by
+/// `step_sim` (M5a), so the replay ends at the deciding tick and the exit
+/// later finds nothing to do. When the deciding tick is also a cadence
+/// checkpoint the file gets the same hash record twice; the reader and
+/// `sim-cli verify` accept that.
+pub fn finish_recorder(sim: &SimHandle, recorder: &mut ReplayRecorder) -> Option<PathBuf> {
+    let mut rec = recorder.0.take()?;
     rec.send(RecorderMessage::Hash {
         tick: sim.tick(),
         hash: sim.hash(),
@@ -1061,6 +1177,7 @@ pub fn finish_recorder_on_exit(
         ),
         Err(why) => eprintln!("eonmark: {why}"),
     }
+    Some(rec.path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -1174,6 +1291,7 @@ mod tests {
             match drive_tick(&mut sim, &mut src, &mut pending, None, cadence, &mut stats) {
                 TickOutcome::Stepped { .. } => {}
                 TickOutcome::Stalled => panic!("a replay never stalls"),
+                TickOutcome::Decided { .. } => panic!("a replay never freezes"),
                 TickOutcome::Finished(f) => break f,
             }
         };
@@ -1267,6 +1385,7 @@ mod tests {
             ) {
                 TickOutcome::Stepped { .. } => {}
                 TickOutcome::Stalled => panic!("a replay never stalls"),
+                TickOutcome::Decided { .. } => panic!("a replay never freezes"),
                 TickOutcome::Finished(f) => break f,
             }
         };
@@ -1690,6 +1809,338 @@ mod tests {
         assert_eq!(stats.ticks_this_frame, 0);
         assert_eq!(stats.dropped_ticks, 0);
         assert!(!app.world().resource::<SimStepped>().0);
+    }
+
+    /// A P0 Yeoman spawned at tick 0 and sent across the map, and P1's
+    /// Surrender issued during `surrender_at`: the sim decides
+    /// `Victory { P0, decisive }` (Surrender) in the step that applies it,
+    /// with the Yeoman still walking.
+    fn surrender_stream(rules: &Rules, surrender_at: u32) -> Stream {
+        let yeoman = sim::UnitKindId(
+            u16::try_from(rules.units.iter().position(|u| u.id == "yeoman").unwrap()).unwrap(),
+        );
+        vec![
+            (
+                0,
+                vec![
+                    PlayerCommand::new(
+                        LOCAL_PLAYER,
+                        0,
+                        Command::DebugSpawn {
+                            owner: LOCAL_PLAYER,
+                            kind: yeoman,
+                            at: FxVec2::from_ints(20, 30),
+                            count: 1,
+                        },
+                    ),
+                    PlayerCommand::new(
+                        LOCAL_PLAYER,
+                        1,
+                        Command::Move {
+                            units: vec![UnitId(1)],
+                            target: FxVec2::from_ints(100, 30),
+                            queue: false,
+                        },
+                    ),
+                ],
+            ),
+            (
+                surrender_at,
+                vec![PlayerCommand::new(PlayerId(1), 0, Command::Surrender)],
+            ),
+        ]
+    }
+
+    #[test]
+    fn outcome_line_has_the_documented_format() {
+        let won = MatchResult {
+            outcome: Outcome::Victory {
+                player: PlayerId(0),
+                decisive: true,
+            },
+            reason: OutcomeReason::SeatCaptured,
+            tick: 1628,
+        };
+        assert_eq!(
+            outcome_line(&won, 0x2c9a_9ef5_2a51_84d0),
+            "outcome: victory player=0 decisive=true reason=seat_captured tick=1628 hash=0x2c9a9ef52a5184d0"
+        );
+        let tiebreak = MatchResult {
+            outcome: Outcome::Victory {
+                player: PlayerId(1),
+                decisive: false,
+            },
+            reason: OutcomeReason::Territory,
+            tick: 54000,
+        };
+        assert_eq!(
+            outcome_line(&tiebreak, 0x1f),
+            "outcome: victory player=1 decisive=false reason=territory tick=54000 hash=0x000000000000001f"
+        );
+        let draw = MatchResult {
+            outcome: Outcome::Draw,
+            reason: OutcomeReason::Surrender,
+            tick: 3,
+        };
+        assert_eq!(
+            outcome_line(&draw, 0xabc),
+            "outcome: draw reason=surrender tick=3 hash=0x0000000000000abc"
+        );
+        assert_eq!(reason_name(OutcomeReason::AllTownsLost), "all_towns_lost");
+    }
+
+    /// ROADMAP M5a acceptance 3 without a window: `capture_seat` driven as
+    /// the game drives it (the scenario's stream merged with local input,
+    /// recorded), until the step that decides it. The recorder is finished
+    /// there, the next `drive_tick` freezes without stepping, and the
+    /// recorded replay verifies to the hash the overlay shows, which is the
+    /// committed golden's.
+    #[test]
+    fn capture_seat_freezes_at_its_outcome_and_its_replay_verifies_to_the_overlay_hash() {
+        let rules = rules();
+        let (setup, stream, max_ticks) = scenarios::by_name("capture_seat", &rules).unwrap();
+        let mut sim = SimHandle::from_setup(setup.clone(), rules);
+        let path = temp("capture_seat_session.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let mut recorder = ReplayRecorder(Some(Recorder::spawn(&path, &setup).unwrap()));
+        let mut src = ScenarioInput::new(stream);
+        let mut pending = PendingCommands::default();
+        let mut stats = DriverStats::default();
+        let cadence = HashCadence::default();
+        let decided_at = loop {
+            match drive_tick(
+                &mut sim,
+                &mut src,
+                &mut pending,
+                recorder.0.as_ref(),
+                cadence,
+                &mut stats,
+            ) {
+                TickOutcome::Stepped { tick } => {
+                    if sim.outcome().is_some() {
+                        break tick;
+                    }
+                    assert!(tick < max_ticks, "no outcome by tick {max_ticks}");
+                }
+                other => panic!("tick {}: {other:?}", sim.tick()),
+            }
+        };
+        let result = sim.result().unwrap();
+        assert_eq!(result.tick, decided_at);
+        assert_eq!(
+            result.outcome,
+            Outcome::Victory {
+                player: LOCAL_PLAYER,
+                decisive: true
+            }
+        );
+        assert_eq!(result.reason, OutcomeReason::SeatCaptured);
+        let hash = sim.hash();
+        assert_eq!(finish_recorder(&sim, &mut recorder), Some(path.clone()));
+        assert!(recorder.0.is_none());
+        assert_eq!(finish_recorder(&sim, &mut recorder), None, "finished once");
+        // Frozen: nothing more is stepped, whatever the player queues.
+        pending.push_local(Command::Stop {
+            units: vec![UnitId(15)],
+        });
+        for _ in 0..5 {
+            assert_eq!(
+                drive_tick(&mut sim, &mut src, &mut pending, None, cadence, &mut stats),
+                TickOutcome::Decided { tick: decided_at }
+            );
+        }
+        assert_eq!(sim.tick(), decided_at);
+        assert_eq!(sim.hash(), hash);
+        // The replay ends at the deciding tick with its trailer and
+        // verifies to the overlay's hash, the golden's.
+        let file = ReplayReader::open(&path).unwrap();
+        assert!(!file.truncated, "the trailer was written at the outcome");
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let outcome = sim::replay::verify(&path, &data, Box::new(ai::Passive)).unwrap();
+        assert_eq!(
+            outcome,
+            sim::replay::VerifyOutcome::Ok {
+                final_hash: hash,
+                ticks: decided_at
+            }
+        );
+        let golden =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../sim/tests/fixtures/capture_seat.hash");
+        let golden = std::fs::read_to_string(golden).unwrap();
+        assert_eq!(format!("{hash:#018x}"), golden.trim());
+        eprintln!("{}", outcome_line(&result, hash));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The windowed driver at the outcome: `MatchOver` is inserted once, in
+    /// the deciding step, with the recorder already finished there (the
+    /// file verifies with no exit and no further write); every `Interp` is
+    /// settled at its final pose although a unit was walking; later frames
+    /// step nothing, local commands included, and the exit finds no
+    /// recorder left.
+    #[test]
+    fn match_over_is_inserted_once_finishes_the_recorder_and_settles_interp() {
+        use crate::present::{Interp, PresentPlugin, UnitEntities};
+        #[derive(Resource, Default)]
+        struct Inserted(u32);
+        let rules = rules();
+        let setup = MatchSetup::scenario(&rules, 4);
+        let path = temp("match_over.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .init_resource::<Inserted>()
+            .add_plugins((
+                SimPlugin::new(
+                    SimHandle::from_setup(setup.clone(), rules.clone()),
+                    Box::new(ScenarioInput::new(surrender_stream(&rules, 20))),
+                )
+                .recording(Some(path.clone())),
+                PresentPlugin,
+            ))
+            .add_systems(
+                Update,
+                (|mut n: ResMut<Inserted>| n.0 += 1).run_if(resource_added::<MatchOver>),
+            );
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        let interp = |app: &App| {
+            let e = app.world().resource::<UnitEntities>().0[&UnitId(1)];
+            *app.world().get::<Interp>(e).unwrap()
+        };
+        let mut walking_before = None;
+        for _ in 0..100 {
+            if app.world().contains_resource::<MatchOver>() {
+                break;
+            }
+            if app
+                .world()
+                .resource::<UnitEntities>()
+                .0
+                .contains_key(&UnitId(1))
+            {
+                walking_before = Some(interp(&app));
+            }
+            app.update();
+        }
+        let over = app.world().resource::<MatchOver>().clone();
+        let walking_before = walking_before.expect("the Yeoman was shown");
+        assert_ne!(walking_before.prev, walking_before.curr, "walking");
+        let decided = 20 + setup.cmd_delay + 1;
+        assert_eq!(over.result.tick, decided);
+        assert_eq!(
+            over.result.outcome,
+            Outcome::Victory {
+                player: LOCAL_PLAYER,
+                decisive: true
+            }
+        );
+        assert_eq!(over.result.reason, OutcomeReason::Surrender);
+        let sim_tick = app.world().non_send::<SimHandle>().tick();
+        assert_eq!(sim_tick, decided);
+        assert_eq!(over.hash, app.world().non_send::<SimHandle>().hash());
+        assert_eq!(over.replay.as_deref(), Some(path.as_path()));
+        assert!(app.world().resource::<ReplayRecorder>().0.is_none());
+        // Settled at the deciding tick's pose, which is ahead of the last
+        // one shown before it.
+        let settled = interp(&app);
+        assert_eq!(settled.prev, settled.curr);
+        assert_eq!(settled.prev_yaw, settled.curr_yaw);
+        assert_ne!(settled.curr, walking_before.curr);
+        // The replay is finished already: a kill now would leave this file.
+        let bytes = std::fs::read(&path).unwrap();
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        assert!(!ReplayReader::open(&path).unwrap().truncated);
+        assert_eq!(
+            sim::replay::verify(&path, &data, Box::new(ai::Passive)).unwrap(),
+            sim::replay::VerifyOutcome::Ok {
+                final_hash: over.hash,
+                ticks: decided
+            }
+        );
+        // Frozen: more frames, a local command, nothing steps or moves.
+        app.world_mut()
+            .resource_mut::<PendingCommands>()
+            .push_local(Command::Stop {
+                units: vec![UnitId(1)],
+            });
+        for _ in 0..10 {
+            app.update();
+        }
+        assert_eq!(app.world().non_send::<SimHandle>().tick(), decided);
+        assert_eq!(interp(&app), settled);
+        assert_eq!(app.world().resource::<Inserted>().0, 1, "inserted once");
+        assert_eq!(*app.world().resource::<MatchOver>(), over);
+        assert_eq!(app.world().resource::<DriverStats>().ticks_last_frame, 0);
+        // The exit finds no recorder: the file is left as it was.
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A replay plays on past its outcome to its recorded end: only a live
+    /// source freezes.
+    #[test]
+    fn replays_never_freeze_at_an_outcome() {
+        let rules = rules();
+        let setup = MatchSetup::scenario(&rules, 4);
+        let stream = surrender_stream(&rules, 2);
+        // Record 60 ticks of the stream with the sim itself.
+        let mut sim = SimHandle::from_setup(setup.clone(), rules.clone());
+        let mut records = Vec::new();
+        for tick in 0..60 {
+            let cmds = scenarios::commands_at(&stream, tick).to_vec();
+            if !cmds.is_empty() {
+                records.push(Record::Tick(TickBatch {
+                    tick,
+                    cmds: cmds.clone(),
+                }));
+            }
+            sim.step(&cmds);
+        }
+        let decided = sim.result().expect("decided early").tick;
+        assert!(decided < 10, "{decided}");
+        records.push(Record::Hash(HashRecord {
+            tick: 60,
+            hash: sim.hash(),
+            sub: sim.sub_hashes(),
+        }));
+        let file = ReplayFile {
+            setup: setup.clone(),
+            records,
+            truncated: false,
+            undecoded_bytes: 0,
+        };
+        let (setup, mut src) = ReplayInput::from_file(Path::new("surrender.eonreplay"), file);
+        let mut replayed = SimHandle::from_setup(setup, rules);
+        let mut pending = PendingCommands::default();
+        let mut stats = DriverStats::default();
+        let finished = loop {
+            match drive_tick(
+                &mut replayed,
+                &mut src,
+                &mut pending,
+                None,
+                HashCadence::default(),
+                &mut stats,
+            ) {
+                TickOutcome::Stepped { .. } => {}
+                TickOutcome::Stalled => panic!("a replay never stalls"),
+                TickOutcome::Decided { .. } => panic!("a replay never freezes"),
+                TickOutcome::Finished(f) => break f,
+            }
+        };
+        assert_eq!(finished.final_tick, 60);
+        assert!(finished.matches(), "{finished:?}");
+        assert_eq!(replayed.result().map(|r| r.tick), Some(decided));
     }
 
     #[test]

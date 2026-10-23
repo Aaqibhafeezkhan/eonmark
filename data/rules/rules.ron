@@ -3,8 +3,10 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  // 17: M4b unit looks; visuals.ron is in rules_hash; no sim change.
-  rules_version: 17,
+  // 20: M5a annexation and outcome (SIM 16): every fixture re-recorded for
+  // the new hashed TownState::hold and State::outcome; no RON content
+  // changed besides the version.
+  rules_version: 20,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",
@@ -54,9 +56,37 @@
   chase_regoal_tiles: 2,
 
   // Attrition, supply and annexation (M5a). 32 ds = 3.2 s; 600 ds = 60 s.
+  // An enemy unit on a player's land loses HP every attrition interval once
+  // that player has Harrying I (techs.ron); each Harrying level halves the
+  // interval. A Supply Wain (units.ron `supplies`) covers its owner's units
+  // within supply_radius_tiles (1..=64).
   supply_radius_tiles: 14,
   attrition_interval_ds: 32,
   annexation_ds: 600,
+  // HP per pulse by max(0, owner age - intruder age); the last entry covers
+  // larger gaps. Non-empty, from 1, never decreasing, each at most 1000.
+  attrition_age_gap_hp: [1, 2],
+  // Late-game pressure knob: harrying_bonus_hp extra HP per pulse once the
+  // territory owner reaches harrying_bonus_age (an ages.ron id, or None).
+  harrying_bonus_age: Some("charter"),
+  harrying_bonus_hp: 0, // set at M6
+  // A Town at 0 HP flips to the one enemy owner of attackers within
+  // annexation_adjacent_tiles (1..=4) of its footprint once no defender has
+  // been within annexation_defender_radius_tiles (1..=16, centre to centre)
+  // for annexation_ds. Selectors as in techs.ron: Military, Class(..) or
+  // Kind("<unit id>"); no Civilian kind may annex.
+  annexation_adjacent_tiles: 1,
+  annexation_defender_radius_tiles: 6,
+  annexation_attackers: [Class(Infantry), Class(Cavalry)],
+  annexation_defenders: [Military],
+  annexation_town_hp_permille: 250, // a flipped Town keeps 500 of 2000 HP
+  // The territory tiebreak ends the match: 27000 ds = 45 min = 54000 ticks.
+  match_cap_ds: 27000,
+  // Late-game Yield Cap decay: from minute 30 the cap falls by step every
+  // 5 min. Off (step 0) until an M6 fun-gate iteration turns it on.
+  yield_cap_decay_after_ds: 18000,
+  yield_cap_decay_every_ds: 3000,
+  yield_cap_decay_step: 0,
 
   // Pathfinding (M1). Expansions shared by all requests per tick; cache entries.
   path_budget_expansions: 4000,

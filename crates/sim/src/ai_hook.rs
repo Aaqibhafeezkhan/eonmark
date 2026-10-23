@@ -5,6 +5,8 @@
 //! state, draws no randomness of its own, and its commands go through the
 //! same delay queue as a human's.
 
+use crate::annexation::AnnexView;
+use crate::attrition::{self, Exposure, Pulses, SupplyGrid};
 use crate::combat::{self, UnitStats};
 use crate::command::Command;
 use crate::construction::{self, BuildPlan};
@@ -15,7 +17,9 @@ use crate::ids::{
 };
 use crate::map::Map;
 use crate::pathing::Pathing;
-use crate::state::{Building, MatchSetup, Player, RejectReason, State, Unit};
+use crate::state::{
+    Building, Hold, MatchResult, MatchSetup, Outcome, Player, RejectReason, State, Unit,
+};
 use crate::tech;
 use crate::territory::TerritoryField;
 use crate::town;
@@ -117,7 +121,8 @@ impl<'a> SimView<'a> {
     }
 
     /// Whether `Train { building, kind }` from `p` would be accepted now,
-    /// and what it would deduct.
+    /// and what it would deduct (`TownContested` at a Town whose
+    /// annexation timer runs, M5a).
     pub fn check_train(
         &self,
         p: PlayerId,
@@ -165,6 +170,18 @@ impl<'a> SimView<'a> {
     /// If the player does not exist.
     pub fn researched(&self, p: PlayerId) -> &'a BTreeSet<TechId> {
         &self.state.tech.player(p).researched
+    }
+
+    /// How many of `p`'s completed techs count toward the next age's
+    /// `techs_required` (M5a): `researched(p)` without the side techs whose
+    /// `counts_toward_age` is false (Harrying I and II), the number
+    /// `AdvanceAge` compares with the gate.
+    ///
+    /// # Panics
+    ///
+    /// If the player does not exist.
+    pub fn age_tech_count(&self, p: PlayerId) -> u32 {
+        tech::age_tech_count(self.state, self.rules, p)
     }
 
     /// What researching `tech` costs `p` now and how many ticks it takes
@@ -273,6 +290,85 @@ impl<'a> SimView<'a> {
             .expect("a building's kind is in the rules");
         let max = i32::try_from(def.hp).expect("data-check bounds building hp");
         Some((b.hp, max))
+    }
+
+    /// `p`'s Harrying level (M5a): the `HarryingLevel` rows from base 0,
+    /// one per Harrying tech researched, clamped to `0..=8`. Enemy units
+    /// on `p`'s land are exposed to attrition from level 1.
+    ///
+    /// # Panics
+    ///
+    /// If the player does not exist.
+    pub fn harrying_level(&self, p: PlayerId) -> u32 {
+        attrition::harrying_level(self.state, self.rules, p)
+    }
+
+    /// The radius within which a Supply Wain covers its owner's units, in
+    /// tiles (`supply_radius_tiles`, tile to tile, inclusive).
+    pub fn supply_radius_tiles(&self) -> u32 {
+        self.rules.supply_radius_tiles
+    }
+
+    /// The tiles `p`'s Supply Wains (the kinds that `supplies`) stand on,
+    /// in `UnitId` order: the centres of `p`'s supply discs.
+    pub fn supply_wains(&self, p: PlayerId) -> Vec<Tile> {
+        SupplyGrid::new(self.state, self.rules).wains(p).to_vec()
+    }
+
+    /// Whether one of `p`'s Supply Wains covers `tile` now, as step 5b'
+    /// decides it (`dx² + dy² <= supply_radius_tiles²`).
+    pub fn supplied(&self, p: PlayerId, tile: Tile) -> bool {
+        SupplyGrid::new(self.state, self.rules).covers(p, tile)
+    }
+
+    /// What a pulse on `owner`'s land does to `intruder`'s units now:
+    /// `(interval_ticks, hp)` from `owner`'s Harrying level and both ages
+    /// (the step's own function), or `None` while `owner` has no Harrying
+    /// level.
+    ///
+    /// # Panics
+    ///
+    /// If either player does not exist.
+    pub fn attrition_pulse(&self, owner: PlayerId, intruder: PlayerId) -> Option<(u32, i32)> {
+        attrition::pulse(self.state, self.rules, owner, intruder)
+    }
+
+    /// Whether unit `id` is exposed to attrition where it stands now, and
+    /// to whose borders, how often and how hard: what step 5b' would apply
+    /// if the unit did not move. `None` when it is not exposed (immune,
+    /// on neutral or own land, the owner has no Harrying level, or an own
+    /// Supply Wain covers it) or does not exist. Builds the step's tables
+    /// on every call, so it is meant for single units; the unit's
+    /// `exposed_ticks` says whether it is bleeding.
+    pub fn attrition(&self, id: UnitId) -> Option<Exposure> {
+        let u = self.state.units.get(&id)?;
+        Pulses::new(self.state, self.rules)?.exposure(&self.state.map, &self.state.territory, u)
+    }
+
+    /// Town `town`'s running annexation timer (M5a): who annexes it, how
+    /// many eligible steps have passed since the entry step and how many
+    /// flip it. `None` when the building is not a Town, does not exist, or
+    /// is held.
+    pub fn annexation(&self, town: BuildingId) -> Option<AnnexView> {
+        match self.state.buildings.get(&town)?.town_state?.hold {
+            Hold::Held => None,
+            Hold::Contested { attacker, ticks } => Some(AnnexView {
+                attacker,
+                ticks,
+                total: self.rules.annexation_ticks(),
+            }),
+        }
+    }
+
+    /// How the match ended, once step 6e decided it (M5a); `None` while it
+    /// runs.
+    pub fn outcome(&self) -> Option<Outcome> {
+        self.state.outcome.map(|r| r.outcome)
+    }
+
+    /// The match result (outcome, reason and deciding tick), once decided.
+    pub fn result(&self) -> Option<MatchResult> {
+        self.state.outcome
     }
 
     /// Whether `Attack { units, target }` from `p` would be accepted now,

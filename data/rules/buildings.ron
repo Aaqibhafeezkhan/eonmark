@@ -15,6 +15,10 @@
 // attack (M4a): Some((damage, range_tiles_x100, cooldown_ds)) makes the
 // complete building shoot enemy units (the Town and the Watchtower), None
 // when absent; the same block as in units.ron, prefer must stay Units.
+// stays_on_annexation (M5a, false when absent): buildings and sites of the
+// kind stay with their owner when the Town they belong to is annexed (the
+// Watchtower); every other kind changes hands with the Town. Never on the
+// Town kind.
 (
   buildings: [
     (
@@ -97,6 +101,7 @@
       vision_tiles: 12,
       border_radius_tiles: Some(2),
       attack: Some((damage: 15, range_tiles_x100: 700, cooldown_ds: 15)),
+      stays_on_annexation: true,
     ),
     (
       id: "engine_yard",

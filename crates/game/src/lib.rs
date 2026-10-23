@@ -31,6 +31,11 @@
 //!   (`--scenario units200_auto`, the `enemy_outpost` scenarios, `--max-fps`);
 //!   for the `enemy_outpost` scenarios also the 200 vs 200 fight window
 //!   (M4b).
+//! - [`markers`]: the attrition indicator under bleeding units, the supply
+//!   ring around a selected Supply Wain, the annexation timer around a
+//!   contested Town and the annexation readout (M5a).
+//! - [`outcome`]: the victory, defeat or draw overlay with the final hash
+//!   over the frozen world once the sim decides the match (M5a).
 //! - [`director`]: camera and selection beats for
 //!   `--scenario enemy_outpost_walkthrough` (M4b); never issues a command.
 //! - `macos_menu`: muda menu with the custom Cmd-Q item (macOS only).
@@ -56,8 +61,10 @@ pub mod health_bars;
 pub mod hud;
 #[cfg(target_os = "macos")]
 pub mod macos_menu;
+pub mod markers;
 pub mod monitor_loss;
 pub mod orders;
+pub mod outcome;
 pub mod palette;
 pub mod placement;
 pub mod present;

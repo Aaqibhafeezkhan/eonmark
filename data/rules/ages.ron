@@ -7,8 +7,10 @@
 // unlocks lists the units.ron, buildings.ron and techs.ron ids that become
 // available in the age: every id is listed by exactly one age, a unit no
 // earlier than its trainer and its requires_tech, a tech no earlier than
-// its host and the level before it in its line. Level k of every tech line
-// is unlocked in age k.
+// its host and the level before it in its line. Level k of every
+// Scriptorium line is unlocked in age k; the Watchtower's Harrying line
+// starts in the Masonry Age. Only techs that count toward an age
+// (techs.ron counts_toward_age, not Harrying) meet techs_required.
 (
   ages: [
     (
@@ -29,7 +31,7 @@
       unlocks: (
         units: ["outrider", "mangonel", "supply_wain"],
         buildings: ["engine_yard"],
-        techs: ["arms_2", "statecraft_2", "trade_2", "letters_2"],
+        techs: ["arms_2", "statecraft_2", "trade_2", "letters_2", "harrying_1"],
       ),
     ),
     (
@@ -38,7 +40,7 @@
       techs_required: 5,
       cost: {"grain": 500, "lumber": 300, "lore": 300},
       unlocks: (
-        techs: ["arms_3", "statecraft_3", "trade_3", "letters_3"],
+        techs: ["arms_3", "statecraft_3", "trade_3", "letters_3", "harrying_2"],
       ),
     ),
   ],

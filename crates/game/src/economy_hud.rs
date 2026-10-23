@@ -17,7 +17,9 @@
 //! [`MESSAGE_SECONDS`]: a building of theirs completed, and since M4b a
 //! tech of theirs researched, their next age reached, a building destroyed
 //! (another player's "destroyed", their own "lost") and their Town held at
-//! 0 hit points ([`notice_text`]). Rejections and events arrive as
+//! 0 hit points, and since M5a an annexation of one of their Towns or by
+//! them starting, stopping and ending ("Town annexed", "Town was lost")
+//! ([`notice_text`]). Rejections and events arrive as
 //! `SimEventMsg` from the sim driver, rejections `cmd_delay` ticks after
 //! the command.
 //! An `InvalidTarget` for a right-click `Attack` whose target died in those
@@ -26,11 +28,13 @@
 //! but the layout. [`HUD_KEYS`] lists every HUD string key the game reads
 //! with the placeholders it fills, and a test holds `en.ron` to it.
 
+use std::collections::BTreeMap;
+
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use rules::Rules;
 use rules::strings::{Strings, fill};
-use sim::{RejectReason, SimEvent};
+use sim::{BuildingId, PlayerId, RejectReason, SimEvent};
 
 use crate::hud::{BOTTOM_BAR_HEIGHT_PX, HUD_FONT_PX, HudRoot, PADDING_PX, TopBar, spawn_hud};
 use crate::orders::{IssuedAttacks, target_gone};
@@ -85,6 +89,24 @@ pub const HUD_KEYS: &[(&str, &[&str])] = &[
     ("notice.destroyed", &["building"]),
     ("notice.lost", &["building"]),
     ("notice.town_down", &["building"]),
+    // M5a: annexation notices, the annexation readout and the outcome
+    // overlay (`markers.rs`, `outcome.rs`).
+    ("notice.annexation_started", &["building"]),
+    ("notice.annexation_stopped", &[]),
+    ("notice.annexed", &[]),
+    ("notice.town_lost", &["building"]),
+    ("annex.attacking", &["building", "time"]),
+    ("annex.defending", &["building", "time"]),
+    ("outcome.victory", &[]),
+    ("outcome.defeat", &[]),
+    ("outcome.draw", &[]),
+    ("outcome.seat_captured", &[]),
+    ("outcome.all_towns_lost", &[]),
+    ("outcome.surrender", &[]),
+    ("outcome.territory", &["count", "cap"]),
+    ("outcome.time", &["time", "count"]),
+    ("outcome.hash", &["hash"]),
+    ("outcome.replay", &["name"]),
 ];
 
 /// How long the message line shows a message, in seconds.
@@ -126,6 +148,11 @@ pub struct MessageState {
     pub text: String,
     /// When it was set.
     pub since: f64,
+    /// The attacker of every annexation timer running as the message line
+    /// last heard (`AnnexationStarted` adds, `AnnexationReset` and
+    /// `TownAnnexed` remove): a reset carries only the Town, and its
+    /// "Annexation stopped" is for the attacker too (M5a).
+    pub annexing: BTreeMap<BuildingId, PlayerId>,
 }
 
 /// The snake-case key of `reason` in the `reject` table of the strings
@@ -168,6 +195,7 @@ pub fn reject_key(reason: &RejectReason) -> &'static str {
         RejectReason::FinalAge => "final_age",
         RejectReason::PlayerMismatch => "player_mismatch",
         RejectReason::InvalidTarget => "invalid_target",
+        RejectReason::TownContested => "town_contested",
     }
 }
 
@@ -366,11 +394,19 @@ pub fn update_resource_bar(
 /// "Town has fallen" when their Town reaches 0 hit points. Names come from
 /// the rules, by the event's ids (`BuildingDestroyed` carries the owner and
 /// kind of the building it removed) or the building in the view.
+///
+/// Annexation (M5a), for a Town the local player owns or annexes: "Town is
+/// being annexed" when a timer starts; "Annexation stopped" when it
+/// resets, for the Town's owner or for the attacker `annexing` names (the
+/// reset event carries only the Town); "Town annexed" for the player who
+/// took it and "Town was lost" for the one who lost it. A flip the local
+/// player only watches says nothing.
 pub fn notice_text(
     view: &sim::SimView<'_>,
     rules: &Rules,
     strings: &UiStrings,
     event: &SimEvent,
+    annexing: &BTreeMap<BuildingId, PlayerId>,
 ) -> Option<String> {
     let building_name = |kind: u16| {
         rules
@@ -420,6 +456,37 @@ pub fn notice_text(
                 &[("building", &name)],
             ))
         }
+        SimEvent::AnnexationStarted { town, attacker } => {
+            let b = view.building(*town)?;
+            (b.owner == LOCAL_PLAYER || *attacker == LOCAL_PLAYER).then(|| {
+                fill(
+                    strings.hud("notice.annexation_started"),
+                    &[("building", &building_name(b.kind.0))],
+                )
+            })
+        }
+        SimEvent::AnnexationReset { town } => {
+            let owned = view
+                .building(*town)
+                .is_some_and(|b| b.owner == LOCAL_PLAYER);
+            let attacking = annexing.get(town) == Some(&LOCAL_PLAYER);
+            (owned || attacking).then(|| strings.hud("notice.annexation_stopped").to_string())
+        }
+        SimEvent::TownAnnexed { town, from, to } => {
+            if *to == LOCAL_PLAYER {
+                Some(strings.hud("notice.annexed").to_string())
+            } else if *from == LOCAL_PLAYER {
+                let name = view
+                    .building(*town)
+                    .map_or("?".to_string(), |b| building_name(b.kind.0));
+                Some(fill(
+                    strings.hud("notice.town_lost"),
+                    &[("building", &name)],
+                ))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -458,7 +525,18 @@ pub fn collect_messages(
                 reject_text(&strings, rules, reason)
             }
             event => {
-                let Some(text) = notice_text(&sim.view(), rules, &strings, event) else {
+                let text = notice_text(&sim.view(), rules, &strings, event, &state.annexing);
+                // Who annexes what, for a later reset's notice.
+                match event {
+                    SimEvent::AnnexationStarted { town, attacker } => {
+                        state.annexing.insert(*town, *attacker);
+                    }
+                    SimEvent::AnnexationReset { town } | SimEvent::TownAnnexed { town, .. } => {
+                        state.annexing.remove(town);
+                    }
+                    _ => {}
+                }
+                let Some(text) = text else {
                     continue;
                 };
                 text
@@ -541,6 +619,7 @@ mod tests {
             RejectReason::FinalAge,
             RejectReason::PlayerMismatch,
             RejectReason::InvalidTarget,
+            RejectReason::TownContested,
         ]
     }
 
@@ -711,7 +790,7 @@ mod tests {
             notices.extend(
                 stepped
                     .iter()
-                    .filter_map(|e| notice_text(&view, &rules, &s, e)),
+                    .filter_map(|e| notice_text(&view, &rules, &s, e, &BTreeMap::new())),
             );
             events.extend(stepped);
             sim.step(&[]);
@@ -720,7 +799,7 @@ mod tests {
         notices.extend(
             stepped
                 .iter()
-                .filter_map(|e| notice_text(&sim.view(), &rules, &s, e)),
+                .filter_map(|e| notice_text(&sim.view(), &rules, &s, e, &BTreeMap::new())),
         );
         events.extend(stepped);
         assert!(
@@ -747,17 +826,23 @@ mod tests {
             town: BuildingId(town),
         };
         assert_eq!(
-            notice_text(&view, &rules, &s, &down(1)).as_deref(),
+            notice_text(&view, &rules, &s, &down(1), &BTreeMap::new()).as_deref(),
             Some("Town has fallen")
         );
-        assert_eq!(notice_text(&view, &rules, &s, &down(2)), None);
+        assert_eq!(
+            notice_text(&view, &rules, &s, &down(2), &BTreeMap::new()),
+            None
+        );
         // An age reached: only the local player's.
         let aged = |player| SimEvent::AgeAdvanced { player, age: 1 };
         assert_eq!(
-            notice_text(&view, &rules, &s, &aged(LOCAL_PLAYER)).as_deref(),
+            notice_text(&view, &rules, &s, &aged(LOCAL_PLAYER), &BTreeMap::new()).as_deref(),
             Some("Masonry Age reached")
         );
-        assert_eq!(notice_text(&view, &rules, &s, &aged(p1)), None);
+        assert_eq!(
+            notice_text(&view, &rules, &s, &aged(p1), &BTreeMap::new()),
+            None
+        );
 
         // The message line: the latest notice of a frame wins.
         let mut app = App::new();
@@ -785,6 +870,114 @@ mod tests {
             app.world().resource::<MessageState>().text,
             "Town has fallen"
         );
+    }
+
+    /// Annexation notices (M5a) go to the Town's owner and its attacker,
+    /// and a reset, which names only the Town, reaches the attacker through
+    /// the timers the message line heard start.
+    #[test]
+    fn annexation_notices_name_the_owner_and_the_attacker() {
+        use sim::{BuildingId, PlayerId};
+        let rules = rules();
+        let s = strings();
+        let mut setup = sim::MatchSetup::scenario(&rules, 1);
+        setup.start = sim::StartKind::Standard;
+        let sim = SimHandle::from_setup(setup, rules.clone());
+        let view = sim.view();
+        // The Seats: B1 is the local player's, B2 P1's; P2 is a bystander.
+        let (mine, theirs) = (BuildingId(1), BuildingId(2));
+        assert_eq!(view.building(mine).unwrap().owner, LOCAL_PLAYER);
+        assert_eq!(view.building(theirs).unwrap().owner, PlayerId(1));
+        let (p1, p2) = (PlayerId(1), PlayerId(2));
+        let none = BTreeMap::new();
+        let notice = |e: SimEvent, annexing: &BTreeMap<BuildingId, PlayerId>| {
+            notice_text(&view, &rules, &s, &e, annexing)
+        };
+        let started = |town, attacker| SimEvent::AnnexationStarted { town, attacker };
+        assert_eq!(
+            notice(started(theirs, LOCAL_PLAYER), &none).as_deref(),
+            Some("Town is being annexed"),
+            "the attacker"
+        );
+        assert_eq!(
+            notice(started(mine, p1), &none).as_deref(),
+            Some("Town is being annexed"),
+            "the owner"
+        );
+        assert_eq!(notice(started(theirs, p2), &none), None, "a bystander");
+        let reset = |town| SimEvent::AnnexationReset { town };
+        assert_eq!(
+            notice(reset(mine), &none).as_deref(),
+            Some("Annexation stopped")
+        );
+        let attacking: BTreeMap<_, _> = [(theirs, LOCAL_PLAYER)].into();
+        assert_eq!(
+            notice(reset(theirs), &attacking).as_deref(),
+            Some("Annexation stopped")
+        );
+        assert_eq!(notice(reset(theirs), &none), None);
+        assert_eq!(notice(reset(theirs), &[(theirs, p2)].into()), None);
+        let flipped = |town, from, to| SimEvent::TownAnnexed { town, from, to };
+        assert_eq!(
+            notice(flipped(theirs, p1, LOCAL_PLAYER), &none).as_deref(),
+            Some("Town annexed")
+        );
+        assert_eq!(
+            notice(flipped(mine, LOCAL_PLAYER, p1), &none).as_deref(),
+            Some("Town was lost")
+        );
+        assert_eq!(notice(flipped(theirs, p1, p2), &none), None);
+        assert_eq!(
+            notice(
+                SimEvent::MatchDecided {
+                    result: sim::MatchResult {
+                        outcome: sim::Outcome::Draw,
+                        reason: sim::OutcomeReason::Surrender,
+                        tick: 3
+                    }
+                },
+                &none
+            ),
+            None,
+            "the overlay shows the outcome"
+        );
+
+        // The message line remembers who annexes what for a later reset.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<SimEventMsg>()
+            .insert_resource(s)
+            .init_resource::<MessageState>()
+            .add_systems(Update, collect_messages);
+        app.world_mut().insert_non_send(sim);
+        app.world_mut().write_message(SimEventMsg {
+            tick: 3,
+            event: started(theirs, LOCAL_PLAYER),
+        });
+        app.update();
+        let state = app.world().resource::<MessageState>().clone();
+        assert_eq!(state.text, "Town is being annexed");
+        assert_eq!(state.annexing, [(theirs, LOCAL_PLAYER)].into());
+        app.world_mut().write_message(SimEventMsg {
+            tick: 4,
+            event: reset(theirs),
+        });
+        app.update();
+        let state = app.world().resource::<MessageState>().clone();
+        assert_eq!(state.text, "Annexation stopped");
+        assert!(state.annexing.is_empty());
+        app.world_mut().write_message(SimEventMsg {
+            tick: 5,
+            event: started(theirs, LOCAL_PLAYER),
+        });
+        app.world_mut().write_message(SimEventMsg {
+            tick: 1205,
+            event: flipped(theirs, p1, LOCAL_PLAYER),
+        });
+        app.update();
+        let state = app.world().resource::<MessageState>().clone();
+        assert_eq!(state.text, "Town annexed");
+        assert!(state.annexing.is_empty());
     }
 
     /// `HUD_KEYS` names every `hud` key the game reads: each exists in

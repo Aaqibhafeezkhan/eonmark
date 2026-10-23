@@ -2,7 +2,8 @@
 // file, it is not part of rules_hash, and editing it needs no rules_version
 // bump. Schema: crates/rules/src/strings.rs (deny_unknown_fields).
 // Placeholders: {resource} {unit} {building} {cost} {used} {cap} {count}
-// {rate} {name} {key}; any other brace fails `sim-cli data-check`.
+// {rate} {name} {key} {time} {hash}; any other brace fails
+// `sim-cli data-check`.
 (
   // Message line, one entry per sim RejectReason in snake case.
   reject: {
@@ -41,6 +42,7 @@
     "final_age": "Already in the last age",
     "player_mismatch": "That order is for another player",
     "invalid_target": "Cannot attack that",
+    "town_contested": "This Town is being annexed",
   },
   // HUD labels and tooltips.
   hud: {
@@ -84,5 +86,21 @@
     "notice.destroyed": "{building} destroyed",
     "notice.lost": "{building} lost",
     "notice.town_down": "{building} has fallen",
+    "notice.annexation_started": "{building} is being annexed",
+    "notice.annexation_stopped": "Annexation stopped",
+    "notice.annexed": "Town annexed",
+    "notice.town_lost": "{building} was lost",
+    "annex.attacking": "Annexing {building}: {time}",
+    "annex.defending": "{building} is being annexed: {time}",
+    "outcome.victory": "Victory",
+    "outcome.defeat": "Defeat",
+    "outcome.draw": "Draw",
+    "outcome.seat_captured": "The Seat was captured",
+    "outcome.all_towns_lost": "Every Town was lost",
+    "outcome.surrender": "Surrender",
+    "outcome.territory": "Territory at the time limit: {count} tiles to {cap}",
+    "outcome.time": "{time}, tick {count}",
+    "outcome.hash": "Final hash {hash}",
+    "outcome.replay": "Replay {name}",
   },
 )

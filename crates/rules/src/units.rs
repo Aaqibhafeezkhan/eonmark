@@ -9,7 +9,9 @@
 //! that `180` means `1.80`. The sim converts them to fixed-point exactly
 //! once at spawn time. `trainer` and `requires_tech` are checked against
 //! `buildings.ron` and `techs.ron` in `Rules::load`, which loads this file
-//! first.
+//! first. M5a adds the attrition flags `immune_to_attrition` (the Scribe and
+//! the Supply Wain) and `supplies` (the Supply Wain, whose radius cancels
+//! attrition for its owner's units).
 
 use crate::Error;
 use crate::attack::Attack;
@@ -109,6 +111,15 @@ pub struct UnitKind {
     pub builder: bool,
     /// Vision radius in tiles (fog of war, M7).
     pub vision_tiles: u32,
+    /// Whether attrition never damages units of this kind (M5a); `false`
+    /// when absent.
+    #[serde(default)]
+    pub immune_to_attrition: bool,
+    /// Whether units of this kind cancel attrition for their owner's units
+    /// within `supply_radius_tiles` of `rules.ron` (M5a, the Supply Wain);
+    /// `false` when absent.
+    #[serde(default)]
+    pub supplies: bool,
 }
 
 /// Default for [`UnitKind::return_to_post_radius_tiles_x100`]: one tile.
@@ -425,6 +436,8 @@ mod tests {
             requires_tech: None,
             builder: true,
             vision_tiles: 8,
+            immune_to_attrition: false,
+            supplies: false,
         }
     }
 

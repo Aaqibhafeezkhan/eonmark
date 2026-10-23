@@ -70,6 +70,11 @@ pub enum StatPath {
     UnitHp(UnitSel),
     /// Attack damage of the selected unit kinds.
     UnitDamage(UnitSel),
+    /// The Harrying level a player's borders impose on intruders (M5a
+    /// attrition): base 0, and each Harrying tech adds 1. Player-wide;
+    /// the sim clamps it to `0..=MAX_HARRYING_LEVEL` and the validator
+    /// keeps the worst case within it.
+    HarryingLevel,
 }
 
 impl StatPath {
@@ -84,7 +89,8 @@ impl StatPath {
             | StatPath::TownLimit
             | StatPath::TownBorderRadius
             | StatPath::ResearchCost
-            | StatPath::ResearchTime => false,
+            | StatPath::ResearchTime
+            | StatPath::HarryingLevel => false,
         }
     }
 }
@@ -366,6 +372,7 @@ mod tests {
         assert!(StatPath::UnitHp(UnitSel::Military).matches(bowman));
         assert!(!StatPath::UnitDamage(UnitSel::Military).matches(yeoman));
         assert!(!StatPath::PopCap.matches(bowman));
+        assert!(!StatPath::HarryingLevel.matches(bowman));
     }
 
     #[test]
@@ -414,6 +421,8 @@ mod tests {
         let m: Modifier =
             ron::from_str("Modifier(target: YieldCap, op: Mul, value: 1250)").unwrap();
         assert_eq!(m, mul(1250));
+        let m: Modifier = ron::from_str("(target: HarryingLevel, op: Add, value: 1)").unwrap();
+        assert_eq!(m, row(StatPath::HarryingLevel, ModOp::Add, 1));
         let e = ron::from_str::<Modifier>("(target: GoldCap, op: Add, value: 1)").unwrap_err();
         assert!(e.to_string().contains("StatPath"), "{e}");
         let e =

@@ -14,7 +14,10 @@
 //! Lore", greyed while a resource is short as a card button is. The tooltip
 //! shows under the strip: "Advance to Masonry Age: Costs 250 Grain 100
 //! Lore" when enabled, else the rejection's message ("Not enough Grain"),
-//! "n / m techs researched" and the cost. A click issues `AdvanceAge {
+//! "n / m techs researched" and the cost. `n` is `SimView::age_tech_count`,
+//! the techs that count toward an age, the number the sim compares with
+//! the gate: since M5a's rules data the Watchtower's Harrying I and II are
+//! side techs that count toward none. A click issues `AdvanceAge {
 //! player: LOCAL_PLAYER }` from a `Pointer<Click>` observer, or puts the
 //! tooltip on the message line when greyed. In the last age the button is
 //! hidden (`Display::None`). The hover colours and the tooltip are the
@@ -99,7 +102,7 @@ pub fn advance_view(view: &SimView<'_>, rules: &Rules, strings: &UiStrings) -> A
         };
     };
     let counts = [
-        ("count", view.researched(LOCAL_PLAYER).len().to_string()),
+        ("count", view.age_tech_count(LOCAL_PLAYER).to_string()),
         ("cap", next.techs_required.to_string()),
     ];
     let counts = counts.each_ref().map(|(k, v)| (*k, v.as_str()));
@@ -667,6 +670,49 @@ mod tests {
             want.state.tooltip,
             "Research more techs first. 2 / 5 techs researched. \
              Costs 500 Grain 300 Lumber 300 Lore"
+        );
+    }
+
+    /// The tech count on the button and in its tooltip is the techs that
+    /// count toward an age, which the sim compares with the gate (M5a):
+    /// Letters I with both Harrying techs is "1 / 2", not 3, and the
+    /// button stays on the count until a second Scriptorium tech.
+    #[test]
+    fn advance_tooltip_counts_only_age_techs() {
+        let mut app = hud_app();
+        let cmds = ["letters_1", "harrying_1", "harrying_2"]
+            .iter()
+            .map(|id| research(&app, id))
+            .collect();
+        run(&mut app, cmds);
+        let sim = app.world().non_send::<SimHandle>();
+        let (researched, counting) = (
+            sim.view().researched(LOCAL_PLAYER).len(),
+            sim.view().age_tech_count(LOCAL_PLAYER),
+        );
+        assert_eq!((researched, counting), (3, 1));
+        let want = check(&mut app);
+        assert_eq!(
+            (want.label.as_str(), want.state),
+            (
+                "Advance: 1 / 2 techs",
+                CardState {
+                    enabled: false,
+                    tooltip: "Research more techs first. 1 / 2 techs researched. \
+                              Costs 250 Grain 100 Lore"
+                        .into(),
+                }
+            )
+        );
+        let cmds = vec![research(&app, "trade_1")];
+        run(&mut app, cmds);
+        let want = check(&mut app);
+        assert_eq!(
+            (want.label.as_str(), want.state.tooltip.as_str()),
+            (
+                "Advance to Masonry Age: 250 Grain 100 Lore",
+                "Not enough Grain. 2 / 2 techs researched. Costs 250 Grain 100 Lore"
+            )
         );
     }
 

@@ -79,6 +79,8 @@ Primitive silhouettes (M2 to M7):
 | Town | `Cylinder` | Larger when it reaches the second radius tier |
 | Resource node | `Sphere` | Grain gold, timber, ore colours |
 | Selection ring, rally marker, move marker | Retained gizmo lines | Separate entities keyed by id, never children of moving units |
+| Attrition indicator, supply ring (M5a) | Retained gizmo lines | Same rule; a steady Yield Cap amber (#D29B3B) diamond under a unit bleeding on enemy land, a Timber ring around a selected Supply Wain; nothing pulses |
+| Annexation timer (M5a) | Immediate gizmo lines, 3 px | A #3A3A3F track circle just outside a contested Town and the attacker's team-colour arc filling clockwise from north |
 | Health bar | Flat quad entity | Same rule; unlit, a team-colour fill on a #3A3A3F track, no green-to-red, shown only while the target is damaged or selected (M4b, `health_bars.rs`) |
 
 Unit looks (M4b, `data/visuals.ron`), one silhouette per kind. Width is the kind's collision diameter from `units.ron`; each mesh has 10 facets around (a 6-latitude capsule, an icosphere of 80 faces) and flat face normals, at most 600 vertices, one mesh per kind and one material per kind and team:
@@ -109,7 +111,7 @@ Motion is procedural (bob, swing, scale pulse), not animation clips, in v0.1.
 | Neutral or tied tiles | no tint, except within half a tile of owned land, where the owner's tint fades from about half of the 12% at the edge to nothing at the tile centre, under the border line |
 | Fog, explored | ground and buildings darkened to 0.45 |
 | Fog, unexplored | 0.0 (hidden) |
-| Supply coverage | subtle hatching from the same field texture (M5a) |
+| Supply coverage | a thin Timber (#8B6B4A) ring of radius 14.5 m around a selected Supply Wain (M5a, `markers.rs`); the subtle hatching from the same field texture's A channel waits for M7 with fog (M5a owner decision 10) |
 
 The ground's material is the `FieldExt` extended material (`crates/game/src/field.rs`, shader `field.wgsl` embedded in the binary) reading an RGBA8 field texture with one texel per tile, 128x128 on the current maps (R owner, G strength, B fog, A supply). Each owner's membership is interpolated between tile centres with smoothstep weights; the tint follows it and the border is the isoline where it crosses one half, fading to nothing at the tile centres on either side, so the line follows the buildable tiles with rounded corners. M3b drew a vertex-coloured version first and replaced it within the milestone. The shader is mandatory by M7 because fog rides the same texture.
 

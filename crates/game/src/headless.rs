@@ -13,6 +13,9 @@
 //! simulating, like `sim-cli verify`; a file that does not decode is
 //! `error: ...` with exit 2; a truncated recording (no clean-exit trailer)
 //! is replayed up to its last complete record with a `warning:` on stderr.
+//! A replay plays on past the match's outcome to its recorded end (M5a:
+//! only a live windowed source freezes there), so `capture_seat` ends at
+//! its recorded deciding tick and `move_500` at its 1200.
 //! `move_500` (1200 ticks) finishes in well under 10 s on the dev Mac in
 //! the `ci` profile because the runner steps [`REPLAY_TICKS_PER_UPDATE`]
 //! ticks per `Update` and never waits on wall time (`FixedUpdate` would).
@@ -171,6 +174,13 @@ fn replay_and_report(
                 // A replay source never stalls before its end; if one did,
                 // looping here would spin forever.
                 eprintln!("eonmark: replay source stalled at tick {}", sim.tick());
+                exit.write(AppExit::error());
+                return;
+            }
+            TickOutcome::Decided { tick } => {
+                // Only a live source freezes at the outcome; a replay plays
+                // to its recorded end, so this is a driver bug.
+                eprintln!("eonmark: replay source froze at its outcome at tick {tick}");
                 exit.write(AppExit::error());
                 return;
             }

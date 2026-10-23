@@ -4,7 +4,8 @@
 //! `State` is hashed and snapshotted. Derived structures live outside it on
 //! [`Sim`] or behind `#[serde(skip)]` and are rebuilt by the private
 //! `Sim::rebuild_derived`, which [`Sim::restore`] calls before returning: the
-//! map's connected components, the spatial grid, and the (cleared) path cache.
+//! map's connected components, the spatial grid, the rules-only combat
+//! tables, and the (cleared) path cache.
 //!
 //! Tick order inside [`Sim::step`]:
 //!
@@ -24,25 +25,46 @@
 //!      in id order, aims at the nearest enemy unit in range;
 //!    - 5b `movement::step` with those engagements; units that need a
 //!      repath get a new `PathRequest`;
+//!    - 5b' `attrition::step` (M5a): each unit in id order on another
+//!      player's land with Harrying and no friendly Supply Wain in range
+//!      counts one more exposed tick, any other unit's count drops to 0,
+//!      and a count that reaches a multiple of the owner's interval takes
+//!      a pulse of hit points;
 //!    - 5c `combat::resolve`: hits from the post-movement positions (units,
 //!      then the shooters' aims), summed per target and applied at once,
-//!      then the dead units and the destroyed buildings are removed.
+//!      then the dead units (attrition's included) and the destroyed
+//!      buildings are removed;
+//!    - 5d `annexation::step` (M5a): each complete Town at 0 HP, in id
+//!      order, with exactly one enemy owner's infantry or cavalry beside it
+//!      and no defender within 6 tiles starts or advances its timer (its
+//!      border source on the neutral layer); any other step resets it; a
+//!      timer that reaches `annexation_ds` flips the Town and the buildings
+//!      attributed to it that do not stay. The annex-hold guard rule lives
+//!      in 5a: an idle infantry or cavalry guard beside an enemy Town at 0
+//!      HP takes only targets in weapon range.
 //! 6. Economy and Towns, each in id order:
 //!    - 6a construction: sites whose builder is at work gain progress; a
 //!      finished site completes (a Town or Watchtower adds its border, its
 //!      Town may grow a tier) and its builder may take a slot there;
 //!    - 6b training and research: every complete building's queue head
-//!      gains a tick; a finished unit appears beside the building and walks
+//!      gains a tick (not at a Town whose annexation timer runs, M5a); a
+//!      finished unit appears beside the building and walks
 //!      to its rally point or takes a slot there, a finished tech applies
 //!      its rows and re-derives the owner's Towns;
 //!    - 6c jobs: a job whose target is gone, or whose worker stopped
 //!      somewhere it cannot work, is dropped; then idle workers past their
 //!      timer take the nearest free slot;
 //!    - 6d income: every player's base yields and worked slots go through
-//!      the Yield Cap into the accumulators and stockpiles.
+//!      the Yield Cap (less the late-game decay, M5a, off in the shipped
+//!      data) into the accumulators and stockpiles;
+//!    - 6e `victory::step` (M5a): while no outcome is set, Surrender, a
+//!      Seat flipped in 5d, a player left with no complete Town by a 5d
+//!      flip, then the match cap (territory) decide it, once.
 //! 7. `tick += 1`.
 
 use crate::ai_hook::{AiController, SimView};
+use crate::annexation;
+use crate::attrition;
 use crate::combat;
 use crate::command::{Command, PlayerCommand, sort_commands};
 use crate::construction::{self, BuildPlan};
@@ -59,6 +81,7 @@ use crate::tech::{self, TechState};
 use crate::territory::TerritoryField;
 use crate::town;
 use crate::training;
+use crate::victory;
 use rand_core::SeedableRng;
 use rules::{Rules, UnitKind};
 use serde::{Deserialize, Serialize};
@@ -150,7 +173,35 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Complete Watchtowers and Towns with hit points left shoot the nearest
 /// enemy unit in range (`Building::ready_at`). `DebugSpawnJittered` is
 /// appended to `Command` and draws two offsets per spawned unit.
-pub const SIM_VERSION: u32 = 14;
+///
+/// 15: M5a attrition. New hashed state `Unit::exposed_ticks` (sub-hash
+/// `units`). Step 5b' applies Harrying (the `HarryingLevel` rows: a pulse
+/// every 64 ticks at Harrying I, the interval halved per level), cancelled
+/// by the unit owner's Supply Wains within `supply_radius_tiles` (14),
+/// skipped for `immune_to_attrition` kinds, with the age-gap table and the
+/// late Harrying bonus; its dead are reaped in 5c. `Command::DebugDamage`
+/// is appended to `Command`, and `combat::apply_damage` applies both its
+/// damage and every hit. `AdvanceAge` counts only the techs that count
+/// toward an age from `rules_version` 18 on (behaviour-neutral for older
+/// data, which has no side tech).
+///
+/// 16: M5a annexation and outcome. New hashed state `TownState::hold`
+/// (sub-hash `buildings`) and `State::outcome` (`meta`). Step 5d enters,
+/// resets and flips Towns at 0 HP: one enemy owner's adjacent infantry or
+/// cavalry and no defender within 6 tiles move the Town's border source to
+/// the neutral layer, and after `annexation_ds` (1200 ticks) the Town and
+/// the buildings attributed to it that do not stay change hands (queues
+/// refunded to the old owner, sites' `paid` zeroed, border sources moved to
+/// the new owner's layer, 250 per mille of the Town's hit points
+/// restored). `Train` and `Research` at a contested Town
+/// are rejected with `TownContested` and its queue pauses; new buildings
+/// are not attributed to it. The annex-hold guard rule: an idle infantry
+/// or cavalry guard adjacent to an enemy Town at 0 HP keeps and takes only
+/// targets in weapon range and never chases. Step 6e decides the outcome
+/// (Surrender, Seat captured, all Towns lost and the 45-minute territory
+/// cap, with a Draw for an exact tie). The Yield Cap decay knob
+/// (`yield_cap_decay_*`, off in the shipped data).
+pub const SIM_VERSION: u32 = 16;
 
 /// Who drives a player slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +406,13 @@ pub struct Unit {
     pub target: Option<TargetId>,
     /// Why it has that target.
     pub intent: Intent,
+    /// Consecutive steps the unit has been exposed to attrition (M5a,
+    /// saturating): on another player's land, where that player has a
+    /// Harrying level, with no own Supply Wain in range and a kind that is
+    /// not immune. Any other step sets it to 0. A pulse lands when it is a
+    /// multiple of the owner's interval; the game reads `> 0` as
+    /// "bleeding".
+    pub exposed_ticks: u32,
 }
 
 impl Unit {
@@ -386,6 +444,7 @@ impl Unit {
             ready_at: 0,
             target: None,
             intent: Intent::Plain,
+            exposed_ticks: 0,
         }
     }
 
@@ -430,10 +489,76 @@ pub enum Construction {
 /// What only a Town has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TownState {
-    /// The player's first Town, placed by the standard start. Never moves.
+    /// The player's first Town, placed by the standard start. Never moves,
+    /// and stays on the building when it is annexed (M5a).
     pub seat: bool,
     /// Border tier: 1 when founded, 2 once grown.
     pub tier: u8,
+    /// Whether the Town's annexation timer runs (M5a, step 5d).
+    pub hold: Hold,
+}
+
+/// A Town's annexation state (`docs/design/towns.md`, "Annexation state
+/// machine"; M5a step 5d, `annexation::step`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Hold {
+    /// Its owner holds it: its border source stamps the owner's layer.
+    #[default]
+    Held,
+    /// At 0 HP with one enemy owner's infantry or cavalry adjacent and no
+    /// defender near: its border source stamps the neutral layer, `Train`
+    /// and `Research` there are rejected (`TownContested`) and its queue
+    /// pauses. It flips to `attacker` once `ticks` reaches
+    /// `Rules::annexation_ticks()`.
+    Contested {
+        /// The one enemy owner whose units are adjacent.
+        attacker: PlayerId,
+        /// Eligible steps since the step that entered the timer (0 in that
+        /// step).
+        ticks: u32,
+    },
+}
+
+/// How a match ended (M5a, step 6e, `victory::step`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    /// `player` won: decisively by capture, elimination or surrender, or
+    /// not decisively on territory at the match cap.
+    Victory {
+        /// The winner.
+        player: PlayerId,
+        /// `false` only for the territory tiebreak at the match cap.
+        decisive: bool,
+    },
+    /// Nobody won: an exact territory tie at the cap, or a symmetric
+    /// same-step capture, elimination or double surrender.
+    Draw,
+}
+
+/// Why a match ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutcomeReason {
+    /// A Seat was annexed.
+    SeatCaptured,
+    /// A player's last complete Town was annexed.
+    AllTownsLost,
+    /// Every player but one (or all) surrendered.
+    Surrender,
+    /// The match cap (`match_cap_ds`, 45 minutes) was reached: the player
+    /// with the most owned tiles wins.
+    Territory,
+}
+
+/// The decided result of a match: latched in `State::outcome` (sub-hash
+/// `meta`) in the step that decides it and never changed afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchResult {
+    /// Who won, or a draw.
+    pub outcome: Outcome,
+    /// Which condition decided it.
+    pub reason: OutcomeReason,
+    /// `Sim::tick()` after the deciding step.
+    pub tick: u32,
 }
 
 /// One entry of a building's queue: a unit in training or a tech in
@@ -578,7 +703,8 @@ pub enum RejectReason {
     /// The tech is queued at one of the player's buildings.
     ResearchInProgress,
     /// `AdvanceAge` before the player has researched the next age's
-    /// `techs_required` techs (queued ones do not count).
+    /// `techs_required` techs (queued ones and the Harrying side techs,
+    /// `counts_toward_age: false`, do not count).
     NotEnoughTechs,
     /// `AdvanceAge` in the last age of `ages.ron`.
     FinalAge,
@@ -586,7 +712,11 @@ pub enum RejectReason {
     PlayerMismatch,
     /// `Attack`: the target does not exist, is the player's own, or is a
     /// building with no hit points left (a complete Town at 0 HP).
+    /// `DebugDamage`: the target does not exist.
     InvalidTarget,
+    /// `Train` or `Research` at a Town whose annexation timer runs
+    /// (M5a): its queue is paused until the timer resets or it flips.
+    TownContested,
 }
 
 /// Something the presenter or a test may want to know about a tick. Events
@@ -700,6 +830,44 @@ pub enum SimEvent {
         /// The Town.
         town: BuildingId,
     },
+    /// An attrition pulse took hit points from a unit exposed on enemy land
+    /// (step 5b'); a unit it kills is removed in 5c with `UnitDied`.
+    Attrition {
+        /// The unit.
+        unit: UnitId,
+        /// Hit points taken.
+        damage: i32,
+    },
+    /// A Town's annexation timer started (step 5d): its land turned
+    /// neutral.
+    AnnexationStarted {
+        /// The Town.
+        town: BuildingId,
+        /// The player whose units are adjacent.
+        attacker: PlayerId,
+    },
+    /// A Town's annexation timer stopped before the flip (a defender came
+    /// near, the attackers left or another player's took their place); its
+    /// land returned to its owner.
+    AnnexationReset {
+        /// The Town.
+        town: BuildingId,
+    },
+    /// A Town changed hands (step 5d), with the buildings attributed to it
+    /// that do not stay.
+    TownAnnexed {
+        /// The Town.
+        town: BuildingId,
+        /// Its old owner.
+        from: PlayerId,
+        /// Its new owner.
+        to: PlayerId,
+    },
+    /// The match was decided (step 6e); emitted once.
+    MatchDecided {
+        /// The result, as `Sim::result` returns it from now on.
+        result: MatchResult,
+    },
 }
 
 /// Per-subsystem hashes for localising a divergence. Field order is the
@@ -724,7 +892,8 @@ pub struct SubHashes {
     pub rng: u64,
     /// Cost grid and its generation.
     pub map: u64,
-    /// Tick, seed, id allocator, players, pending commands, counters.
+    /// Tick, seed, id allocator, players, pending commands, counters and,
+    /// since M5a, the match result (`State::outcome`).
     pub meta: u64,
 }
 
@@ -792,6 +961,8 @@ pub(crate) struct State {
     pub(crate) territory: TerritoryField,
     /// Every player's age and researched techs.
     pub(crate) tech: TechState,
+    /// The match result once step 6e decided it (M5a); sub-hash `meta`.
+    pub(crate) outcome: Option<MatchResult>,
 }
 
 /// A snapshot could not be decoded into match state.
@@ -831,6 +1002,8 @@ pub struct Sim {
     state: State,
     /// Derived: rebuilt every tick and on restore.
     grid: SpatialGrid,
+    /// Derived from the rules alone: built here and in `rebuild_derived`.
+    combat_tables: combat::CombatTables,
     /// Whether the (derived) path cache is in use; survives restore.
     path_cache_enabled: bool,
     /// Not hashed; drained by the caller.
@@ -884,6 +1057,7 @@ impl Sim {
             economy,
             territory,
             tech,
+            outcome: None,
         };
         if setup.start == StartKind::Standard {
             assert!(
@@ -893,12 +1067,14 @@ impl Sim {
             town::apply_standard_start(&mut state, &rules, def, rules.tick_rate_hz);
         }
         let grid = SpatialGrid::new(&state.map);
+        let combat_tables = combat::CombatTables::new(&rules);
         Self {
             setup,
             rules,
             ai,
             state,
             grid,
+            combat_tables,
             path_cache_enabled: true,
             events: Vec::new(),
         }
@@ -998,7 +1174,7 @@ impl Sim {
         //    the back of the queue and could starve it under a saturated
         //    budget. Its periodic timer is pushed back either way.
         self.grid.rebuild(&self.state.units);
-        let stats = combat::Stats::new(&self.state, &self.rules);
+        let stats = combat::Stats::new(&self.state, &self.rules, &self.combat_tables);
         let plan = combat::think(&mut self.state, &self.rules, &self.grid, &stats, tick);
         let repath = movement::step(
             &mut self.state.units,
@@ -1035,6 +1211,9 @@ impl Sim {
                 order.repath_at = tick + self.rules.repath_interval_ticks();
             }
         }
+        // 5b'. Attrition from the post-movement positions; its dead are
+        //      reaped in 5c with the rest.
+        attrition::step(&mut self.state, &self.rules, &mut self.events);
         // 5c. Hits from the post-movement positions, then the dead and the
         //     destroyed.
         combat::resolve(
@@ -1045,13 +1224,17 @@ impl Sim {
             tick,
             &mut self.events,
         );
+        // 5d. Annexation of Towns at 0 HP, from the post-movement,
+        //     post-reap positions.
+        let flips = annexation::step(&mut self.state, &self.rules, &mut self.events);
 
         // 6. Economy and Towns: construction, training, jobs and idle
-        //    seeking, income.
+        //    seeking, income; then the match outcome.
         construction::step(&mut self.state, &self.rules, tick, &mut self.events);
         training::step(&mut self.state, &self.rules, tick, &mut self.events);
         economy::jobs_step(&mut self.state, &self.rules, tick);
         economy::income_step(&mut self.state, &self.rules);
+        victory::step(&mut self.state, &self.rules, tick, &flips, &mut self.events);
 
         self.state.tick += 1;
     }
@@ -1391,6 +1574,28 @@ impl Sim {
                     Ok(attackers) => combat::apply_attack(&mut self.state, &attackers, *target),
                 }
             }
+            Command::DebugDamage { target, amount } => {
+                if !self.setup.debug_commands {
+                    self.reject(&pc, RejectReason::DebugCommandsDisabled);
+                    return;
+                }
+                // Existence only, not `combat::locate`: any owner, a
+                // player's own buildings and a Town at 0 HP included.
+                let exists = match target {
+                    TargetId::Unit(id) => self.state.units.contains_key(id),
+                    TargetId::Building(id) => self.state.buildings.contains_key(id),
+                };
+                if !exists {
+                    self.reject(&pc, RejectReason::InvalidTarget);
+                    return;
+                }
+                combat::apply_damage(
+                    &mut self.state,
+                    *target,
+                    i64::from(*amount),
+                    &mut self.events,
+                );
+            }
         }
     }
 
@@ -1517,6 +1722,18 @@ impl Sim {
         self.state.tick
     }
 
+    /// How the match ended, once step 6e decided it (M5a); `None` while it
+    /// runs. Latched: it never changes once set, and the sim keeps
+    /// stepping.
+    pub fn outcome(&self) -> Option<Outcome> {
+        self.state.outcome.map(|r| r.outcome)
+    }
+
+    /// The full result (outcome, reason and deciding tick), once decided.
+    pub fn result(&self) -> Option<MatchResult> {
+        self.state.outcome
+    }
+
     /// xxh3 over the canonical postcard encoding of all hashed state.
     pub fn hash(&self) -> u64 {
         crate::hash::hash_value(&self.state)
@@ -1541,6 +1758,7 @@ impl Sim {
                 &s.players,
                 &s.pending,
                 s.commands_applied,
+                &s.outcome,
             )),
         }
     }
@@ -1562,13 +1780,15 @@ impl Sim {
         Ok(())
     }
 
-    /// Rebuild every unhashed derived structure from `state`: map components,
-    /// spatial grid, and the path cache (empty, with its capacity and the
-    /// sim's enabled flag re-applied since `serde(skip)` reset it).
+    /// Rebuild every unhashed derived structure from `state` and the rules:
+    /// map components, spatial grid, the combat tables and the path cache
+    /// (empty, with its capacity and the sim's enabled flag re-applied since
+    /// `serde(skip)` reset it).
     fn rebuild_derived(&mut self) {
         self.state.map.rebuild_components();
         self.grid = SpatialGrid::new(&self.state.map);
         self.grid.rebuild(&self.state.units);
+        self.combat_tables = combat::CombatTables::new(&self.rules);
         self.state.pathing.cache =
             crate::pathing::PathCache::new(self.rules.path_cache_entries, self.path_cache_enabled);
         self.events.clear();

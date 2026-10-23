@@ -78,6 +78,22 @@ pub const MAX_COMBAT_TILES: u32 = 16;
 /// Largest starting stockpile entry.
 pub const MAX_START_STOCK: u32 = 1_000_000;
 
+/// Largest `supply_radius_tiles`, so the sim's squared radius stays far
+/// inside `i32` with overflow checks on.
+pub const MAX_SUPPLY_RADIUS_TILES: u32 = 64;
+
+/// Largest Harrying level the `HarryingLevel` rows may reach in the worst
+/// case (M5a). The sim clamps the resolved level to `0..=8` and halves
+/// the attrition interval once per level above 1.
+pub const MAX_HARRYING_LEVEL: u32 = 8;
+
+/// Largest entry of `attrition_age_gap_hp` and largest `harrying_bonus_hp`,
+/// in hit points per pulse.
+pub const MAX_ATTRITION_HP: u32 = 1000;
+
+/// Largest `annexation_adjacent_tiles`.
+pub const MAX_ANNEXATION_ADJACENT_TILES: u32 = 4;
+
 /// Errors produced while loading or validating rules data.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -217,6 +233,42 @@ pub struct Rules {
     pub attrition_interval_ds: u32,
     /// Time a Town at 0 HP must stay uncontested before it flips, in deciseconds.
     pub annexation_ds: u32,
+    /// Hit points one attrition pulse takes, indexed by the age gap
+    /// `max(0, territory owner's age - intruder's age)`; the last entry
+    /// covers every larger gap. Non-empty, at least 1 and non-decreasing.
+    pub attrition_age_gap_hp: Vec<u32>,
+    /// The late-game pressure knob: once the territory owner has reached
+    /// this age (an `ages.ron` id), each pulse takes `harrying_bonus_hp`
+    /// more; `None` for no bonus.
+    pub harrying_bonus_age: Option<String>,
+    /// Extra hit points per pulse from `harrying_bonus_age` on (0 until the
+    /// M6 fun gate tunes it).
+    pub harrying_bonus_hp: u32,
+    /// An attacker counts toward annexing a Town within this many tiles
+    /// (Chebyshev, tile to footprint) of its footprint.
+    pub annexation_adjacent_tiles: u32,
+    /// A defender within this many tiles of a Town's centre (centre to
+    /// centre, inclusive) blocks or resets its annexation.
+    pub annexation_defender_radius_tiles: u32,
+    /// The unit kinds whose units annex an enemy Town (infantry and
+    /// cavalry); every selector must reach a kind and none a civilian.
+    pub annexation_attackers: Vec<UnitSel>,
+    /// The unit kinds whose units defend their own Town (every
+    /// non-civilian kind).
+    pub annexation_defenders: Vec<UnitSel>,
+    /// A flipped Town's hit points, in permille of its kind's `hp`.
+    pub annexation_town_hp_permille: u32,
+    /// The match ends at this time with the territory tiebreak (45 min), in
+    /// deciseconds.
+    pub match_cap_ds: u32,
+    /// The late-game Yield Cap decay starts at this match time, in
+    /// deciseconds.
+    pub yield_cap_decay_after_ds: u32,
+    /// The decay lowers the Yield Cap by `yield_cap_decay_step` once per
+    /// this many deciseconds from `yield_cap_decay_after_ds` on.
+    pub yield_cap_decay_every_ds: u32,
+    /// How much each decay step lowers the Yield Cap; 0 turns the knob off.
+    pub yield_cap_decay_step: u32,
     /// A* node expansions shared by all path requests per tick.
     pub path_budget_expansions: u32,
     /// Entries kept in the bounded path cache.
@@ -403,6 +455,16 @@ impl Rules {
                 format!("{age:?} is not an age id in ages.ron"),
             ));
         }
+        if let Some(age) = &self.harrying_bonus_age
+            && self.age_index(age).is_none()
+        {
+            return Err(Error::invalid(
+                &p.rules,
+                "harrying_bonus_age",
+                format!("{age:?} is not an age id in ages.ron"),
+            ));
+        }
+        self.check_annexation_sets(&p.rules)?;
         self.check_gathered_from(&p.resources)?;
         let non_town = self.buildings.iter().filter(|b| !b.town).count();
         if usize::try_from(self.town_growth_distinct_buildings).unwrap_or(usize::MAX) > non_town {
@@ -584,7 +646,9 @@ impl Rules {
     }
 
     /// An age's `techs_required` can be met with the techs the ages before
-    /// it unlock.
+    /// it unlock, counting only those that count toward an age (M5a: not
+    /// the Harrying side techs). Since those ages unlock at most
+    /// [`Rules::counting_techs`], no gate can ask for more.
     fn check_age_gates_reachable(&self, path: &Path) -> Check {
         let mut available = 0usize;
         for (i, a) in self.ages.iter().enumerate() {
@@ -593,12 +657,66 @@ impl Rules {
                     path,
                     &format!("ages[{i}].techs_required"),
                     format!(
-                        "{} techs can never be researched: the ages before it unlock {available}",
+                        "{} techs can never be researched: the ages before it unlock {available} that count toward an age",
                         a.techs_required
                     ),
                 ));
             }
-            available += a.unlocks.techs.len();
+            available += a
+                .unlocks
+                .techs
+                .iter()
+                .filter(|id| {
+                    self.tech_by_id(id)
+                        .is_some_and(|(_, t)| t.counts_toward_age)
+                })
+                .count();
+        }
+        Ok(())
+    }
+
+    /// The annexation selectors (M5a), naming `rules.ron`: every `Kind`
+    /// names a unit kind in `units.ron`; each list reaches at least one
+    /// kind; no attacker selector reaches a `Civilian` kind.
+    fn check_annexation_sets(&self, path: &Path) -> Check {
+        for (field, sels) in [
+            ("annexation_attackers", &self.annexation_attackers),
+            ("annexation_defenders", &self.annexation_defenders),
+        ] {
+            for (j, sel) in sels.iter().enumerate() {
+                if let UnitSel::Kind(id) = sel
+                    && self.unit_kind_by_id(id).is_none()
+                {
+                    return Err(Error::invalid(
+                        path,
+                        &format!("{field}[{j}]"),
+                        format!("{id:?} is not a unit id in units.ron"),
+                    ));
+                }
+            }
+            if !self.units.iter().any(|u| sels.iter().any(|s| s.selects(u))) {
+                return Err(Error::invalid(
+                    path,
+                    field,
+                    "selects no unit kind in units.ron",
+                ));
+            }
+        }
+        for (j, sel) in self.annexation_attackers.iter().enumerate() {
+            if let Some(u) = self
+                .units
+                .iter()
+                .find(|u| u.class == UnitClass::Civilian && sel.selects(u))
+            {
+                return Err(Error::invalid(
+                    path,
+                    &format!("annexation_attackers[{j}]"),
+                    format!(
+                        "selects {:?}, a Civilian kind; civilians never annex a Town",
+                        u.id
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -894,6 +1012,32 @@ impl Rules {
                 player(StatPath::TownBorderRadius, radius),
                 u64::from(MAX_BORDER_RADIUS_TILES),
             )?;
+            // The Harrying level (M5a): at most MAX_HARRYING_LEVEL, and the
+            // attrition interval halved once per level above 1 stays at
+            // least one tick at the highest level reachable.
+            let harrying = player(StatPath::HarryingLevel, 0);
+            fits(
+                &p.techs,
+                "techs[*].modifiers",
+                0,
+                "HarryingLevel",
+                harrying,
+                u64::from(MAX_HARRYING_LEVEL),
+            )?;
+            let level = harrying
+                .and_then(|w| u32::try_from(w).ok())
+                .expect("bounded by MAX_HARRYING_LEVEL above");
+            let interval = self.attrition_interval_ticks();
+            if level >= 1 && interval.checked_shr(level - 1).unwrap_or(0) == 0 {
+                return Err(Error::invalid(
+                    &p.rules,
+                    "attrition_interval_ds",
+                    format!(
+                        "{} ds is {interval} ticks at {} Hz, which halved for Harrying level {level} (the worst case of the HarryingLevel rows of techs.ron and factions[{f}] {:?}) is 0 ticks; it must stay at least one tick",
+                        self.attrition_interval_ds, self.tick_rate_hz, faction.id
+                    ),
+                ));
+            }
             for (i, t) in self.techs.iter().enumerate() {
                 for (id, &amount) in &t.cost {
                     fits(
@@ -1054,7 +1198,6 @@ impl Rules {
             ));
         }
         positive("town_limit_base", self.town_limit_base)?;
-        positive("supply_radius_tiles", self.supply_radius_tiles)?;
         positive("attrition_interval_ds", self.attrition_interval_ds)?;
         positive("annexation_ds", self.annexation_ds)?;
         let in_range = |field: &str, v: u32, lo: u32, hi: u32| -> Result<(), Error> {
@@ -1125,6 +1268,148 @@ impl Rules {
             self.separation_push_moving_div,
         )?;
         positive("separation_push_idle_div", self.separation_push_idle_div)?;
+        self.validate_m5a_rules(path)
+    }
+
+    /// The attrition, annexation and match-end fields of `rules.ron` (M5a)
+    /// that need no other file: ranges, the age-gap table's shape, and
+    /// every timer converting to a tick count that fits `u32` (at least one
+    /// tick where the sim divides or counts by it).
+    fn validate_m5a_rules(&self, path: &Path) -> Check {
+        let in_range = |field: &str, v: u32, lo: u32, hi: u32| -> Check {
+            if (lo..=hi).contains(&v) {
+                Ok(())
+            } else {
+                Err(Error::invalid(
+                    path,
+                    field,
+                    format!("{v} must be in {lo}..={hi}"),
+                ))
+            }
+        };
+        in_range(
+            "supply_radius_tiles",
+            self.supply_radius_tiles,
+            1,
+            MAX_SUPPLY_RADIUS_TILES,
+        )?;
+        let gaps = &self.attrition_age_gap_hp;
+        if gaps.is_empty() {
+            return Err(Error::invalid(
+                path,
+                "attrition_age_gap_hp",
+                "must list the HP per pulse at age gap 0 at least",
+            ));
+        }
+        for (i, &hp) in gaps.iter().enumerate() {
+            let field = format!("attrition_age_gap_hp[{i}]");
+            in_range(&field, hp, 1, MAX_ATTRITION_HP)?;
+            if i > 0 && hp < gaps[i - 1] {
+                return Err(Error::invalid(
+                    path,
+                    &field,
+                    format!(
+                        "{hp} is less than {} at gap {}; HP per pulse never decreases as the age gap grows",
+                        gaps[i - 1],
+                        i - 1
+                    ),
+                ));
+            }
+        }
+        if self.harrying_bonus_age.as_deref() == Some("") {
+            return Err(Error::invalid(
+                path,
+                "harrying_bonus_age",
+                "must not be empty; use None for no bonus",
+            ));
+        }
+        in_range(
+            "harrying_bonus_hp",
+            self.harrying_bonus_hp,
+            0,
+            MAX_ATTRITION_HP,
+        )?;
+        in_range(
+            "annexation_adjacent_tiles",
+            self.annexation_adjacent_tiles,
+            1,
+            MAX_ANNEXATION_ADJACENT_TILES,
+        )?;
+        in_range(
+            "annexation_defender_radius_tiles",
+            self.annexation_defender_radius_tiles,
+            1,
+            MAX_COMBAT_TILES,
+        )?;
+        in_range(
+            "annexation_town_hp_permille",
+            self.annexation_town_hp_permille,
+            0,
+            1000,
+        )?;
+        for (field, sels) in [
+            ("annexation_attackers", &self.annexation_attackers),
+            ("annexation_defenders", &self.annexation_defenders),
+        ] {
+            if sels.is_empty() {
+                return Err(Error::invalid(
+                    path,
+                    field,
+                    "must list at least one selector (Military, Class(..) or Kind(\"<unit id>\"))",
+                ));
+            }
+        }
+        let ticks = |field: &str, ds: u32| -> Result<u32, Error> {
+            self.ticks_from_ds_checked(ds).ok_or_else(|| {
+                Error::invalid(
+                    path,
+                    field,
+                    format!(
+                        "{ds} ds is more ticks than u32 holds at {} Hz",
+                        self.tick_rate_hz
+                    ),
+                )
+            })
+        };
+        let at_least_one_tick = |field: &str, ds: u32| -> Result<u32, Error> {
+            let t = ticks(field, ds)?;
+            if t == 0 {
+                return Err(Error::invalid(
+                    path,
+                    field,
+                    format!(
+                        "{ds} ds is 0 ticks at {} Hz; it must last at least one tick",
+                        self.tick_rate_hz
+                    ),
+                ));
+            }
+            Ok(t)
+        };
+        ticks("attrition_interval_ds", self.attrition_interval_ds)?;
+        let annexation = at_least_one_tick("annexation_ds", self.annexation_ds)?;
+        let cap = ticks("match_cap_ds", self.match_cap_ds)?;
+        if cap <= annexation {
+            return Err(Error::invalid(
+                path,
+                "match_cap_ds",
+                format!(
+                    "{} ds ({cap} ticks) must be longer than annexation_ds {} ({annexation} ticks)",
+                    self.match_cap_ds, self.annexation_ds
+                ),
+            ));
+        }
+        ticks("yield_cap_decay_after_ds", self.yield_cap_decay_after_ds)?;
+        at_least_one_tick("yield_cap_decay_every_ds", self.yield_cap_decay_every_ds)?;
+        if self.yield_cap_decay_step > self.yield_cap_base {
+            return Err(Error::invalid(
+                path,
+                "yield_cap_decay_step",
+                format!(
+                    "{} must be <= yield_cap_base {}",
+                    self.yield_cap_decay_step, self.yield_cap_base
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -1132,8 +1417,15 @@ impl Rules {
     /// nearest (half rounds up). This is the only seconds-to-ticks conversion
     /// in the codebase: `ticks = round(ds * tick_rate_hz / 10)`.
     pub fn ticks_from_ds(&self, ds: u32) -> u32 {
+        self.ticks_from_ds_checked(ds)
+            .expect("tick count fits in u32")
+    }
+
+    /// [`Rules::ticks_from_ds`], or `None` when the tick count does not fit
+    /// `u32`; the validator uses it on timers that have no tighter bound.
+    fn ticks_from_ds_checked(&self, ds: u32) -> Option<u32> {
         let scaled = u64::from(ds) * u64::from(self.tick_rate_hz);
-        u32::try_from((scaled + 5) / 10).expect("tick count fits in u32")
+        u32::try_from((scaled + 5) / 10).ok()
     }
 
     /// Attrition interval in ticks.
@@ -1144,6 +1436,54 @@ impl Rules {
     /// Annexation timer in ticks.
     pub fn annexation_ticks(&self) -> u32 {
         self.ticks_from_ds(self.annexation_ds)
+    }
+
+    /// Hit points one attrition pulse takes at age gap `gap` (the territory
+    /// owner's age minus the intruder's, at least 0) before the late
+    /// bonus: `attrition_age_gap_hp[min(gap, len - 1)]`, so the last entry
+    /// covers every larger gap.
+    pub fn attrition_pulse_hp(&self, gap: u8) -> u32 {
+        let last = self.attrition_age_gap_hp.len().saturating_sub(1);
+        self.attrition_age_gap_hp
+            .get(usize::from(gap).min(last))
+            .copied()
+            .expect("validated non-empty")
+    }
+
+    /// The index of `harrying_bonus_age` in `ages.ron`, or `None` for no
+    /// bonus. `Rules::load` checks that the id names an age.
+    pub fn harrying_bonus_age_index(&self) -> Option<u8> {
+        self.harrying_bonus_age
+            .as_deref()
+            .and_then(|a| self.age_index(a))
+    }
+
+    /// The match cap in ticks (54000 at 20 Hz): the step that reaches it
+    /// decides the match by territory.
+    pub fn match_cap_ticks(&self) -> u32 {
+        self.ticks_from_ds(self.match_cap_ds)
+    }
+
+    /// The radius within which a defender blocks a Town's annexation, in
+    /// hundredths of a tile, as [`Rules::acquire_reach`] (600 for 6 tiles).
+    pub fn annexation_defender_radius(&self) -> u32 {
+        self.annexation_defender_radius_tiles * 100
+    }
+
+    /// The Yield Cap decay's start and step period in ticks:
+    /// `(yield_cap_decay_after_ds, yield_cap_decay_every_ds)` converted. The
+    /// period is at least one tick in loaded data.
+    pub fn yield_cap_decay_ticks(&self) -> (u32, u32) {
+        (
+            self.ticks_from_ds(self.yield_cap_decay_after_ds),
+            self.ticks_from_ds(self.yield_cap_decay_every_ds),
+        )
+    }
+
+    /// How many techs count toward the ages' `techs_required`: every tech
+    /// except the side techs with `counts_toward_age: false` (Harrying).
+    pub fn counting_techs(&self) -> usize {
+        self.techs.iter().filter(|t| t.counts_toward_age).count()
     }
 
     /// Ticks between periodic repaths while a unit is moving.
@@ -1409,7 +1749,10 @@ mod tests {
             Some((6, Some(2)))
         );
         assert_eq!(rules.ages.len(), 3);
-        assert_eq!(rules.techs.len(), 12);
+        // The 12 Scriptorium techs count toward the ages; Harrying I and II
+        // (M5a) are side techs.
+        assert_eq!(rules.techs.len(), 14);
+        assert_eq!(rules.counting_techs(), 12);
         assert_eq!(rules.factions.len(), 1);
         assert!(rules.factions[0].modifiers.is_empty());
         assert_eq!(rules.yield_cap_base, 70);
@@ -1439,6 +1782,53 @@ mod tests {
         assert_eq!(rules.ticks_from_ds(32), 64);
         assert_eq!(rules.attrition_interval_ticks(), 64);
         assert_eq!(rules.annexation_ticks(), 1200);
+        // M5a: the attrition, annexation and match-end knobs.
+        assert_eq!(rules.supply_radius_tiles, 14);
+        assert_eq!(rules.attrition_age_gap_hp, [1, 2]);
+        assert_eq!(
+            (0..=3)
+                .map(|g| rules.attrition_pulse_hp(g))
+                .collect::<Vec<_>>(),
+            [1, 2, 2, 2],
+            "the last row covers every larger gap"
+        );
+        assert_eq!(rules.harrying_bonus_age_index(), Some(2));
+        assert_eq!(rules.harrying_bonus_hp, 0);
+        assert_eq!(
+            (
+                rules.annexation_adjacent_tiles,
+                rules.annexation_defender_radius_tiles,
+                rules.annexation_defender_radius(),
+                rules.annexation_town_hp_permille,
+            ),
+            (1, 6, 600, 250)
+        );
+        assert_eq!(
+            rules.annexation_attackers,
+            [
+                UnitSel::Class(UnitClass::Infantry),
+                UnitSel::Class(UnitClass::Cavalry)
+            ]
+        );
+        assert_eq!(rules.annexation_defenders, [UnitSel::Military]);
+        assert_eq!(rules.match_cap_ticks(), 54_000);
+        assert_eq!(rules.yield_cap_decay_ticks(), (36_000, 6000));
+        assert_eq!(rules.yield_cap_decay_step, 0, "off until M6");
+        let flags = |id: &str| {
+            let u = rules.unit_kind_by_id(id).unwrap();
+            (u.immune_to_attrition, u.supplies)
+        };
+        assert_eq!(
+            ["yeoman", "scribe", "skirmisher", "supply_wain"].map(flags),
+            [(false, false), (true, false), (false, false), (true, true)]
+        );
+        let stays: Vec<&str> = rules
+            .buildings
+            .iter()
+            .filter(|b| b.stays_on_annexation)
+            .map(|b| b.id.as_str())
+            .collect();
+        assert_eq!(stays, ["watchtower"]);
         assert_eq!(rules.repath_interval_ticks(), 60);
         assert_eq!(rules.separation_push_moving_div, 2);
         assert_eq!(rules.separation_push_idle_div, 8);
@@ -1484,12 +1874,37 @@ mod tests {
                 "trade_3",
                 "letters_1",
                 "letters_2",
-                "letters_3"
+                "letters_3",
+                "harrying_1",
+                "harrying_2"
             ]
         );
-        assert!(r.techs.iter().all(|t| t.host == "scriptorium"));
+        // Every tech that counts toward an age is a Scriptorium tech; the
+        // two side techs are the Watchtower's Harrying line (M5a).
+        assert!(
+            r.techs
+                .iter()
+                .filter(|t| t.counts_toward_age)
+                .all(|t| t.host == "scriptorium")
+        );
+        let side: Vec<(&str, &str, u8)> = r
+            .techs
+            .iter()
+            .filter(|t| !t.counts_toward_age)
+            .map(|t| (t.id.as_str(), t.host.as_str(), t.level))
+            .collect();
+        assert_eq!(
+            side,
+            [
+                ("harrying_1", "watchtower", 1),
+                ("harrying_2", "watchtower", 2)
+            ]
+        );
         assert_eq!(r.tech(11).unwrap().id, "letters_3");
-        assert!(r.tech(12).is_none());
+        assert_eq!(r.tech(12).unwrap().id, "harrying_1");
+        assert_eq!(r.tech(13).unwrap().id, "harrying_2");
+        assert!(r.tech(14).is_none());
+        assert_eq!(r.tech_predecessor(13), Some(12));
         assert_eq!(r.ages[2].unlocks.techs[3], "letters_3");
         assert_eq!(r.tech_by_id("trade_2").map(|(i, _)| i), Some(7));
         assert!(r.tech_by_id("trade_4").is_none());
@@ -1509,6 +1924,7 @@ mod tests {
             |id: &str| r.age_of_building(r.building_kind_by_id(id).unwrap().0),
         );
         assert_eq!((age("arms_1"), age("letters_2"), age("trade_3")), (0, 1, 2));
+        assert_eq!((age("harrying_1"), age("harrying_2")), (1, 2));
         assert_eq!(
             (unit("bowman"), unit("outrider"), unit("supply_wain")),
             (0, 1, 1)
@@ -2660,5 +3076,306 @@ mod tests {
             "cooldown_ds: 15, prefer: Buildings)),",
         );
         assert!(msg.contains("buildings[0].attack.prefer"), "{msg}");
+    }
+
+    /// The M5a fields of `rules.ron` that need no other file are range
+    /// checked, each error naming the field; the boundaries load.
+    #[test]
+    fn m5a_match_rules_are_range_checked() {
+        let base = Rules::load(data_dir()).unwrap();
+        let check = |set: &dyn Fn(&mut Rules)| {
+            let mut r = base.clone();
+            set(&mut r);
+            r.validate_match_rules(Path::new("x.ron"))
+                .map_err(|e| e.to_string())
+        };
+        let cases: [(&str, &str, &dyn Fn(&mut Rules)); 22] = [
+            ("supply_radius_tiles", "1..=64", &|r| {
+                r.supply_radius_tiles = 0
+            }),
+            ("supply_radius_tiles", "1..=64", &|r| {
+                r.supply_radius_tiles = MAX_SUPPLY_RADIUS_TILES + 1
+            }),
+            ("attrition_age_gap_hp", "gap 0", &|r| {
+                r.attrition_age_gap_hp.clear()
+            }),
+            ("attrition_age_gap_hp[0]", "1..=1000", &|r| {
+                r.attrition_age_gap_hp = vec![0, 2]
+            }),
+            ("attrition_age_gap_hp[1]", "never decreases", &|r| {
+                r.attrition_age_gap_hp = vec![2, 1]
+            }),
+            ("attrition_age_gap_hp[2]", "1..=1000", &|r| {
+                r.attrition_age_gap_hp = vec![1, 2, MAX_ATTRITION_HP + 1]
+            }),
+            ("harrying_bonus_age", "None", &|r| {
+                r.harrying_bonus_age = Some(String::new())
+            }),
+            ("harrying_bonus_hp", "0..=1000", &|r| {
+                r.harrying_bonus_hp = MAX_ATTRITION_HP + 1
+            }),
+            ("annexation_adjacent_tiles", "1..=4", &|r| {
+                r.annexation_adjacent_tiles = 0
+            }),
+            ("annexation_adjacent_tiles", "1..=4", &|r| {
+                r.annexation_adjacent_tiles = 5
+            }),
+            ("annexation_defender_radius_tiles", "1..=16", &|r| {
+                r.annexation_defender_radius_tiles = 0
+            }),
+            ("annexation_defender_radius_tiles", "1..=16", &|r| {
+                r.annexation_defender_radius_tiles = MAX_COMBAT_TILES + 1
+            }),
+            ("annexation_town_hp_permille", "0..=1000", &|r| {
+                r.annexation_town_hp_permille = 1001
+            }),
+            ("annexation_attackers", "at least one", &|r| {
+                r.annexation_attackers.clear()
+            }),
+            ("annexation_defenders", "at least one", &|r| {
+                r.annexation_defenders.clear()
+            }),
+            // At 4 Hz one decisecond is 0.4 ticks, which rounds to 0.
+            ("annexation_ds", "0 ticks", &|r| {
+                r.tick_rate_hz = 4;
+                r.annexation_ds = 1;
+            }),
+            ("match_cap_ds", "longer than annexation_ds", &|r| {
+                r.match_cap_ds = r.annexation_ds
+            }),
+            ("match_cap_ds", "more ticks than u32", &|r| {
+                r.tick_rate_hz = 1000;
+                r.match_cap_ds = u32::MAX;
+            }),
+            ("attrition_interval_ds", "more ticks than u32", &|r| {
+                r.tick_rate_hz = 1000;
+                r.attrition_interval_ds = u32::MAX;
+            }),
+            ("yield_cap_decay_after_ds", "more ticks than u32", &|r| {
+                r.tick_rate_hz = 1000;
+                r.yield_cap_decay_after_ds = u32::MAX;
+            }),
+            ("yield_cap_decay_every_ds", "0 ticks", &|r| {
+                r.yield_cap_decay_every_ds = 0
+            }),
+            ("yield_cap_decay_step", "yield_cap_base 70", &|r| {
+                r.yield_cap_decay_step = r.yield_cap_base + 1
+            }),
+        ];
+        for (field, words, set) in cases {
+            let err = check(set).unwrap_err();
+            assert!(
+                err.contains(&format!("x.ron: {field}: ")) && err.contains(words),
+                "{field}: {err}"
+            );
+        }
+        check(&|r| {
+            r.supply_radius_tiles = MAX_SUPPLY_RADIUS_TILES;
+            r.attrition_age_gap_hp = vec![1, 1, MAX_ATTRITION_HP];
+            r.harrying_bonus_hp = MAX_ATTRITION_HP;
+            r.annexation_adjacent_tiles = MAX_ANNEXATION_ADJACENT_TILES;
+            r.annexation_defender_radius_tiles = MAX_COMBAT_TILES;
+            r.annexation_town_hp_permille = 1000;
+            r.match_cap_ds = r.annexation_ds + 1;
+            r.yield_cap_decay_after_ds = 0;
+            r.yield_cap_decay_every_ds = 1;
+            r.yield_cap_decay_step = r.yield_cap_base;
+        })
+        .unwrap();
+        check(&|r| {
+            r.harrying_bonus_age = None;
+            r.annexation_town_hp_permille = 0;
+        })
+        .unwrap();
+    }
+
+    /// The M5a checks that need the other files name `rules.ron` (or
+    /// `buildings.ron` for the Town's flag) and the field.
+    #[test]
+    fn m5a_cross_file_checks_name_the_file_and_field() {
+        let msg = load_error_after_edit(
+            "m5a-bonus-age",
+            "rules/rules.ron",
+            r#"harrying_bonus_age: Some("charter"),"#,
+            r#"harrying_bonus_age: Some("bronze"),"#,
+        );
+        assert!(
+            msg.contains("rules/rules.ron: harrying_bonus_age: ") && msg.contains("bronze"),
+            "{msg}"
+        );
+        let attackers = "annexation_attackers: [Class(Infantry), Class(Cavalry)],";
+        let msg = load_error_after_edit(
+            "m5a-civilian-kind",
+            "rules/rules.ron",
+            attackers,
+            r#"annexation_attackers: [Class(Infantry), Kind("yeoman")],"#,
+        );
+        assert!(
+            msg.contains("rules/rules.ron: annexation_attackers[1]: ")
+                && msg.contains("\"yeoman\"")
+                && msg.contains("Civilian"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "m5a-civilian-class",
+            "rules/rules.ron",
+            attackers,
+            "annexation_attackers: [Class(Civilian)],",
+        );
+        assert!(
+            msg.contains("annexation_attackers[0]: ") && msg.contains("Civilian"),
+            "{msg}"
+        );
+        let msg = load_error_after_edit(
+            "m5a-unknown-defender",
+            "rules/rules.ron",
+            "annexation_defenders: [Military],",
+            r#"annexation_defenders: [Military, Kind("dragon")],"#,
+        );
+        assert!(
+            msg.contains("rules/rules.ron: annexation_defenders[1]: ") && msg.contains("dragon"),
+            "{msg}"
+        );
+        // Military never reaches a Civilian kind, so it may annex.
+        let r = loads_after_edits(
+            "m5a-military-attackers",
+            &[(
+                "rules/rules.ron",
+                attackers,
+                "annexation_attackers: [Military],",
+            )],
+        );
+        assert_eq!(r.annexation_attackers, [UnitSel::Military]);
+        // A selector list that reaches no kind (no Cavalry kind left).
+        let mut r = Rules::load(data_dir()).unwrap();
+        r.units.retain(|u| u.class != UnitClass::Cavalry);
+        r.annexation_attackers = vec![UnitSel::Class(UnitClass::Cavalry)];
+        let msg = r
+            .check_annexation_sets(Path::new("x.ron"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("x.ron: annexation_attackers: ") && msg.contains("selects no unit kind"),
+            "{msg}"
+        );
+        // The Town is what changes hands; it cannot stay.
+        let msg = load_error_after_edit(
+            "m5a-town-stays",
+            "rules/buildings.ron",
+            "town: true,",
+            "town: true,\n      stays_on_annexation: true,",
+        );
+        assert!(
+            msg.contains("rules/buildings.ron: buildings[0].stays_on_annexation: "),
+            "{msg}"
+        );
+    }
+
+    /// Harrying I and II count toward no age gate (M5a): the Charter Age's
+    /// reachable count is the 8 Scriptorium techs of the two ages before
+    /// it, not 9 with Harrying I. Marking Harrying I as counting makes 9
+    /// reachable, which shows the flag is what is read.
+    #[test]
+    fn harrying_techs_do_not_count_toward_age_gates() {
+        let r = Rules::load(data_dir()).unwrap();
+        assert_eq!((r.techs.len(), r.counting_techs()), (14, 12));
+        let nine = ("rules/ages.ron", "techs_required: 5,", "techs_required: 9,");
+        let msg = load_error_after_edits("h-gate-9", &[nine]);
+        assert!(
+            msg.contains("rules/ages.ron: ages[2].techs_required: ") && msg.contains("unlock 8"),
+            "{msg}"
+        );
+        let r = loads_after_edits(
+            "h-gate-9-counting",
+            &[
+                nine,
+                (
+                    "rules/techs.ron",
+                    "      counts_toward_age: false,",
+                    "      counts_toward_age: true,",
+                ),
+            ],
+        );
+        assert_eq!(r.ages[2].techs_required, 9);
+        assert_eq!(r.counting_techs(), 13);
+        // Each Harrying tech adds one level.
+        let level = |researched: &[u16]| {
+            modifiers::resolve(
+                0,
+                r.modifier_rows(0, researched.iter().copied())
+                    .filter(|m| m.target == StatPath::HarryingLevel),
+            )
+        };
+        assert_eq!(
+            (level(&[]), level(&[0, 9]), level(&[12]), level(&[12, 13])),
+            (0, 0, 1, 2)
+        );
+    }
+
+    /// The `HarryingLevel` rows of the techs and the faction may reach at
+    /// most level 8, and the attrition interval halved per level above 1
+    /// must stay at least one tick at the highest reachable level: 64
+    /// ticks allow level 7 (one tick) but not level 8.
+    #[test]
+    fn harrying_level_worst_case_bounds_the_level_and_the_interval() {
+        // Everything here is read from the repository data, so a data-only
+        // edit of `attrition_interval_ds` (the worked example in
+        // data/rules/README.md) moves the numbers instead of failing the
+        // test: the shipped Harrying rows' level, the interval in ticks and
+        // the first level at which it halves to 0.
+        let repo = Rules::load(data_dir()).unwrap();
+        let shipped: i32 = repo
+            .techs
+            .iter()
+            .flat_map(|t| &t.modifiers)
+            .chain(&repo.factions[0].modifiers)
+            .filter(|m| m.target == StatPath::HarryingLevel && m.op == ModOp::Add)
+            .map(|m| m.value)
+            .sum();
+        let interval = repo.attrition_interval_ticks();
+        // The first level whose halving `interval >> (level - 1)` is 0: one
+        // more than the interval's bit length.
+        let zero_at = 32 - interval.leading_zeros() + 1;
+        let max = i32::try_from(MAX_HARRYING_LEVEL).unwrap();
+        let harrying = |value: i32| {
+            move |f: &mut Factions| {
+                f.factions[0].modifiers.push(Modifier {
+                    target: StatPath::HarryingLevel,
+                    op: ModOp::Add,
+                    value,
+                });
+            }
+        };
+        let msg = load_error_with::<Factions>(
+            "h-level-9",
+            "rules/factions.ron",
+            harrying(max + 1 - shipped),
+        );
+        assert!(
+            msg.contains("rules/techs.ron")
+                && msg.contains("HarryingLevel")
+                && msg.contains(&format!("can reach {}", max + 1))
+                && msg.contains(&format!("<= {max}"))
+                && msg.contains("freeholders"),
+            "{msg}"
+        );
+        let zero_at = i32::try_from(zero_at).unwrap();
+        if zero_at <= max {
+            let msg = load_error_with::<Factions>(
+                "h-level-8",
+                "rules/factions.ron",
+                harrying(zero_at - shipped),
+            );
+            assert!(
+                msg.contains("rules/rules.ron: attrition_interval_ds: ")
+                    && msg.contains(&format!("{interval} ticks"))
+                    && msg.contains(&format!("level {zero_at}")),
+                "{msg}"
+            );
+        }
+        let top = zero_at.min(max + 1) - 1;
+        let r = loads_with::<Factions>("h-level-7", "rules/factions.ron", harrying(top - shipped));
+        let shift = u32::try_from(top - 1).unwrap();
+        assert!(r.attrition_interval_ticks().checked_shr(shift) >= Some(1));
     }
 }

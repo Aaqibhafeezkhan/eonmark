@@ -90,6 +90,24 @@ pub const VALID: Color = Color::srgb(0.435, 0.627, 0.416);
 /// Unaffordable or invalid placement (`docs/ART_STYLE.md`, #B04A3F).
 pub const INVALID: Color = Color::srgb(0.690, 0.290, 0.247);
 
+/// Attrition indicator (M5a): the flat diamond under a unit bleeding on
+/// enemy land, in the Yield Cap amber (#D29B3B), steady (nothing pulses,
+/// `docs/ART_STYLE.md`). No new hue.
+pub const ATTRITION: Color = HUD_AMBER;
+
+/// Supply radius ring (M5a) around a selected Supply Wain: Timber
+/// (#8B6B4A, `docs/ART_STYLE.md`, the Wain's own role colour).
+pub const SUPPLY_RING: Color = Color::srgb(0.545, 0.420, 0.290);
+
+/// Annexation timer track (M5a): the health bar's neutral dark grey
+/// (#3A3A3F) at 80 % alpha, under the attacker's team-coloured progress
+/// arc.
+pub const ANNEX_TRACK: Color = Color::srgba(0.227, 0.227, 0.247, 0.8);
+
+/// The outcome overlay's scrim (M5a): the HUD panel slate at 80 % alpha
+/// over the frozen world.
+pub const OUTCOME_SCRIM: Color = Color::srgba(0.16, 0.18, 0.20, 0.80);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -102,10 +102,27 @@ fn non_negative(v: i64) -> u32 {
 }
 
 /// `p`'s Yield Cap per capped resource per 30 s: `yield_cap_base` with the
-/// `YieldCap` rows (Trade), at least 0.
+/// `YieldCap` rows (Trade), less the late-game decay (M5a), at least 0.
+/// The decay is `yield_cap_decay_step` once `state.tick` reaches
+/// `yield_cap_decay_after_ds` and once more every
+/// `yield_cap_decay_every_ds` after that:
+/// `step * (1 + (tick - after) / every)`. It reads `state.tick`, so step
+/// 6d and `SimView::income` agree. The shipped step is 0 (off).
 pub(crate) fn yield_cap(state: &State, rules: &Rules, p: PlayerId) -> u32 {
     let base = i64::from(rules.yield_cap_base);
-    non_negative(stat(state, rules, p, &StatPath::YieldCap, base))
+    let cap = stat(state, rules, p, &StatPath::YieldCap, base);
+    non_negative(cap.saturating_sub(yield_cap_decay(rules, state.tick)))
+}
+
+/// The late-game Yield Cap decay at `tick` (see [`yield_cap`]): 0 before
+/// `yield_cap_decay_after_ds` and whenever `yield_cap_decay_step` is 0.
+pub(crate) fn yield_cap_decay(rules: &Rules, tick: u32) -> i64 {
+    let (after, every) = rules.yield_cap_decay_ticks();
+    if rules.yield_cap_decay_step == 0 || tick < after {
+        return 0;
+    }
+    let steps = 1 + i64::from((tick - after) / every.max(1));
+    i64::from(rules.yield_cap_decay_step).saturating_mul(steps)
 }
 
 /// `p`'s population cap: `pop_cap_base` with the `PopCap` rows (Arms), at
@@ -276,7 +293,9 @@ pub(crate) fn has_required_tech(
 /// anything. Checks, first failure wins:
 ///
 /// 1. the building is `p`'s (`UnknownBuilding`)
-/// 2. and complete (`UnderConstruction`);
+/// 2. and complete (`UnderConstruction`)
+///    and not a Town whose annexation timer runs (`TownContested`, M5a; no
+///    tech is hosted by a Town in the shipped data);
 /// 3. the tech exists (`UnknownTech`);
 /// 4. the building's kind is the tech's `host` (`CannotResearchHere`);
 /// 5. the level below it in its line is researched (`PrerequisiteMissing`);
@@ -301,6 +320,9 @@ pub(crate) fn validate_research(
         .ok_or(RejectReason::UnknownBuilding)?;
     if b.construction != Construction::Complete {
         return Err(RejectReason::UnderConstruction);
+    }
+    if crate::annexation::is_contested(b) {
+        return Err(RejectReason::TownContested);
     }
     let t = rules.tech(tech.0).ok_or(RejectReason::UnknownTech)?;
     if building_kind(rules, b.kind).id != t.host {
@@ -355,12 +377,28 @@ pub(crate) fn enqueue_research(
         });
 }
 
+/// How many of `p`'s completed techs count toward an age's
+/// `techs_required`: every researched tech whose `counts_toward_age` is set
+/// (M5a; the Harrying side techs count toward no age). Queued research is
+/// not completed and does not count.
+pub(crate) fn age_tech_count(state: &State, rules: &Rules, p: PlayerId) -> u32 {
+    let n = state
+        .tech
+        .player(p)
+        .researched
+        .iter()
+        .filter(|t| rules.tech(t.0).is_some_and(|d| d.counts_toward_age))
+        .count();
+    u32::try_from(n).expect("at most u16::MAX techs")
+}
+
 /// Validate `AdvanceAge { player: named }` from `p` without changing
 /// anything. Checks, first failure wins: `named` is `p`
 /// (`PlayerMismatch`); `p` is not in the last age (`FinalAge`); `p` has
-/// completed the next age's `techs_required` techs, queued ones not
-/// counting (`NotEnoughTechs`); `p` can pay its cost (`CannotAfford`,
-/// first short resource). Returns the cost.
+/// completed the next age's `techs_required` techs that count toward an
+/// age ([`age_tech_count`]; queued ones and the Harrying side techs do not
+/// count) (`NotEnoughTechs`); `p` can pay its cost (`CannotAfford`, first
+/// short resource). Returns the cost.
 pub(crate) fn validate_advance(
     state: &State,
     rules: &Rules,
@@ -375,8 +413,7 @@ pub(crate) fn validate_advance(
         .ages
         .get(usize::from(mine.age) + 1)
         .ok_or(RejectReason::FinalAge)?;
-    let done = u32::try_from(mine.researched.len()).expect("at most u16::MAX techs");
-    if done < next.techs_required {
+    if age_tech_count(state, rules, p) < next.techs_required {
         return Err(RejectReason::NotEnoughTechs);
     }
     let cost = rules.amounts(&next.cost);

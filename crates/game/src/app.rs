@@ -74,7 +74,9 @@ pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputS
 /// rows; `enemy_outpost` and `enemy_outpost_walkthrough` open on their
 /// 200 vs 200 prologue east of the river at 55 m, which puts all 400 units
 /// on screen between the HUD bars (ROADMAP M4b acceptance line 2 measures
-/// that fight; the player pans home, Period jumps to an idle Yeoman).
+/// that fight; the player pans home, Period jumps to an idle Yeoman);
+/// `capture_seat` (M5a) opens at 40 m over the ring of P1's Seat, where
+/// the Mangonels, the Skirmishers' posts and the annexation timer are.
 /// Every other scenario, and a skirmish, starts over the local player's
 /// first units (`present::focus_camera_on_first_units`).
 pub fn default_framing(scenario: Option<&str>) -> Option<CameraStart> {
@@ -88,6 +90,11 @@ pub fn default_framing(scenario: Option<&str>) -> Option<CameraStart> {
             x: 106.0,
             y: 32.0,
             zoom: 55.0,
+        }),
+        "capture_seat" => Some(CameraStart {
+            x: 100.0,
+            y: 64.0,
+            zoom: 40.0,
         }),
         _ => None,
     }
@@ -251,6 +258,12 @@ pub fn run(cli: &Cli) -> AppExit {
         OrdersPlugin,
         HudPlugin { hud_click_check },
     ));
+    // M5a: the attrition indicator, supply ring, annexation timer and
+    // readout, and the outcome overlay over the frozen world.
+    app.add_plugins((
+        crate::markers::MarkersPlugin,
+        crate::outcome::OutcomeOverlayPlugin,
+    ));
 
     // Presentation only: frames and selects the walkthrough's beats.
     if let Some(beats) = director_beats {
@@ -397,11 +410,11 @@ fn limit_frame_rate(limiter: Res<FrameLimiter>, mut deadline: Local<Option<Insta
 
 /// `--screenshot-at`: captures still to take, as `(tick, path)`.
 #[derive(Resource, Debug, Default)]
-struct TickScreenshots(Vec<(u32, std::path::PathBuf)>);
+pub(crate) struct TickScreenshots(Vec<(u32, std::path::PathBuf)>);
 
 /// Capture the primary window for every `--screenshot-at` whose tick the
 /// sim has reached (the PNG lands a frame or two later).
-fn take_tick_screenshots(
+pub(crate) fn take_tick_screenshots(
     sim: NonSend<crate::sim_driver::SimHandle>,
     mut shots: ResMut<TickScreenshots>,
     mut commands: Commands,
@@ -507,16 +520,58 @@ mod tests {
             (framing.y - (min_y + max_y) / 2.0).abs() <= 1.0,
             "{min_y}..{max_y}"
         );
-        // Nothing else is framed by default but the enemy_outpost pair.
+        // Nothing else is framed by default but the enemy_outpost pair and
+        // capture_seat (`capture_seat_is_framed_on_the_seats_ring`).
         for name in scenarios::NAMES.iter().filter(|n| {
             !matches!(
                 **n,
-                "unit_looks" | "enemy_outpost" | "enemy_outpost_walkthrough"
+                "unit_looks" | "enemy_outpost" | "enemy_outpost_walkthrough" | "capture_seat"
             )
         }) {
             assert_eq!(default_framing(Some(name)), None, "{name}");
         }
         assert_eq!(default_framing(None), None);
+    }
+
+    /// The camera `camera.rs` spawns (40 degree vertical fov) at
+    /// `framing`, looking at a 1280 x 800 window, and the part of that
+    /// window between the HUD's bottom bar and the age strip under its top
+    /// bar.
+    fn framed_camera(framing: CameraStart) -> (Camera, GlobalTransform, Rect) {
+        use crate::camera::RtsCamera;
+        use crate::hud::{BOTTOM_BAR_HEIGHT_PX, TOP_BAR_HEIGHT_PX};
+        let rts = RtsCamera {
+            focus: Vec3::new(
+                framing.x - crate::ground::HALF_EXTENT,
+                0.0,
+                framing.y - crate::ground::HALF_EXTENT,
+            ),
+            zoom: framing.zoom,
+            zoom_target: framing.zoom,
+        };
+        let transform = GlobalTransform::from(
+            Transform::from_translation(rts.eye()).looking_at(rts.focus, Vec3::Y),
+        );
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(bevy::camera::RenderTargetInfo {
+            physical_size: UVec2::new(WINDOW_SIZE.0, WINDOW_SIZE.1),
+            scale_factor: 1.0,
+        });
+        let projection = Projection::Perspective(PerspectiveProjection {
+            fov: 40.0_f32.to_radians(),
+            near: 0.5,
+            far: 400.0,
+            aspect_ratio: WINDOW_SIZE.0 as f32 / WINDOW_SIZE.1 as f32,
+            ..default()
+        });
+        camera.computed.clip_from_view = projection.get_clip_from_view();
+        let visible = Rect::new(
+            0.0,
+            TOP_BAR_HEIGHT_PX + crate::age_hud::AGE_STRIP_HEIGHT_PX,
+            WINDOW_SIZE.0 as f32,
+            WINDOW_SIZE.1 as f32 - BOTTOM_BAR_HEIGHT_PX,
+        );
+        (camera, transform, visible)
     }
 
     /// Both `enemy_outpost` scenarios open on their prologue: at tick 3
@@ -526,8 +581,7 @@ mod tests {
     /// framing.
     #[test]
     fn enemy_outpost_is_framed_on_its_prologue_battle() {
-        use crate::camera::{RtsCamera, ZOOM_MAX, ZOOM_MIN};
-        use crate::hud::{BOTTOM_BAR_HEIGHT_PX, TOP_BAR_HEIGHT_PX};
+        use crate::camera::{ZOOM_MAX, ZOOM_MIN};
         struct NoAi;
         impl sim::AiController for NoAi {
             fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
@@ -561,39 +615,7 @@ mod tests {
         assert!((framing.x - mid(|c| c.0)).abs() <= 1.0, "{framing:?}");
         assert!((framing.y - mid(|c| c.1)).abs() <= 1.0, "{framing:?}");
 
-        // The camera `camera.rs` spawns (40 degree vertical fov) at this
-        // framing, looking at a 1280 x 800 window.
-        let rts = RtsCamera {
-            focus: Vec3::new(
-                framing.x - crate::ground::HALF_EXTENT,
-                0.0,
-                framing.y - crate::ground::HALF_EXTENT,
-            ),
-            zoom: framing.zoom,
-            zoom_target: framing.zoom,
-        };
-        let transform = GlobalTransform::from(
-            Transform::from_translation(rts.eye()).looking_at(rts.focus, Vec3::Y),
-        );
-        let mut camera = Camera::default();
-        camera.computed.target_info = Some(bevy::camera::RenderTargetInfo {
-            physical_size: UVec2::new(WINDOW_SIZE.0, WINDOW_SIZE.1),
-            scale_factor: 1.0,
-        });
-        let projection = Projection::Perspective(PerspectiveProjection {
-            fov: 40.0_f32.to_radians(),
-            near: 0.5,
-            far: 400.0,
-            aspect_ratio: WINDOW_SIZE.0 as f32 / WINDOW_SIZE.1 as f32,
-            ..default()
-        });
-        camera.computed.clip_from_view = projection.get_clip_from_view();
-        let visible = Rect::new(
-            0.0,
-            TOP_BAR_HEIGHT_PX + crate::age_hud::AGE_STRIP_HEIGHT_PX,
-            WINDOW_SIZE.0 as f32,
-            WINDOW_SIZE.1 as f32 - BOTTOM_BAR_HEIGHT_PX,
-        );
+        let (camera, transform, visible) = framed_camera(framing);
         for name in ["enemy_outpost", "enemy_outpost_walkthrough"] {
             let (setup, stream, _) = scenarios::by_name(name, &rules).unwrap();
             let mut sim = sim::Sim::new(setup, rules.clone(), Box::new(NoAi));
@@ -611,6 +633,52 @@ mod tests {
                 let at = camera.world_to_viewport(&transform, p).expect("in front");
                 assert!(visible.contains(at), "{name}: {p} at {at} is off screen");
             }
+        }
+    }
+
+    /// `capture_seat` opens at 40 m on its Seat from the west: at tick
+    /// 300, when the Mangonels have stopped in range and the Skirmishers
+    /// are told to walk to the ring, the Mangonels, every ring post and the
+    /// whole Seat with its annexation timer's circle project inside the
+    /// window between the HUD bars.
+    #[test]
+    fn capture_seat_is_framed_on_the_seats_ring() {
+        struct NoAi;
+        impl sim::AiController for NoAi {
+            fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
+                Vec::new()
+            }
+        }
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let framing = default_framing(Some("capture_seat")).expect("framed");
+        assert_eq!(framing.zoom, 40.0);
+        let (camera, transform, visible) = framed_camera(framing);
+        let (setup, stream, _) = scenarios::by_name("capture_seat", &rules).unwrap();
+        let mut sim = sim::Sim::new(setup, rules.clone(), Box::new(NoAi));
+        for t in 0..scenarios::CAPTURE_SEAT_MOVE_TICK {
+            sim.step(scenarios::commands_at(&stream, t));
+        }
+        let view = sim.view();
+        let on_screen = |p: Vec3, what: &str| {
+            let at = camera.world_to_viewport(&transform, p).expect("in front");
+            assert!(visible.contains(at), "{what}: {p} at {at} is off screen");
+        };
+        for id in 11..=14 {
+            let u = view.unit(sim::UnitId(id)).expect("a Mangonel");
+            on_screen(crate::present::world_from_sim(u.pos, 0.0), "Mangonel");
+        }
+        for tile in scenarios::CAPTURE_SEAT_RING {
+            on_screen(
+                crate::present::world_from_sim(view.map().center_of(tile), 0.0),
+                "ring post",
+            );
+        }
+        let seat = view.building(sim::BuildingId(2)).expect("P1's Seat");
+        let (centre, radius) = crate::markers::annex_ring(&rules, seat);
+        for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            on_screen(centre + Vec3::new(dx, 0.0, dz) * radius, "timer circle");
         }
     }
 

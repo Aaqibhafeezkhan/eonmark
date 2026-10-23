@@ -7,8 +7,9 @@
 //!
 //! A value may hold placeholders in braces, filled by [`fill`]: `{resource}`,
 //! `{unit}`, `{building}`, `{cost}`, `{used}`, `{cap}`, `{count}`,
-//! `{rate}`, `{name}`, `{key}`. Any other brace is an error, so a typo in a
-//! placeholder fails `data-check` instead of reaching the screen.
+//! `{rate}`, `{name}`, `{key}`, and from M5a `{time}` (a match time such as
+//! "12:30") and `{hash}` (a state hash). Any other brace is an error, so a
+//! typo in a placeholder fails `data-check` instead of reaching the screen.
 
 use crate::{Error, load_ron};
 use serde::Deserialize;
@@ -16,8 +17,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Placeholders a string may contain.
-pub const PLACEHOLDERS: [&str; 10] = [
-    "resource", "unit", "building", "cost", "used", "cap", "count", "rate", "name", "key",
+pub const PLACEHOLDERS: [&str; 12] = [
+    "resource", "unit", "building", "cost", "used", "cap", "count", "rate", "name", "key", "time",
+    "hash",
 ];
 
 /// The UI strings for one language.
@@ -144,6 +146,8 @@ mod tests {
         assert!(check_placeholders("Not enough {resource}").is_ok());
         assert!(check_placeholders("{used} / {cap}").is_ok());
         assert!(check_placeholders("plain").is_ok());
+        assert!(check_placeholders("{time}, tick {count}").is_ok());
+        assert!(check_placeholders("Final hash {hash}").is_ok());
         assert!(check_placeholders("Not enough {amount}").is_err());
         assert!(check_placeholders("open { brace").is_err());
         assert!(check_placeholders("close } brace").is_err());

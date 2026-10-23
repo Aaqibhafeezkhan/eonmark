@@ -18,27 +18,61 @@ in a game that runs and a command that proves it.
 
 The repository was planned and scaffolded on 2026-10-05 with AI assistance.
 M0, M1, M2, M3a and M3b are merged (M3a as PR #26, M3b as PR #31). M4a, the
-simulation half of tech, ages and combat, is merged as PR #35 at
-`SIM_VERSION` 14 and `rules_version` 16.
+simulation half of tech, ages and combat, is merged as PR #35, and M4b, its
+game half, as PR #38 (unit looks, health bars, attack orders, the research
+panel, the age strip and the `enemy_outpost` scenarios; its line 2 waits
+for the dev Mac).
 
-M4b, the game half, is on PR #38 at `SIM_VERSION` 14 and
-`rules_version` 17 (the bump is the unit looks: `data/visuals.ron` is in
-`rules_hash`), with eight golden fixtures. It adds a low-poly look per unit
-kind, health bars as flat top-level entities with a dev-only hierarchy
-check, right-click Attack and attack-move feedback, the research panel on
-the Scriptorium's card, the age strip with the Advance button, notices on
-the message line, the `enemy_outpost` scenarios (a 200 vs 200 prologue,
-then a lone Watchtower) with the `enemy_outpost_walkthrough` golden, the
-walkthrough's camera director and the fight-window line in `frame_stats`.
-Its acceptance line 1 is ticked on Linux evidence (the scripted golden, and
-`scripts/m4b_outpost_drive.sh` playing the whole sequence on the interactive
-scenario with real X input, its replay verifying); line 2 (>= 60 fps at
-200 vs 200 on `cargo run --release`) needs the dev Mac and is open, with its
-Linux lavapipe proxy recorded in `docs/BUILD_TIMES.md` and `docs/PLAYTEST.md`.
-Issues filed at the close: #39 (the ROADMAP's 'units lost by kind' good
-first issue), #40 (`sim-cli`: print units lost by kind per player for a
-replay), #41 (per-slot queue Cancel buttons) and #42 (the infinite-queue
-toggle, needs-design).
+M5a, attrition, supply, annexation and victory, is closed on PR #43 at
+`SIM_VERSION` 16 and `rules_version` 20, with ten golden fixtures: all
+three of its acceptance lines are ticked there with pasted output, observed
+on a Linux VM (line 3 under Xvfb with lavapipe, the M3b and M4b precedent),
+and it is done once that PR merges. The
+owner answered the 15 questions of its implementation plan on 2026-10-22
+by taking every default; the decisions are numbered in the ROADMAP's M5a
+Notes. What M5a built, in five slices:
+
+- Rules data (`rules_version` 18): the Watchtower's Harrying I and II as
+  side techs that count toward no age, the attrition, annexation and
+  match-end knobs, and their validators.
+- Attrition (`SIM_VERSION` 15, `rules_version` 19):
+  `crates/sim/src/attrition.rs`, step 5b' between movement and combat
+  resolution, the hashed `Unit::exposed_ticks`, the per-step supply grid of
+  Supply Wain tiles, `Command::DebugDamage`, and the `attrition_*` tests of
+  line 1 (`cargo test -p sim attrition`).
+- Annexation and the outcome (`SIM_VERSION` 16, `rules_version` 20):
+  `crates/sim/src/annexation.rs` (step 5d: the timer of a Town at 0 HP, its
+  neutral land, the flip) and `crates/sim/src/victory.rs` (step 6e:
+  Surrender, Seat captured, all Towns lost, the 45-minute territory cap),
+  the hashed `TownState::hold` and `State::outcome`, `TownContested`, the
+  annex-hold guard rule, the Yield Cap decay knob (off), the
+  `capture_seat` and `stalemate_45min` goldens and the `annexation_*`
+  tests of line 2 (`cargo test -p sim annexation`, the 54000-step
+  stalemate included and not ignored).
+- The game half (no bump): the live game freezes at the outcome after
+  finishing its replay in the deciding step and printing an `outcome:`
+  line; the outcome overlay shows Victory, Defeat or Draw with the reason,
+  the time, the final hash and the replay's name
+  (`crates/game/src/outcome.rs`); `crates/game/src/markers.rs` draws the
+  attrition indicator, the supply ring on a selected Supply Wain and the
+  annexation timer with its readout; `just m5a-checks`
+  (`scripts/m5a_checks.sh`, local only under decision 14) is line 3's
+  proxy.
+- The bench and the close (no bump): `sim-cli bench --units 400 --ticks
+  1200 --combat --harrying`, the M4a battle with attrition on, adds about
+  0.05 ms to the plain battle's 0.50 ms mean step on the Linux VM
+  (`docs/BUILD_TIMES.md`), and the measurements of the close.
+
+The M5a good first issues are filed: #44 (the attrition table row for age
+gap 2 and a test, the ROADMAP's), #45 (a test that a Statecraft level
+researched mid-timer pushes the neutral kernel and the field equals
+`recomputed()`) and #46 (`sim-cli data-check --verbose` printing the pulse
+table and the Harrying intervals).
+
+Next is M5b, the first complete skirmish opponent and the first playable
+match (the Standard bot, `sim-cli play-bots`, the `m5_first_match` fixture
+and New Game). Its implementation plan is being written; it starts once the
+plan's open questions are answered.
 
 Open owner checks on the dev Mac, batched into one session under the owner's
 decision 3 in the ROADMAP's M4b Notes (an exception to rule 1 in
@@ -58,51 +92,16 @@ The exact commands are in `docs/PLAYTEST.md`, "Owner's Mac checklist (M4b)":
   verifying its replay, the M4b controls checklist, the unit looks' 40 m
   sign-off with the P3 and sRGB check, and `--scenario hud_click` (it fails
   under lavapipe, issue #33).
+- M5a: line 3's command and `just m5a-checks` on Metal (nothing of the game
+  half has been drawn by Metal yet: the overlay, its scrim, the 3 px
+  annexation arc; the script's 150 s default is unconfirmed there), the
+  M5a controls checklist (the overlay blocking world clicks is an owner
+  row), and the re-measures of `bench --combat --harrying` against
+  `--combat` and of `cargo test -p sim`, which now runs the 54000-step
+  stalemate and was 9.4 to 10.0 s warm on the Linux VM at the close.
 
-Next is M5a, the simulation half of attrition, supply, annexation and
-victory. The owner answered the 15 open questions of its implementation
-plan on 2026-10-22, taking the plan's default on every one. Until M5a
-starts this list is their only record in the repository; they are then
-copied into the ROADMAP's M5a Notes with these numbers, as M4a's and M4b's
-were:
-
-1. An exact territory tie at tick 54000 is `Outcome::Draw` (M5b's CSV
-   writes `draw`).
-2. A Town flips at 0 HP, and its HP is then set to
-   `annexation_town_hp_permille: 250` of its kind's maximum:
-   floor(2000 * 250 / 1000) = 500.
-3. At a flip, the queue entries of each transferred building are refunded
-   to the old owner, clamped like `Cancel`; each transferred site has its
-   `paid` set to 0, with no refund.
-4. Every building and site attributed to the Town transfers to the
-   attacker, Muster Halls and Engine Yards included. Only
-   `stays_on_annexation` kinds stay with the old owner: the Watchtower,
-   complete or a site, re-attributed to the old owner's nearest
-   uncontested Town, or to none.
-5. A contested Town pauses its queue and rejects new Train and Research.
-6. The annex-hold guard rule is on: adjacent Infantry and Cavalry at an
-   enemy Town at 0 HP hit only targets already in range and never chase.
-7. Only complete Towns count for "owns no Towns", checked at the flip.
-8. A flip may exceed the town limit; only new Town sites are gated.
-9. Starting data: attrition at age gap 1 is 2 HP per pulse; Harrying I
-   costs 75 Ore + 100 Lore and takes 40 s, Harrying II 150 Ore + 200 Lore
-   and 60 s; the Charter Age Harrying bonus is 0 until M6; the Yield Cap
-   decay is implemented with step 0 (off).
-10. Supply hatching in the field texture's A channel waits for M7, with
-    fog; M5a ships the selection ring.
-11. Yeomen are exposed to attrition.
-12. Annexation attackers are Infantry and Cavalry; defenders are every
-    non-Civilian kind, the Supply Wain and the Mangonel included.
-13. The Seat flag stays on the building after capture.
-14. `just m5a-checks` stays a local, PR-pasted proxy, not in CI's
-    game-linux job.
-15. The local m1 proptest cases may be lowered if `cargo test -p sim` goes
-    over 10 s on the dev Mac; CI keeps 256.
-
-Under the owner's M4b decision 3, M5a may start while M4b's line 2 waits
-for that Mac session, as M3b's fps line does. A milestone is done when
-every acceptance checkbox in `docs/ROADMAP.md` is ticked with pasted
-command output in a merged PR.
+A milestone is done when every acceptance checkbox in `docs/ROADMAP.md` is
+ticked with pasted command output in a merged PR.
 
 | Area | Where | Status |
 | --- | --- | --- |
@@ -111,8 +110,8 @@ command output in a merged PR.
 | Architecture and invariants | `docs/ARCHITECTURE.md`, `docs/DETERMINISM.md`, `docs/DATA_FORMAT.md` | Complete |
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
-| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b (PR #38) adds the `enemy_outpost` scenarios, their golden and `SimView::building_hp`; next, M5a (attrition, supply, annexation, victory); `crates/ai` holds the M0 bots until M5b |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b on PR #38 (line 1 ticked; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window |
+| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a closed on PR #43, done when it merges (attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); `crates/ai` holds the M0 bots until M5b |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a's game half on PR #43: the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout |
 | CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order

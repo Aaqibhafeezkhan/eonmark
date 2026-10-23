@@ -6,7 +6,9 @@
 //! Hashed state lives on the units and buildings: `Unit::damage_taken`,
 //! `ready_at`, `target` and `intent`, and `Building::hp` and `ready_at`.
 //! Nothing else carries over between ticks: `Stats` and `Plan` are
-//! rebuilt inside every step, so a restore has nothing to rebuild.
+//! rebuilt inside every step, and the rules-only `CombatTables` that
+//! `Stats` borrows are derived from the rules alone (built in `Sim::new`
+//! and `Sim::rebuild_derived`), so a restore has nothing else to rebuild.
 //!
 //! Each tick, inside step 5 of `Sim::step`:
 //!
@@ -65,7 +67,11 @@
 //!     weapon range. The unit then holds or chases its target directly; an
 //!     attack-mover keeps its order meanwhile (it is not followed) and
 //!     resumes it when the fight is over, and a guard keeps its post and
-//!     walks back to it afterwards.
+//!     walks back to it afterwards. The annex-hold guard rule (M5a): a
+//!     guard whose kind `annexation_attackers` selects, standing within
+//!     `annexation_adjacent_tiles` of an enemy complete Town at 0 HP, keeps
+//!     and takes only targets in weapon range, so it holds and never chases
+//!     off the ring it annexes from.
 //!   - A shooter: a complete building with an `attack` (the Watchtower and
 //!     the Town) and hit points left, whose cooldown has run out, aims at
 //!     the nearest enemy unit whose edge is within its range of the
@@ -73,14 +79,16 @@
 //!     in `UnitId` order). Shooters fire at units only and keep no target:
 //!     the aim lasts the tick.
 //! - 5b `movement::step` takes the engagements: a holding unit stands and
-//!   faces its target, a chasing one steers straight at it.
+//!   faces its target, a chasing one steers straight at it. Then 5b'
+//!   (`attrition::step`, M5a) adds the attrition pulses to `damage_taken`.
 //! - 5c `resolve`: every attacker whose target is still valid and in
 //!   weapon range from the post-movement positions, and whose cooldown has
 //!   run out, hits, in `UnitId` order, then every shooter whose aim is
 //!   still in range, in `BuildingId` order; the hits are summed per target
-//!   and applied at once, so a unit killed this tick still lands its own
-//!   and a lower id has no first strike. Then `reap` removes the dead and
-//!   the destroyed.
+//!   and applied at once through `apply_damage`, so a unit killed this
+//!   tick (by a hit or a pulse) still lands its own and a lower id has no
+//!   first strike. Then `reap` removes the dead, attrition's included, and
+//!   the destroyed, also those `Command::DebugDamage` dealt in step 3.
 //!
 //! Range is measured edge to edge: a unit is in range of a unit target when
 //! `dist_sq_i64(a, t) <= (range + r_a + r_t)^2`, and of a building when the
@@ -168,14 +176,14 @@ struct ShooterStats {
     cooldown_ticks: u32,
 }
 
-/// Every player's [`UnitStats`] per kind, the counter table and the
-/// shooters, built once at the start of step 5 and read by `think` and
-/// `resolve`. Research completes in step 6b, so the table holds for the
-/// whole of step 5.
-pub(crate) struct Stats {
+/// The rules-only combat tables: the counter table, each kind's
+/// preference, the largest unit radius, the shooters and the variance.
+/// They depend on the rules alone, so the sim builds them once, in
+/// `Sim::new`, and again in `Sim::rebuild_derived` (derived state, never
+/// hashed or snapshotted), instead of in every step; [`Stats`] borrows
+/// them.
+pub(crate) struct CombatTables {
     kinds: usize,
-    /// `[player * kinds + kind]`.
-    units: Vec<UnitStats>,
     /// Permille, `[attacker * kinds + defender]`.
     counters: Vec<i64>,
     /// Permille against any building, `[attacker]`.
@@ -191,17 +199,10 @@ pub(crate) struct Stats {
     variance: i64,
 }
 
-impl Stats {
-    /// Resolve every player's stats for every kind.
-    pub(crate) fn new(state: &State, rules: &Rules) -> Stats {
+impl CombatTables {
+    /// Build the tables from the rules.
+    pub(crate) fn new(rules: &Rules) -> CombatTables {
         let kinds = rules.units.len();
-        let kind_id = |k: usize| UnitKindId(u16::try_from(k).expect("validated unit count"));
-        let mut units = Vec::with_capacity(state.players.len() * kinds);
-        for p in &state.players {
-            for k in 0..kinds {
-                units.push(unit_stats(state, rules, p.id, kind_id(k)));
-            }
-        }
         let mut counters = Vec::with_capacity(kinds * kinds);
         let mut vs_buildings = Vec::with_capacity(kinds);
         for a in &rules.units {
@@ -235,9 +236,8 @@ impl Stats {
                 })
             })
             .collect();
-        Stats {
+        CombatTables {
             kinds,
-            units,
             counters,
             vs_buildings,
             prefer,
@@ -246,27 +246,67 @@ impl Stats {
             variance: i64::from(rules.damage_variance_permille),
         }
     }
+}
+
+/// Every player's [`UnitStats`] per kind, with the rules-only
+/// [`CombatTables`], built at the start of step 5 and read by `think` and
+/// `resolve`. Research completes in step 6b, so the table holds for the
+/// whole of step 5.
+pub(crate) struct Stats<'a> {
+    tables: &'a CombatTables,
+    /// `[player * kinds + kind]`.
+    units: Vec<UnitStats>,
+}
+
+impl<'a> Stats<'a> {
+    /// Resolve every player's stats for every kind.
+    pub(crate) fn new(state: &State, rules: &Rules, tables: &'a CombatTables) -> Stats<'a> {
+        let kinds = tables.kinds;
+        let kind_id = |k: usize| UnitKindId(u16::try_from(k).expect("validated unit count"));
+        let mut units = Vec::with_capacity(state.players.len() * kinds);
+        for p in &state.players {
+            for k in 0..kinds {
+                units.push(unit_stats(state, rules, p.id, kind_id(k)));
+            }
+        }
+        Stats { tables, units }
+    }
 
     /// Player `p`'s stats for `kind`.
     pub(crate) fn unit(&self, p: PlayerId, kind: UnitKindId) -> &UnitStats {
-        &self.units[usize::from(p.0) * self.kinds + usize::from(kind.0)]
+        &self.units[usize::from(p.0) * self.tables.kinds + usize::from(kind.0)]
     }
 
     fn counter(&self, attacker: UnitKindId, defender: UnitKindId) -> i64 {
-        self.counters[usize::from(attacker.0) * self.kinds + usize::from(defender.0)]
+        self.tables.counters[usize::from(attacker.0) * self.tables.kinds + usize::from(defender.0)]
+    }
+
+    /// Permille of `attacker`'s hits against any building.
+    fn vs_buildings(&self, attacker: UnitKindId) -> i64 {
+        self.tables.vs_buildings[usize::from(attacker.0)]
+    }
+
+    /// The largest radius of any unit kind.
+    fn max_radius(&self) -> Fx {
+        self.tables.max_radius
+    }
+
+    /// `damage_variance_permille`.
+    fn variance(&self) -> i64 {
+        self.tables.variance
     }
 
     /// The tier of a target, a building or a unit, for an attacker of
     /// `kind`: 0 is taken first (enemy units, or enemy buildings for a kind
     /// with `prefer: Buildings`).
     fn tier(&self, kind: UnitKindId, building: bool) -> u8 {
-        let buildings_first = self.prefer[usize::from(kind.0)] == Prefer::Buildings;
+        let buildings_first = self.tables.prefer[usize::from(kind.0)] == Prefer::Buildings;
         u8::from(building != buildings_first)
     }
 
     /// The shot of building kind `kind`, if it shoots.
     fn shooter(&self, kind: BuildingKindId) -> Option<ShooterStats> {
-        self.shooters[usize::from(kind.0)]
+        self.tables.shooters[usize::from(kind.0)]
     }
 }
 
@@ -656,7 +696,7 @@ pub(crate) fn think(
     state: &mut State,
     rules: &Rules,
     grid: &SpatialGrid,
-    stats: &Stats,
+    stats: &Stats<'_>,
     tick: u32,
 ) -> Plan {
     let mut plan = Plan::default();
@@ -672,6 +712,7 @@ pub(crate) fn think(
         .filter(|b| b.hp > 0)
         .map(|b| (b.id, b.owner, building_rect(rules, &state.map, b)))
         .collect();
+    let ring = AnnexRing::new(state, rules);
     let mut scratch = Vec::new();
     for (id, intent) in units {
         if intent == Intent::Attack {
@@ -683,6 +724,7 @@ pub(crate) fn think(
                 grid,
                 stats,
                 &targetable,
+                &ring,
                 id,
                 &mut scratch,
                 &mut plan,
@@ -697,7 +739,7 @@ pub(crate) fn think(
 fn think_explicit(
     state: &mut State,
     rules: &Rules,
-    stats: &Stats,
+    stats: &Stats<'_>,
     id: UnitId,
     tick: u32,
     plan: &mut Plan,
@@ -797,8 +839,60 @@ fn think_explicit(
     }
 }
 
+/// The annex-hold rule's inputs (M5a, owner decision 6): every complete
+/// Town at 0 HP with its owner and footprint (usually none), which kinds
+/// `annexation_attackers` selects and how near counts as adjacent.
+struct AnnexRing {
+    /// `(owner, footprint)` of each complete Town at 0 HP, `BuildingId`
+    /// order.
+    towns: Vec<(PlayerId, Rect)>,
+    /// `[kind]`: selected by `annexation_attackers`.
+    attackers: Vec<bool>,
+    /// `annexation_adjacent_tiles`.
+    adjacent: u16,
+}
+
+impl AnnexRing {
+    fn new(state: &State, rules: &Rules) -> AnnexRing {
+        let towns: Vec<(PlayerId, Rect)> = state
+            .buildings
+            .values()
+            .filter(|b| b.town_state.is_some() && b.hp == 0)
+            .map(|b| (b.owner, building_rect(rules, &state.map, b)))
+            .collect();
+        let attackers = if towns.is_empty() {
+            Vec::new()
+        } else {
+            rules
+                .units
+                .iter()
+                .map(|k| rules.annexation_attackers.iter().any(|s| s.selects(k)))
+                .collect()
+        };
+        AnnexRing {
+            towns,
+            attackers,
+            adjacent: u16::try_from(rules.annexation_adjacent_tiles).expect("validated <= 4"),
+        }
+    }
+
+    /// Whether `u`, an idle guard, holds an annexation ring: its kind can
+    /// annex and it stands within `annexation_adjacent_tiles` of an enemy
+    /// complete Town at 0 HP. Such a unit keeps and takes only targets in
+    /// weapon range and never chases, so nothing draws it off the ring.
+    fn holds(&self, map: &Map, u: &Unit) -> bool {
+        if self.towns.is_empty() || !self.attackers[usize::from(u.kind.0)] {
+            return false;
+        }
+        let tile = map.tile_of(u.pos);
+        self.towns
+            .iter()
+            .any(|&(owner, rect)| owner != u.owner && rect.chebyshev(tile) <= self.adjacent)
+    }
+}
+
 /// What an acquiring unit takes of the enemies of one tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Want {
     /// None of them.
     Nothing,
@@ -821,28 +915,32 @@ struct Candidate {
 /// module docs), among those that rank strictly better than `limit` on
 /// `(tier, out of weapon range)`: the best one, or every one that ties
 /// with it exactly, in `TargetId` order. Empty when none is in weapon
-/// range or directly chaseable. Reads `targetable` for buildings and the
-/// grid for units; `scratch` is reused between units.
+/// range or directly chaseable. `max_want` caps what is considered:
+/// `Want::InRange` for a unit holding an annexation ring (M5a), which
+/// takes only targets in weapon range. Reads `targetable` for buildings and
+/// the grid for units; `scratch` is reused between units.
 #[allow(clippy::too_many_arguments)]
 fn best_candidates(
     state: &State,
     grid: &SpatialGrid,
-    stats: &Stats,
+    stats: &Stats<'_>,
     targetable: &[Targetable],
     u: &Unit,
     attack: &AttackStats,
     limit: (u8, bool),
+    max_want: Want,
     scratch: &mut Vec<Candidate>,
 ) -> Vec<Candidate> {
     scratch.clear();
     let want = |tier: u8| {
-        if (tier, false) >= limit {
+        let w = if (tier, false) >= limit {
             Want::Nothing
         } else if (tier, true) >= limit {
             Want::InRange
         } else {
             Want::InReach
-        }
+        };
+        w.min(max_want)
     };
     let mut consider = |want: Want, tier: u8, id: TargetId, aim: Aim, dist_sq: i64| {
         let in_range = within(u.pos, u.radius, attack.range, &aim);
@@ -867,7 +965,7 @@ fn best_candidates(
         } else {
             attack.reach
         };
-        grid.for_each_in(u.pos, edge + u.radius + stats.max_radius, |other| {
+        grid.for_each_in(u.pos, edge + u.radius + stats.max_radius(), |other| {
             let Some(o) = state.units.get(&other).filter(|o| o.owner != u.owner) else {
                 return;
             };
@@ -919,14 +1017,18 @@ fn best_candidates(
 }
 
 /// 5a for a unit that acquires: an idle guard or an attack-mover (see the
-/// module docs). Sets or clears its target and engages it.
+/// module docs). Sets or clears its target and engages it. An idle guard
+/// holding an annexation ring (`AnnexRing::holds`) keeps a target only in
+/// weapon range and takes only targets in weapon range, so it only ever
+/// holds (M5a).
 #[allow(clippy::too_many_arguments)]
 fn think_acquiring(
     state: &mut State,
     rules: &Rules,
     grid: &SpatialGrid,
-    stats: &Stats,
+    stats: &Stats<'_>,
     targetable: &[Targetable],
+    ring: &AnnexRing,
     id: UnitId,
     scratch: &mut Vec<Candidate>,
     plan: &mut Plan,
@@ -950,14 +1052,21 @@ fn think_acquiring(
         .unit(u.owner, u.kind)
         .attack
         .expect("only armed units acquire");
+    let holding = u.intent == Intent::Plain && ring.holds(&state.map, u);
     // The current target, while it is valid and in weapon range or
-    // directly chaseable (so not beyond the reach).
+    // directly chaseable (so not beyond the reach); only in weapon range
+    // while holding a ring.
     let kept = u.target.and_then(|t| {
         let aim = locate(state, rules, u.owner, t)?;
         let in_range = within(u.pos, u.radius, attack.range, &aim);
-        (in_range || chases_directly(&state.map, u.pos, u.radius, attack.reach, &aim))
+        (in_range || (!holding && chases_directly(&state.map, u.pos, u.radius, attack.reach, &aim)))
             .then_some((t, aim, in_range))
     });
+    let max_want = if holding {
+        Want::InRange
+    } else {
+        Want::InReach
+    };
     // Only a candidate that ranks strictly better on (tier, out of weapon
     // range) displaces it; nothing ranks better than an in-range target of
     // the better tier, so then nothing is searched.
@@ -968,7 +1077,9 @@ fn think_acquiring(
         )
     });
     let ties = if limit > (0, false) {
-        best_candidates(state, grid, stats, targetable, u, &attack, limit, scratch)
+        best_candidates(
+            state, grid, stats, targetable, u, &attack, limit, max_want, scratch,
+        )
     } else {
         Vec::new()
     };
@@ -1005,7 +1116,7 @@ fn think_shooters(
     state: &mut State,
     rules: &Rules,
     grid: &SpatialGrid,
-    stats: &Stats,
+    stats: &Stats<'_>,
     tick: u32,
     plan: &mut Plan,
 ) {
@@ -1028,7 +1139,7 @@ fn think_shooters(
         let half = Fx::from_ratio(i32::from(w.max(h)), 2);
         let mut best = i64::MAX;
         nearest.clear();
-        grid.for_each_in(centre, half + shot.range + stats.max_radius, |uid| {
+        grid.for_each_in(centre, half + shot.range + stats.max_radius(), |uid| {
             let Some(u) = state.units.get(&uid).filter(|u| u.owner != owner) else {
                 return;
             };
@@ -1061,7 +1172,7 @@ fn think_shooters(
 pub(crate) fn resolve(
     state: &mut State,
     rules: &Rules,
-    stats: &Stats,
+    stats: &Stats<'_>,
     aims: &[(BuildingId, UnitId)],
     tick: u32,
     events: &mut Vec<SimEvent>,
@@ -1084,7 +1195,7 @@ pub(crate) fn resolve(
         }
         let counter = match aim {
             Aim::Unit { kind: defender, .. } => stats.counter(u.kind, defender),
-            Aim::Building { .. } => stats.vs_buildings[usize::from(u.kind.0)],
+            Aim::Building { .. } => stats.vs_buildings(u.kind),
         };
         let damage = i64::from(attack.damage)
             .checked_mul(counter)
@@ -1112,11 +1223,11 @@ pub(crate) fn resolve(
     }
     let mut dealt: BTreeMap<TargetId, i64> = BTreeMap::new();
     for (attacker, target, base, cooldown) in hits {
-        let variance = if stats.variance == 0 {
+        let variance = if stats.variance() == 0 {
             1000
         } else {
-            let span = u32::try_from(2 * stats.variance + 1).expect("variance <= 500");
-            1000 + i64::from(rng_index(&mut state.rng, span)) - stats.variance
+            let span = u32::try_from(2 * stats.variance() + 1).expect("variance <= 500");
+            1000 + i64::from(rng_index(&mut state.rng, span)) - stats.variance()
         };
         let damage = base * variance / 1000;
         let ready_at = tick.checked_add(cooldown).expect("tick fits u32");
@@ -1134,31 +1245,54 @@ pub(crate) fn resolve(
         let sum = dealt.entry(target).or_insert(0);
         *sum = sum.checked_add(damage).expect("damage sum fits i64");
     }
-    let clamp_i32 =
-        |v: i64| i32::try_from(v.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).expect("clamped");
     for (target, damage) in dealt {
-        match target {
-            TargetId::Unit(id) => {
-                let u = state.units.get_mut(&id).expect("validated target");
-                u.damage_taken = clamp_i32(i64::from(u.damage_taken) + damage);
-            }
-            TargetId::Building(id) => {
-                let b = state.buildings.get_mut(&id).expect("validated target");
-                let hp = i64::from(b.hp) - damage;
-                if b.town_state.is_some() {
-                    // A complete Town is never destroyed: it stays at 0.
-                    let before = b.hp;
-                    b.hp = clamp_i32(hp.max(0));
-                    if before > 0 && b.hp == 0 {
-                        events.push(SimEvent::TownAtZeroHp { town: id });
-                    }
-                } else {
-                    b.hp = clamp_i32(hp);
+        apply_damage(state, target, damage, events);
+    }
+    reap(state, rules, stats, events);
+}
+
+/// `v` clamped into `i32`.
+pub(crate) fn clamp_i32(v: i64) -> i32 {
+    i32::try_from(v.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).expect("clamped")
+}
+
+/// Deal `amount` damage to an existing `target` at once: a unit's
+/// `damage_taken` grows (clamped to `i32`); a complete Town's hit points
+/// fall and stay at 0, with `TownAtZeroHp` on the step that reaches 0; any
+/// other building or site loses `amount` hit points (clamped to `i32`).
+/// Nothing is removed here: `reap` (step 5c) removes the dead and the
+/// destroyed. `resolve` applies each target's summed hits through it, and
+/// `Command::DebugDamage` its amount.
+///
+/// # Panics
+///
+/// If `target` does not exist.
+pub(crate) fn apply_damage(
+    state: &mut State,
+    target: TargetId,
+    amount: i64,
+    events: &mut Vec<SimEvent>,
+) {
+    match target {
+        TargetId::Unit(id) => {
+            let u = state.units.get_mut(&id).expect("an existing target");
+            u.damage_taken = clamp_i32(i64::from(u.damage_taken).saturating_add(amount));
+        }
+        TargetId::Building(id) => {
+            let b = state.buildings.get_mut(&id).expect("an existing target");
+            let hp = i64::from(b.hp).saturating_sub(amount);
+            if b.town_state.is_some() {
+                // A complete Town is never destroyed: it stays at 0.
+                let before = b.hp;
+                b.hp = clamp_i32(hp.max(0));
+                if before > 0 && b.hp == 0 {
+                    events.push(SimEvent::TownAtZeroHp { town: id });
                 }
+            } else {
+                b.hp = clamp_i32(hp);
             }
         }
     }
-    reap(state, rules, stats, events);
 }
 
 /// Remove every unit whose damage has reached its hit points, in `UnitId`
@@ -1170,7 +1304,12 @@ pub(crate) fn resolve(
 /// destroyed building was attributed to is then re-derived, in id order,
 /// and may fall back to tier 1. Emits `UnitDied`, `BuildingDestroyed` and
 /// one `TerritoryChanged` when a border source went.
-pub(crate) fn reap(state: &mut State, rules: &Rules, stats: &Stats, events: &mut Vec<SimEvent>) {
+pub(crate) fn reap(
+    state: &mut State,
+    rules: &Rules,
+    stats: &Stats<'_>,
+    events: &mut Vec<SimEvent>,
+) {
     let dead: Vec<UnitId> = state
         .units
         .values()

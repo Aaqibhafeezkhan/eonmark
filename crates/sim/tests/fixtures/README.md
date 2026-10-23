@@ -4,8 +4,9 @@ Each fixture is `<name>.eonreplay` (written by `sim-cli record --scenario <name>
 with a sibling `<name>.hash` holding the final state hash as `0x<16 hex>` and a
 newline. `crates/sim/tests/m1.rs::golden(name)` (and its copies in `m3a.rs`
 for `economy_second_town`, `m3b.rs` for `economy_walkthrough`, `m4a.rs`
-for `combat_skirmish` and `m4b.rs` for `enemy_outpost_walkthrough`) verifies
-the replay and compares the final hash;
+for `combat_skirmish`, `m4b.rs` for `enemy_outpost_walkthrough` and
+`m5a.rs` for `capture_seat` and `stalemate_45min`) verifies the replay and
+compares the final hash;
 `sim-cli verify` does the same from the command line.
 
 | Fixture | Ticks | Scenario (`sim::scenarios`) | Runs in |
@@ -18,10 +19,66 @@ the replay and compares the final hash;
 | `economy_walkthrough` | 2400 | the M3b owner proxy, from the standard start, P0 only: during tick 0 Yeoman 3's Croft at (50, 60) is rejected `OutsideBorders`, Yeoman 1 founds a Town at (40, 63), Yeoman 2 places a Croft at (28, 60) and the Seat queues a Yeoman; during tick 1200 a Lumber grant for five more Crofts; the Town completes at tick 1346; during tick 1400 Yeoman 3 places the Croft at (50, 60) again (accepted) and Yeomen 1, 4, 5 and 11 four more, three Crofts per Town; from tick 2049 six worked Crofts put Grain over the Yield Cap (raw 80, credited 70); during tick 2160 Yeomen are spawned to 24/25 pop, during 2200 a `Train` reaches 25/25 and during 2240 the next is rejected `PopCapReached` (seed 12) | `cargo test -p sim`, `sim-cli verify --release` in CI |
 | `combat_skirmish` | 3000 | the M4a combat golden, empty start: during tick 0 P0 places a complete Scriptorium (2, 2) and Engine Yard (30, 12), gets stock and queues Letters I; P1 places a complete Town (22, 38) beside the field and a Watchtower (40, 25); each side spawns six Skirmishers, Shieldbearers, Bowmen and Outriders with `DebugSpawnJittered` (P0's `UnitId(1..=24)` west, P1's `25..=48` mirrored east) and P1 50 Yeomen far south-east; during tick 5 the lines attack-move into each other (the Town shoots into the fight); during tick 150 P0's Bowmen Stop and P1's Outriders Move away; Letters I completes at 501, Trade I (queued during 520) at 1061, Statecraft I queued behind it is cancelled during 540; P0 enters the Masonry Age at 1102 and trains a Mangonel (`UnitId(99)`, queued during 1110, out at 1911), which attacks the Watchtower during 1920 and destroys it with five hits at 2363 while the Yeomen, ordered across the river during 2300, keep a path search suspended (seed 21) | `cargo test -p sim`, `sim-cli verify --release` in CI on both operating systems (hash parity) |
 | `enemy_outpost_walkthrough` | 5039 | the M4b owner proxy, from the standard start (seed 13). During tick 0 P0 `DebugSpawnJittered`s a 200-unit vanguard on P1's side of the river (`UnitId(11..=210)`, 50 Skirmishers, Shieldbearers, Bowmen and Outriders, no orders) and is granted 1.5x the walkthrough's bill; P1 gets Arms I to III, a complete Watchtower at (58, 64) (`BuildingId(3)`) and a mirrored army (`211..=410`), which attack-moves into the vanguard during tick 100 and wipes it during tick 711 (P0's pop 255 / 25 back to 5 / 25). P0's real commands, at beat ticks derived from the rules (`enemy_outpost_beats`): during tick 2 Yeomen 1 and 2 place a Scriptorium (27, 58) and a Muster Hall (28, 68) (`BuildingId(4)`, `5`, complete at 635 and 845) and Yeoman 3 pre-walks; Letters I queued during 724 (done 1225); the Muster Hall rallies to (47, 63) and queues two Skirmishers, two Bowmen and a Shieldbearer during 964 (`411..=415`); Trade I queued during 1266 at the Letters price (540 ticks, done 1807); during 1848 P0 enters the Masonry Age and Yeoman 3 places an Engine Yard (40, 62) (`BuildingId(6)`, complete at 2865); two Mangonels queued during 2970 (`416`, `417`, out at 3771 and 4571); during 4692 the Mangonels attack the Watchtower, which they outrange, and the mixed army attack-moves beside it; the tower is destroyed during 4839. Nothing is rejected | `cargo test -p sim -- --ignored enemy_outpost` and the game's `--headless-run` in CI's headless job, `sim-cli verify --release` in CI on both operating systems |
+| `capture_seat` | 1628 | the M5a capture golden, from the standard start (seed 31): during tick 0 P1 researches Harrying I (`DebugResearch`); P0 removes P1's five Yeomen and takes P1's Seat (`BuildingId(2)`) to 300 HP with `DebugDamage`, spawns four Mangonels (`UnitId(11..=14)`) that `Attack` the Seat from out of its range and take it to 0 during tick 146, eight Skirmishers (`15..=22`) and a Supply Wain (`23`) inside P1's border, and a Bowman (`24`) outside the Wain's cover, which bleeds; during tick 300 the Skirmishers walk onto eight tiles of the Seat's ring and the Wain follows. The annexation timer starts in step 427 and the Seat flips in step 1627, which decides `Victory { P0, decisive: true }`, reason `SeatCaptured`; `sim-cli record` stops there (`Scenario::stops_at_outcome`), so the fixture ends at tick 1628 and its hash is the state the game's outcome overlay shows. Nothing is rejected | `cargo test -p sim`, `sim-cli verify --release` in CI on both operating systems (hash parity) |
+| `stalemate_45min` | 54000 | the M5a 45-minute golden, empty start (seed 45), no unit: during tick 0 P0 places a complete Town at (23, 63) and a Watchtower at (43, 64), P1 a Town at (102, 63), so P0 owns 1248 tiles and P1 1245; the match cap (`match_cap_ds`, 54000 ticks) decides `Victory { P0, decisive: false }`, reason `Territory`, in the last step. Recorded with a hash every 1000 ticks (`Scenario::default_hash_every`) | `cargo test -p sim -- --ignored golden_stalemate_45min` locally, `sim-cli verify --release` in CI on both operating systems (hash parity); `annexation_54000_tick_scripted_stalemate_is_a_tiebreak_victory_for_more_territory` runs the same stream in `cargo test -p sim` |
 
 The `snapshot_restore` recording snapshots the sim before tick 300, restores
 the bytes into a fresh sim and continues recording on that sim; `verify`
 re-simulates without the swap, so an `OK` proves the restore was exact.
+
+Recorded 2026-10-23 at `rules_version` 20, `SIM_VERSION` 16 with
+`just rerecord` (M5a annexation and outcome: `TownState` gained the hashed
+`hold` and `State` the hashed `outcome`, in the `meta` sub-hash; step 5d
+annexes Towns at 0 HP, step 6e decides the match, and the annex-hold guard
+rule applies beside an enemy Town at 0 HP). None of the eight re-recorded
+fixtures' Towns ever loses a hit point, so in them no timer starts, the
+hold rule never applies and nothing is decided (the two new recordings
+below are decided: `capture_seat` takes P1's Seat to 0 and annexes it,
+`stalemate_45min` ends at the cap): re-simulating the eight fixtures emits
+no `TownAtZeroHp`, annexation event or `MatchDecided`. A per-tick `sim-cli
+hash-dump --every 1` of each fixture as recorded at `SIM_VERSION` 15, run
+by that binary with its own `data/`, against the re-recorded fixture run by
+the `SIM_VERSION` 16 binary with the current `data/`, differs in the whole hash
+and the `meta` column on every tick, in the `buildings` column on every
+tick with a complete Town (the four fixtures with one) and in no other
+column, and the buildings and meta hashed without the new fields equal the
+old columns on every tick. Every `.hash` file changes for that reason
+only: `combat_skirmish` `0xb200f42aaaf0f1db`, `economy_second_town`
+`0x757fac5776ab9e13`, `economy_walkthrough` `0x213f4462ac4404bd`,
+`enemy_outpost_walkthrough` `0x8f838952c76889f6`, `group_spiral`
+`0xaade86a7b573b680`, `move_500` `0xdce11af94a970c1f`, `move_500_short`
+`0xfe406e123a8dd8dc`, `snapshot_restore` `0xa19f97ffe1618779`.
+`capture_seat` (`0x2c9a9ef52a5184d0`, `just rerecord capture_seat
+stalemate_45min`) and `stalemate_45min` (`0x85a531db76eb0b04`) are first
+recordings of new scenarios, which need no bump by themselves.
+
+Recorded 2026-10-23 at `rules_version` 19, `SIM_VERSION` 15 with
+`just rerecord` (M5a attrition: `Unit` gained the hashed `exposed_ticks`,
+step 5b' applies Harrying, `Command::DebugDamage` is appended). No fixture
+researches Harrying, so nobody is ever exposed: re-simulating the eight
+fixtures emits no `Attrition` event and every `exposed_ticks` stays 0. A
+per-tick `sim-cli hash-dump --every 1` of each fixture as recorded at
+`SIM_VERSION` 14, run by that binary with its own `data/`, against the
+re-recorded fixture run by the `SIM_VERSION` 15 binary with the current
+`data/`, differs in the whole hash and the `units` column on every tick
+with a unit and in no other column, and the units hashed without the new
+field equal the old `units` column on every tick. Every `.hash` file
+changes for that reason only (each unit's encoding grew by one byte):
+`combat_skirmish` `0x4914c1138c1f4255`, `economy_second_town`
+`0xfd88a57c5cb6bf16`, `economy_walkthrough` `0xd783a5f9e81110a5`,
+`enemy_outpost_walkthrough` `0xe6127d167a9d064d`, `group_spiral`
+`0x723eae548d0a8f26`, `move_500` `0xdabf913fcf0dd1b0`, `move_500_short`
+`0x69cb2eaad81cf7f8`, `snapshot_restore` `0xc601c749c206ee7f`.
+
+Recorded 2026-10-22 at `rules_version` 18, `SIM_VERSION` 14 with
+`just rerecord` (M5a rules data: the Watchtower's Harrying I and II with
+`counts_toward_age: false`, the `HarryingLevel` stat path, the attrition,
+annexation and match-end fields of `rules.ron` and the attrition and
+annexation flags of `units.ron` and `buildings.ron` joined `rules_hash`).
+The sim reads only `counts_toward_age`, and `AdvanceAge` counting the
+techs that count toward an age is the old count for every fixture: none
+researches Harrying, and every other tech counts. Every final hash and
+every `.hash` file is unchanged; only the headers differ.
 
 Recorded 2026-10-22 at `rules_version` 17, `SIM_VERSION` 14 with
 `just rerecord enemy_outpost_walkthrough` (M4b scripted owner proxy:

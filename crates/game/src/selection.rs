@@ -27,7 +27,7 @@ use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::PrimaryWindow;
-use sim::{BuildingId, SimView, UnitId};
+use sim::{BuildingId, PlayerId, SimView, UnitId};
 
 use crate::buildings::BuildingRef;
 use crate::camera::RtsCamera;
@@ -67,6 +67,11 @@ pub struct Selection {
     pub units: BTreeSet<UnitId>,
     /// The selected building (M3b), when no unit is selected.
     pub building: Option<BuildingId>,
+    /// The owner [`Selection::building`] had when [`prune_dead`] first saw
+    /// it selected (M5a): an annexed building changes hands, and a
+    /// building that did leaves the selection
+    /// ([`Selection::prune_building`]). `None` until then.
+    pub building_owner: Option<PlayerId>,
     /// Control groups 1..=9 at indices 0..=8.
     pub groups: [BTreeSet<UnitId>; 9],
 }
@@ -82,6 +87,7 @@ impl Selection {
     pub fn set_building(&mut self, building: BuildingId) {
         self.units.clear();
         self.building = Some(building);
+        self.building_owner = None;
     }
 
     /// Deselect everything.
@@ -136,10 +142,22 @@ impl Selection {
         }
     }
 
-    /// Drop a selected building that no longer exists.
-    pub fn prune_building(&mut self, exists: impl Fn(BuildingId) -> bool) {
-        if self.building.is_some_and(|b| !exists(b)) {
-            self.building = None;
+    /// Drop a selected building that no longer exists (`owner_of` returns
+    /// `None`) or that changed hands since it was selected (M5a: an annexed
+    /// Town and the buildings it takes along); the first call after a
+    /// selection remembers the building's owner.
+    pub fn prune_building(&mut self, owner_of: impl Fn(BuildingId) -> Option<PlayerId>) {
+        let Some(id) = self.building else {
+            self.building_owner = None;
+            return;
+        };
+        match (owner_of(id), self.building_owner) {
+            (Some(now), None) => self.building_owner = Some(now),
+            (Some(now), Some(then)) if now == then => {}
+            _ => {
+                self.building = None;
+                self.building_owner = None;
+            }
         }
     }
 
@@ -269,13 +287,11 @@ impl Plugin for SelectionPlugin {
                     control_groups,
                     select_idle_builder,
                     clear_selection_on_escape,
-                    expire_move_markers,
                 )
                     .chain()
                     .before(crate::orders::order_mode_keys)
                     .in_set(WorldInputSet),
             )
-            .add_systems(Update, draw_drag_box.after(WorldInputSet))
             // Before `FrameCount` advances, so the frame number matches the
             // one `frame_stats` records for this frame.
             .add_systems(
@@ -288,6 +304,7 @@ impl Plugin for SelectionPlugin {
                     .chain()
                     .before(TransformSystems::Propagate),
             );
+        add_world_input_feedback(app);
     }
 }
 
@@ -588,6 +605,19 @@ pub fn select_in_rect(
     n
 }
 
+/// The feedback that follows world input but is not input itself: the
+/// move and attack markers' shrink-and-expire timer and the drag-box node.
+/// Both run after [`WorldInputSet`] and outside it, so they keep running
+/// once the set stops at the outcome (M5a, `hud::gate_world_input`): a
+/// marker placed just before it still expires, and the drag box that
+/// `outcome::show_outcome` drops is hidden.
+pub fn add_world_input_feedback(app: &mut App) {
+    app.add_systems(
+        Update,
+        (expire_move_markers, draw_drag_box).after(WorldInputSet),
+    );
+}
+
 /// Shows the drag-box node over the current [`DragRect`] once it is past
 /// the click threshold; hides it otherwise.
 fn draw_drag_box(drag: Res<DragBox>, mut nodes: Query<&mut Node, With<DragBoxNode>>) {
@@ -704,7 +734,8 @@ pub fn clear_selection_on_escape(
     }
 }
 
-/// Drop ids that left the sim from the selection and groups.
+/// Drop ids that left the sim from the selection and groups, and a
+/// selected building that left it or changed hands (M5a annexation).
 pub fn prune_dead(sim: NonSend<SimHandle>, mut selection: ResMut<Selection>) {
     if selection.is_empty()
         && selection.building.is_none()
@@ -714,7 +745,7 @@ pub fn prune_dead(sim: NonSend<SimHandle>, mut selection: ResMut<Selection>) {
     }
     let view = sim.view();
     selection.prune(|id| view.unit(id).is_some());
-    selection.prune_building(|id| view.building(id).is_some());
+    selection.prune_building(|id| view.building(id).map(|b| b.owner));
 }
 
 /// One ring entity per selected unit: spawn `(SelectionRing(id), Gizmo {
@@ -1162,6 +1193,110 @@ mod tests {
         let selection = app.world().resource::<Selection>();
         assert_eq!(selection.building, None);
         assert!(selection.groups[0].is_empty());
+    }
+
+    /// A selected building leaves the selection when it changes hands
+    /// (M5a annexation), not before: P1's Town at 0 HP is annexed by P0's
+    /// Skirmishers 1200 steps after the timer starts, and the pruning that
+    /// `prune_dead` runs every frame drops it in exactly that step. A
+    /// building that is gone is dropped too, and a new selection forgets
+    /// the old owner.
+    #[test]
+    fn flipped_building_leaves_the_selection() {
+        use sim::{Command, FxVec2, PlayerCommand, PlayerId, SimEvent, TargetId, Tile, UnitKindId};
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let skirmisher = UnitKindId(
+            u16::try_from(
+                rules
+                    .units
+                    .iter()
+                    .position(|u| u.id == "skirmisher")
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let (town_kind, _) = rules.building_kind_by_id("town").unwrap();
+        let p1 = PlayerId(1);
+        let town = BuildingId(1);
+        let mut sim = SimHandle::from_setup(sim::MatchSetup::scenario(&rules, 5), rules.clone());
+        // P1's Town at nw (20, 30); then P0 takes it to 0 HP and stands four
+        // Skirmishers on the tiles north of it.
+        sim.step(&[PlayerCommand::new(
+            p1,
+            0,
+            Command::DebugPlaceBuilding {
+                owner: p1,
+                kind: sim::BuildingKindId(town_kind),
+                tile: Tile::new(20, 30),
+                complete: true,
+            },
+        )]);
+        let mut cmds = vec![PlayerCommand::new(
+            LOCAL_PLAYER,
+            0,
+            Command::DebugDamage {
+                target: TargetId::Building(town),
+                amount: u32::MAX,
+            },
+        )];
+        for (seq, x) in (1..).zip(20..24) {
+            cmds.push(PlayerCommand::new(
+                LOCAL_PLAYER,
+                seq,
+                Command::DebugSpawn {
+                    owner: LOCAL_PLAYER,
+                    kind: skirmisher,
+                    at: FxVec2::new(
+                        sim::Fx::from_ratio(2 * x + 1, 2),
+                        sim::Fx::from_ratio(59, 2),
+                    ),
+                    count: 1,
+                },
+            ));
+        }
+        sim.step(&cmds);
+        let mut selection = Selection::default();
+        selection.set_building(town);
+        let mut flipped_at = None;
+        let mut dropped_at = None;
+        for _ in 0..2000 {
+            sim.step(&[]);
+            let events = sim.drain_events();
+            if events.iter().any(|e| {
+                matches!(e, SimEvent::TownAnnexed { town: t, from, to }
+                    if *t == town && *from == p1 && *to == LOCAL_PLAYER)
+            }) {
+                flipped_at = Some(sim.tick());
+            }
+            let view = sim.view();
+            selection.prune_building(|id| view.building(id).map(|b| b.owner));
+            if selection.building.is_none() {
+                dropped_at = Some(sim.tick());
+                break;
+            }
+            assert_eq!(
+                selection.building_owner,
+                Some(p1),
+                "remembered at selection"
+            );
+        }
+        assert!(flipped_at.is_some(), "the Town was annexed");
+        assert_eq!(
+            dropped_at, flipped_at,
+            "dropped in the step it changed hands"
+        );
+        assert_eq!(selection.building_owner, None);
+        // Selecting it again (now P0's) remembers the new owner and keeps it.
+        selection.set_building(town);
+        let view = sim.view();
+        selection.prune_building(|id| view.building(id).map(|b| b.owner));
+        assert_eq!(selection.building, Some(town));
+        assert_eq!(selection.building_owner, Some(LOCAL_PLAYER));
+        // A building that is gone leaves too.
+        selection.prune_building(|_| None);
+        assert_eq!(selection.building, None);
     }
 
     #[test]

@@ -58,6 +58,77 @@ fn repo_data_passes_with_three_ages_eight_kinds_and_twelve_techs() {
         stdout.contains("units=8 buildings=8 ages=3 techs=12"),
         "{stdout}"
     );
+    // M5a: `techs` counts the techs that count toward an age; the
+    // Watchtower's Harrying I and II are the two side techs.
+    assert!(
+        stdout.contains(" techs=12 side_techs=2 factions=1 "),
+        "{stdout}"
+    );
+}
+
+/// Run data-check on a copy of `data/` with the first `from` in `file`
+/// replaced by `to`: it exits 1 with one `error:` line naming `file` and
+/// each of `words`.
+fn rejects_edit(name: &str, file: &str, from: &str, to: &str, words: &[&str]) {
+    let dir = edited_copy(name, file, |text| {
+        assert!(text.contains(from), "{file} no longer contains {from:?}");
+        text.replacen(from, to, 1)
+    });
+    let out = data_check(&dir);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}{stderr}", text(&out.stdout));
+    assert!(
+        stderr.starts_with("error: ") && stderr.lines().count() == 1 && stderr.contains(file),
+        "{stderr}"
+    );
+    for w in words {
+        assert!(stderr.contains(w), "{w:?} missing: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_harrying_bonus_age_that_does_not_exist_exits_1_naming_rules_ron() {
+    rejects_edit(
+        "bonus-age",
+        "rules/rules.ron",
+        r#"harrying_bonus_age: Some("charter"),"#,
+        r#"harrying_bonus_age: Some("bronze"),"#,
+        &["harrying_bonus_age: ", "\"bronze\" is not an age id"],
+    );
+}
+
+#[test]
+fn a_decreasing_age_gap_table_exits_1_naming_the_entry() {
+    rejects_edit(
+        "gap-table",
+        "rules/rules.ron",
+        "attrition_age_gap_hp: [1, 2],",
+        "attrition_age_gap_hp: [2, 1],",
+        &["attrition_age_gap_hp[1]: ", "never decreases"],
+    );
+}
+
+#[test]
+fn a_civilian_annexation_attacker_exits_1_naming_the_selector() {
+    rejects_edit(
+        "civilian-attacker",
+        "rules/rules.ron",
+        "annexation_attackers: [Class(Infantry), Class(Cavalry)],",
+        "annexation_attackers: [Class(Infantry), Class(Civilian)],",
+        &["annexation_attackers[1]: ", "Civilian"],
+    );
+}
+
+#[test]
+fn a_town_that_stays_on_annexation_exits_1_naming_buildings_ron() {
+    rejects_edit(
+        "town-stays",
+        "rules/buildings.ron",
+        "town: true,",
+        "town: true,\n      stays_on_annexation: true,",
+        &["buildings[0].stays_on_annexation: "],
+    );
 }
 
 #[test]

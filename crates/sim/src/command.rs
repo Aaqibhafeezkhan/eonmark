@@ -169,6 +169,20 @@ pub enum Command {
         /// Largest offset per axis, in hundredths of a tile.
         jitter_x100: u8,
     },
+    /// Deal `amount` damage to `target` at once (M5a), as a hit would but
+    /// with no attacker, range or counter: a unit's damage grows, a
+    /// complete Town falls to at most 0 (`TownAtZeroHp`), any other
+    /// building or site loses hit points; step 5c removes the dead and the
+    /// destroyed. Any owner's target, the issuer's own included; rejected
+    /// with `RejectReason::InvalidTarget` when it does not exist. Draws
+    /// nothing from the RNG. Lets tests and scenarios set hit points
+    /// without depending on combat tuning. Gated like `DebugSpawn`.
+    DebugDamage {
+        /// The unit or building.
+        target: TargetId,
+        /// Damage dealt.
+        amount: u32,
+    },
 }
 
 /// A command stamped with its issuing player and per-player sequence number.

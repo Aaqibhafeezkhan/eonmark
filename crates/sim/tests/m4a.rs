@@ -1054,26 +1054,50 @@ fn tech_advance_age_rejections_change_nothing() {
 /// the other level-3 techs without it); then level 2 is rejected in the
 /// Hearth Age and accepted in Masonry, and level 3 with its predecessor is
 /// rejected in Masonry and accepted in Charter, by applying the command.
+///
+/// Since M5a's rules data (`rules_version` 18) this holds for the twelve
+/// Scriptorium techs that count toward an age. The two side techs, the
+/// Watchtower's Harrying I and II, start a level later (level k in age k:
+/// Masonry, then Charter); the same loop checks them at a Watchtower,
+/// with Harrying I researched alongside Letters II, and every tech is
+/// rejected with `CannotResearchHere` at the other host.
 #[test]
 fn tech_level_k_needs_level_k_minus_1_and_age_k() {
     let rules = load_rules();
     for (i, t) in rules.techs.iter().enumerate() {
         let i = u16::try_from(i).unwrap();
-        assert_eq!(rules.age_of_tech(i), t.level - 1, "{}", t.id);
         assert_eq!(rules.tech_predecessor(i).is_some(), t.level > 1, "{}", t.id);
+        if t.counts_toward_age {
+            assert_eq!(rules.age_of_tech(i), t.level - 1, "{}", t.id);
+            assert_eq!(t.host, "scriptorium", "{}", t.id);
+        } else {
+            assert_eq!(rules.age_of_tech(i), t.level, "{}", t.id);
+            assert_eq!(
+                (t.line.as_str(), t.host.as_str()),
+                ("harrying", "watchtower"),
+                "{}",
+                t.id
+            );
+        }
     }
-    // A lab in each age, with Letters II or without it (`DebugResearch`
-    // skips the age check); the Charter Age needs a fifth tech.
+    let unlock_age = |t: &rules::Tech| {
+        if t.counts_toward_age {
+            t.level - 1
+        } else {
+            t.level
+        }
+    };
+    // A lab in each age, with Letters II and Harrying I or without them
+    // (`DebugResearch` skips the age check), and a complete Watchtower,
+    // `BuildingId(2)`; the Charter Age needs a fifth Scriptorium tech.
     let at_age = |age: u8, letters_2: bool| {
         let mut m = lab(&rules, 10);
         let mut ids = vec!["arms_1", "statecraft_1", "trade_1", "letters_1"];
         if letters_2 {
-            ids.push("letters_2");
+            ids.extend(["letters_2", "harrying_1"]);
         }
-        let mut cmds: Vec<Command> = ids
-            .iter()
-            .map(|id| debug_research(tech(&rules, id)))
-            .collect();
+        let mut cmds: Vec<Command> = vec![place(bkind(&rules, "watchtower"), 2, 26, true)];
+        cmds.extend(ids.iter().map(|id| debug_research(tech(&rules, id))));
         cmds.extend((0..age).map(|_| advance()));
         m.ok(cmds);
         m
@@ -1082,16 +1106,26 @@ fn tech_level_k_needs_level_k_minus_1_and_age_k() {
     for (age, letters_2) in variants {
         let m = at_age(age, letters_2);
         assert_eq!(m.view().age(P0), age);
+        let tower = BuildingId(2);
+        assert_eq!(
+            m.view().building(tower).map(|b| b.kind),
+            Some(bkind(&rules, "watchtower"))
+        );
         for (i, t) in rules.techs.iter().enumerate() {
             let id = TechId(u16::try_from(i).unwrap());
             let researched = m.view().researched(P0).contains(&id);
             let pred_done = rules
                 .tech_predecessor(id.0)
                 .is_none_or(|p| m.view().researched(P0).contains(&TechId(p)));
-            let got = m.view().check_research(P0, BuildingId(1), id).map(|_| ());
+            let (host, other) = if t.counts_toward_age {
+                (BuildingId(1), tower)
+            } else {
+                (tower, BuildingId(1))
+            };
+            let got = m.view().check_research(P0, host, id).map(|_| ());
             let want = if !pred_done {
                 Err(RejectReason::PrerequisiteMissing)
-            } else if age < t.level - 1 {
+            } else if age < unlock_age(t) {
                 Err(RejectReason::AgeRequired)
             } else if researched {
                 Err(RejectReason::AlreadyResearched)
@@ -1099,6 +1133,12 @@ fn tech_level_k_needs_level_k_minus_1_and_age_k() {
                 Ok(())
             };
             assert_eq!(got, want, "{} at age {age}, {letters_2}", t.id);
+            assert_eq!(
+                m.view().check_research(P0, other, id).map(|_| ()),
+                Err(RejectReason::CannotResearchHere),
+                "{} at the other host",
+                t.id
+            );
         }
         // Letters III with its predecessor still waits for the Charter Age.
         let letters_3 = m
@@ -5053,6 +5093,8 @@ fn golden_combat_skirmish() {
 /// applied (nothing in the stream is rejected); the Mangonel destroys the
 /// Watchtower with five hits from out of its range while a path search is
 /// suspended, the footprint is passable again and the Mangonel stands down.
+/// Since M5a: P1's Town never reaches 0 HP, so no annexation starts, the
+/// annex-hold guard rule never applies and the match is not decided.
 #[test]
 fn combat_skirmish_beats_happen() {
     use sim::scenarios::{
@@ -5167,6 +5209,25 @@ fn combat_skirmish_beats_happen() {
         (m99.owner, m99.kind, m99.intent),
         (P0, mangonel, Intent::Plain)
     );
+    // M5a (SIM_VERSION 16): P1's Town keeps hit points throughout, so no
+    // Town is ever annexable, the annex-hold guard rule (which applies only
+    // beside an enemy Town at 0 HP) never changes an acquisition, and
+    // nothing decides the match: the fight is M4a's.
+    let annexing = events.iter().find(|(_, e)| {
+        matches!(
+            e,
+            SimEvent::TownAtZeroHp { .. }
+                | SimEvent::AnnexationStarted { .. }
+                | SimEvent::AnnexationReset { .. }
+                | SimEvent::TownAnnexed { .. }
+                | SimEvent::MatchDecided { .. }
+        )
+    });
+    assert_eq!(annexing, None);
+    let town_hp = view.building_hp(town).expect("the Town stands").0;
+    assert!(town_hp > 0, "{town_hp}");
+    assert_eq!(view.building(town).unwrap().owner, P1);
+    assert_eq!(view.outcome(), None);
     eprintln!(
         "combat_skirmish: research {researched:?}, Mangonel trained at {spawned_99}, deaths P0 {died0} P1 {died1}, Town shots {}, tower hits {on_tower:?}, destroyed at {at} with a search suspended",
         shots(town)

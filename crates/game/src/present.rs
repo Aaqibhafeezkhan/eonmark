@@ -18,6 +18,12 @@
 //! When the local player's first units appear, the camera focus jumps once
 //! to their centroid ([`focus_camera_on_first_units`]) so a scenario that
 //! spawns at the west start is on screen from the first frame.
+//!
+//! At the outcome (M5a) the live sim stops stepping, but the fixed clock's
+//! overstep keeps cycling, so a unit still lerping between two poses would
+//! swing between them forever: [`settle_at_outcome`] sets every `Interp`'s
+//! previous pose to its current one once, in the fixed step that decided
+//! the match, after [`sync_lifecycle`] advanced it.
 
 use std::collections::HashMap;
 use std::f32::consts::FRAC_PI_2;
@@ -30,7 +36,7 @@ use sim::{Fx, FxVec2, UnitId};
 use crate::camera::RtsCamera;
 use crate::ground::HALF_EXTENT;
 use crate::palette;
-use crate::sim_driver::{LOCAL_PLAYER, SimHandle, SimSystems, sim_stepped};
+use crate::sim_driver::{LOCAL_PLAYER, MatchOver, SimHandle, SimSystems, sim_stepped};
 
 /// Height of a unit's pivot above the ground, in metres: capsules stand on
 /// the ground, so the pivot is half the total height.
@@ -105,6 +111,13 @@ impl Interp {
         self.prev_yaw = self.curr_yaw;
         self.curr = pos;
         self.curr_yaw = yaw;
+    }
+
+    /// Hold the current pose: `prev = curr` (and the yaw), so every
+    /// [`Interp::sample`] returns it. The frozen game at the outcome (M5a).
+    pub fn settle(&mut self) {
+        self.prev = self.curr;
+        self.prev_yaw = self.curr_yaw;
     }
 
     /// Interpolated position and yaw at `t` in `0..=1` (the overstep
@@ -374,6 +387,12 @@ impl Plugin for PresentPlugin {
                     .run_if(sim_stepped),
             )
             .add_systems(
+                FixedUpdate,
+                settle_at_outcome
+                    .after(sync_lifecycle)
+                    .run_if(resource_added::<MatchOver>),
+            )
+            .add_systems(
                 PostUpdate,
                 sync_transforms.before(TransformSystems::Propagate),
             );
@@ -436,6 +455,18 @@ pub fn sync_lifecycle(
                 false
             }
         });
+    }
+}
+
+/// Once, in the fixed step that decided the match ([`MatchOver`] was just
+/// inserted by `step_sim`), after [`sync_lifecycle`] advanced every unit to
+/// the deciding tick: [`Interp::settle`] on every unit, so the frozen game
+/// shows each unit still at its final pose instead of swinging between its
+/// last two (the live sim never steps again, while the overstep fraction
+/// keeps cycling). Health bars and rings sample the same `Interp`.
+pub fn settle_at_outcome(mut interps: Query<&mut Interp>) {
+    for mut interp in &mut interps {
+        interp.settle();
     }
 }
 

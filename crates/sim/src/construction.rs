@@ -21,7 +21,7 @@ use crate::ids::{BuildingId, BuildingKindId, PlayerId, Tile, UnitId};
 use crate::map::Map;
 use crate::pathing::PathRequest;
 use crate::state::{
-    Building, Construction, Job, MoveOrder, RejectReason, SimEvent, State, TownState, Unit,
+    Building, Construction, Hold, Job, MoveOrder, RejectReason, SimEvent, State, TownState, Unit,
 };
 use crate::tech;
 use crate::territory::{Source, SourceOwner};
@@ -559,6 +559,7 @@ pub(crate) fn complete(
         b.town_state.get_or_insert(TownState {
             seat: false,
             tier: 1,
+            hold: Hold::Held,
         });
     }
     let attributed = b.town;

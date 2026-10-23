@@ -7,8 +7,8 @@ This document specifies Towns: how they are founded, how many a player may hold,
 | Milestone | M3a (founding, limit, radius), M5a (annexation, victory) |
 | Labels | `area:sim`, `area:rules` |
 | Rules files | `data/rules/rules.ron` (town radius, town limit `town_limit_base`, annexation 60 s, defender radius 6, match cap 45 min), `data/rules/buildings.ron` (Town footprint, HP, cost, build time, base yield; the Croft limit `max_per_town`; shooter stats from M4a) |
-| Sim modules | `crates/sim/src/town.rs`, annexation in `crates/sim/src/attrition.rs` neighbourhood or its own module, `outcome()` in `state.rs` |
-| Sub-hash | `buildings`, `territory` |
+| Sim modules | `crates/sim/src/town.rs`, annexation in `crates/sim/src/annexation.rs` (M5a), the outcome in `crates/sim/src/victory.rs` with `Sim::outcome()` in `state.rs` |
+| Sub-hash | `buildings`, `territory`, `meta` (the match outcome, M5a) |
 
 ## Target numbers
 
@@ -162,6 +162,35 @@ The M4a tech slice (`SIM_VERSION` 12, `rules_version` 14) gives Towns their tech
 | Town at 0 HP | Since the combat core slice a complete Town's hit points are clamped at 0: it stays with its footprint, border kernel and queue, emits `TownAtZeroHp { town }` once, is no longer a target for `Attack` (`InvalidTarget`; units attacking it stand down the next tick) and does not regenerate. `Train` there is still accepted until annexation (M5a). A Town site at 0 HP is destroyed like any site, which frees a slot under the town limit (`combat_town_at_zero_hp_stays_and_is_not_targeted`, `combat_site_at_zero_hp_is_destroyed_town_sites_included`). Annexation needs infantry or cavalry next to the Town; since the combat behaviour slice idle soldiers acquire the nearest enemy in their reach and may leave it for another target, which M5a has to allow for. |
 | Town shooter | Since the combat behaviour slice a complete Town with hit points left shoots like a Watchtower (`attack` in `buildings.ron`: 15 every 15 ds, 7 tiles from its footprint to the target's edge): the nearest enemy unit in range, units only, an exact tie drawn from the sim's RNG; a site does not shoot, and a Town at 0 HP neither shoots nor is shot at (`combat_watchtower_and_town_shoot_enemy_units_in_range`, `combat_town_at_zero_hp_does_not_shoot`; see [combat.md](combat.md), "Shooters"). |
 
+## M5a implementation notes
+
+The M5a annexation and outcome slice (`SIM_VERSION` 16, `rules_version` 20) implements the state machine above in `crates/sim/src/annexation.rs` (step 5d) and the victory conditions in `crates/sim/src/victory.rs` (step 6e), with the owner's decisions of 2026-10-22 (ROADMAP M5a, "Notes"). Where it is more precise than the sections above:
+
+| Topic | As implemented |
+| --- | --- |
+| State | `TownState::hold: Hold`, `Held` or `Contested { attacker, ticks }`, hashed in `buildings`. `SimView::annexation(town)` returns `AnnexView { attacker, ticks, total }` while the timer runs; `total - ticks` more steps flip the Town. |
+| When it runs | Step 5d, right after `combat::resolve`, on the post-movement, post-reap positions, for every complete Town at 0 HP in `BuildingId` order (none, the usual case, costs nothing: only a flip restores hit points). |
+| Attackers | Units of another player whose kind `annexation_attackers` selects (`[Class(Infantry), Class(Cavalry)]`) on a tile within `annexation_adjacent_tiles` (1) of the footprint, Chebyshev. Mangonels and Supply Wains beside the Town do not start it (`annexation_mangonels_and_supply_wains_adjacent_do_not_start_it`). |
+| Defenders | Units of the Town's owner whose kind `annexation_defenders` selects (`[Military]`: every non-Civilian kind, the Mangonel and the Supply Wain included; Yeomen and Scribes do not defend) within `annexation_defender_radius_tiles` (6.0) of the footprint's centre, centre to centre, inclusive (`annexation_defender_radius_is_6_tiles_inclusive`: 6.0 tiles straight south resets, 7.0 does not, and off the axis 5.39 resets while 6.08 does not, so the radius is a Euclidean disc). A Town above 0 HP never starts the timer, whoever stands beside it (`annexation_town_above_0_hp_never_starts_the_timer`). |
+| Eligible | Hit points 0, exactly one player owns attackers and there is no defender (`annexation::eligible`). Two attacking players hold the Town as it is. |
+| Entry | The first eligible step sets `Contested { attacker, ticks: 0 }` and moves the Town's border source to the neutral layer (`AnnexationStarted`, `TerritoryChanged`). Each later eligible step adds 1; the Town flips in the step that brings `ticks` to `annexation_ds` in ticks (1200), so 1200 steps after the entry step. |
+| Reset | Any ineligible step (a defender within 6 tiles, no attacker left, another player's attackers) returns the Town to `Held` and the source to its owner's layer (`AnnexationReset`, `TerritoryChanged`); a different sole attacker is a reset and a new entry in the same step. |
+| During the timer | The Town's land is neutral: its kernel stamps the neutral layer, so `owner_at` is `None` wherever no other kernel wins and the field equals a full recompute. `Train` and `Research` there are rejected with `TownContested` (check 3, after `UnderConstruction`; no tech is hosted by a Town in the shipped data, but the `Research` rejection comes before the tech and host checks, so it is reachable) and `SimView::check_train` and `SimView::check_research` agree (`annexation_during_the_timer_research_is_rejected_and_a_research_entry_pauses`); the queue is paused (the head gains no progress) while `Cancel` and `SetRally` still work; base income continues; a new building of the owner is attributed to its nearest other complete Town (`town::attribute` skips contested Towns). Neutral land applies no attrition (`annexation_neutral_land_under_the_timer_applies_no_attrition`). |
+| Flip | The Town and every building and site of the old owner attributed to it change hands, except kinds with `stays_on_annexation` (the Watchtower, sites included; owner decision 4: Muster Halls and Engine Yards transfer). Each building that changes hands has its queue refunded to the old owner, clamped like `Cancel`, with a `TrainingCancelled` per entry (owner decision 3); a site's `paid` is set to 0 with no refund; its rally point is cleared; a complete one that projects its own border (a kind with `border_radius_tiles` whose data does not keep it with the old owner) has its source moved to the new owner's layer, centre and radius unchanged, so its land changes hands with it (`annexation_flip_moves_a_transferred_border_source_to_the_new_owner`, with the Watchtower set to transfer in memory: the shipped Watchtower stays). Every unit of another player whose `Build` or `Gather` job names one of them goes idle. The Town is `Held` again with `annexation_town_hp_permille` (250) of its kind's hit points, 500 of 2000 (owner decision 2), so it shoots and can be attacked again; the seat flag stays on the building (owner decision 13); its source moves to the new owner's layer and `town::refresh` re-derives its tier and radius for the new owner. Each staying building is attributed again to the old owner's nearest uncontested complete Town, or none, and each Town that gains one is re-derived, so it may grow a tier (`annexation_flip_attributes_staying_buildings_to_the_old_owner_s_nearest_town`). Emits `TownAnnexed { town, from, to }` and `TerritoryChanged`. The town limit does not apply to a flip; only new Town sites are gated (owner decision 8). A restored Town that drops to 0 again emits `TownAtZeroHp` again. |
+| Annex-hold guard rule | Owner decision 6. An idle guard (no order, no job, no combat order) whose kind `annexation_attackers` selects and that stands within `annexation_adjacent_tiles` of an enemy complete Town at 0 HP keeps a target only while it is in weapon range and takes only targets in weapon range, so it holds and never chases off the ring (`annexation_adjacent_guards_hold_the_ring`). With the Town still at 0 HP, a guard that had chased a target out of weapon range drops it in the step the Town falls (`annexation_adjacent_guards_drop_a_target_out_of_weapon_range`). Away from Towns at 0 HP acquisition is M4a's: none of the eight re-recorded fixtures' Towns ever loses a hit point (only `capture_seat`, a new recording, takes P1's Seat to 0), so their units are identical tick for tick across the re-record. |
+| Randomness | Steps 5d and 6e draw nothing (`annexation_draws_no_randomness`). |
+
+The outcome, as implemented (`Sim::outcome() -> Option<Outcome>`, `Sim::result() -> Option<MatchResult { outcome, reason, tick }>`, both also on `SimView`). Step 6e runs last in the step while no outcome is set; the first condition that holds decides, the result's tick is `Sim::tick()` after the step, `MatchDecided` is emitted once, and the result never changes while the sim keeps stepping:
+
+| Order | Condition | Result |
+| --- | --- | --- |
+| 1 | A player has surrendered and exactly one has not | `Victory { that player, decisive: true }`, `Surrender`; everybody surrendered: `Draw`, `Surrender` |
+| 2 | A Seat flipped this step (step 5d) | `Victory { its new owner, decisive: true }`, `SeatCaptured`; Seats flipped to two players in one step: `Draw`, `SeatCaptured` (`annexation_outcome_same_step_mutual_seat_capture_is_a_draw`) |
+| 3 | A flip this step left its old owner with no complete Town (a Town site does not count, owner decision 7) | `Victory { the one player left, decisive: true }`, `AllTownsLost`; nobody left: `Draw` (unreachable with two players: every flip hands its new owner a complete Town, so a same-step mutual capture of two Towns that are not Seats leaves each player a Town and decides nothing, `annexation_outcome_same_step_mutual_town_capture_plays_on`) |
+| 4 | The step reaches `match_cap_ds` (27000 ds, 54000 ticks) | `Victory { the player with the most owned tiles, decisive: false }`, `Territory`; an exact tie for the most: `Draw` (owner decision 1) |
+
+So a surrender beats a same-step Seat capture (`annexation_outcome_surrender_beats_a_same_step_seat_capture`), and capturing the last Town that is also a Seat reads `SeatCaptured`. The `capture_seat` scenario decides `Victory { P0, decisive: true }`, `SeatCaptured`, at tick 1628; the `stalemate_45min` scenario `Victory { P0, decisive: false }`, `Territory`, at tick 54000 (1248 tiles against 1245).
+
 ## Interactions
 
 | System | Interaction |
@@ -183,20 +212,27 @@ From M3a:
 
 From M5a:
 
-- [ ] `cargo test -p sim annexation`: a Town at 0 HP with enemy Skirmishers adjacent and no defender military within 6 tiles flips after 1200 ticks; a defender arriving at tick 600 resets the timer; during the timer `owner_at` returns neutral for its tiles and Train is rejected; capturing the Seat makes `outcome()` return `Victory { decisive: true }`; a 54000-tick scripted stalemate returns `Victory { decisive: false }` for the player with more territory.
-- [ ] `cargo run -p game --features dev -- --scenario capture_seat` shows the victory overlay with the final hash and the recorded replay verifies to it.
+- [x] `cargo test -p sim annexation`: a Town at 0 HP with enemy Skirmishers adjacent and no defender military within 6 tiles flips after 1200 ticks; a defender arriving at tick 600 resets the timer; during the timer `owner_at` returns neutral for its tiles and Train is rejected; capturing the Seat makes `outcome()` return `Victory { decisive: true }`; a 54000-tick scripted stalemate returns `Victory { decisive: false }` for the player with more territory.
+
+  Observed on PR #43, 2026-10-23, with `cargo test -p sim --profile ci annexation -- --nocapture`: `test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out` in m5a and 1 passed in the lib. Entry in step 1 and the flip in step 1201 (500 HP, P0 owning 1245 tiles); a defender arriving in step 601 reset the timer at 599, which restarted in step 651 and flipped in step 1851; during the timer the Town's 1245 tiles were neutral and `Train` was rejected `TownContested`; `capture_seat` ends `Victory { player: PlayerId(0), decisive: true }`, reason SeatCaptured, at tick 1628 with hash `0x2c9a9ef52a5184d0`; the 54000-step stalemate, run and not ignored, ends `Victory { player: PlayerId(0), decisive: false }`, reason Territory, at tick 54000 with 1248 tiles against 1245 (0.25 to 0.30 s).
+
+- [x] `cargo run -p game --features dev -- --scenario capture_seat` shows the victory overlay with the final hash and the recorded replay verifies to it.
+
+  Observed on PR #43, 2026-10-23, on a Linux VM under Xvfb with lavapipe (not the dev Mac), with background mode and `--exit-after-seconds 240` appended and `--profile ci`: exit 0, no ERROR line, `outcome: victory player=0 decisive=true reason=seat_captured tick=1628 hash=0x2c9a9ef52a5184d0` 82 s in and the game frozen at tick 1628 until the deadline; the screenshot at tick 1628 shows "Victory", "The Seat was captured", "1:21, tick 1628" and the final hash; `sim-cli verify` of its replay prints `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628`, `capture_seat.hash`. `M5A_SECONDS=240 just m5a-checks` passes every step (docs/ROADMAP.md, M5a line 3, has the full output). The owner's Mac run is open ([../PLAYTEST.md](../PLAYTEST.md), "Controls checklist (M5a)").
 
 ```bash
 cargo test -p sim annexation
 cargo run -p game --features dev -- --scenario capture_seat
 ```
 
+Good first issue from M5a: a test that a Statecraft level researched mid-timer pushes the neutral kernel's radius and the field still equals `recomputed()` (any OS; `town::refresh` keeps the neutral layer, territory.md). Filed as #45.
+
 ## Open tuning questions
 
-1. Town HP after a flip: the design is silent. Options are keeping 0 HP (the defender can immediately contest it back) or restoring a data-defined fraction. M5a must pick and put the value in `rules.ron`.
+1. Town HP after a flip: the design is silent. Options are keeping 0 HP (the defender can immediately contest it back) or restoring a data-defined fraction. M5a must pick and put the value in `rules.ron`. Decided 2026-10-22 (owner decision 2): `annexation_town_hp_permille: 250`, 500 HP; see "M5a implementation notes".
 2. Does a Town at 0 HP keep shooting? Does Town HP regenerate? Decided 2026-10-21 (owner accepted the M4a plan defaults): it does not shoot, and it is not targeted. Decided 2026-10-21 by the M4a plan (an implementation choice, not one of the nine owner decisions in ROADMAP.md; the owner may revisit): its hit points do not regenerate. Town shooters arrived in the M4a combat behaviour slice, which skips a Town at 0 HP.
-3. Exact territory tie at tick 54000: lowest `PlayerId`, or a `Draw` outcome variant.
+3. Exact territory tie at tick 54000: lowest `PlayerId`, or a `Draw` outcome variant. Decided 2026-10-22 (owner decision 1): `Outcome::Draw`.
 4. Does the Masonry Age gate tier-2 radius growth, or does the age list only mean that tier 2 is usually reached in Masonry? Decided 2026-10-21 (owner accepted the M4a plan defaults): it gates it. `town_growth_age: Some("masonry")` in `rules.ron` names the age, the sim applies it from the M4a tech slice, and `None` removes the gate with no Rust change.
-5. Should Muster Halls and Engine Yards transfer on a flip? This doc treats every kind except Watchtower as civilian for transfer purposes.
-6. Queued training at a flipped Town: cancelled with or without refund to the old owner.
+5. Should Muster Halls and Engine Yards transfer on a flip? This doc treats every kind except Watchtower as civilian for transfer purposes. Decided 2026-10-22 (owner decision 4): they transfer; only kinds with `stays_on_annexation` (the Watchtower) stay, attributed again to the defender's nearest uncontested Town or none.
+6. Queued training at a flipped Town: cancelled with or without refund to the old owner. Decided 2026-10-22 (owner decision 3): every queue entry of a building that changes hands is refunded to the old owner, clamped like `Cancel`; a site's `paid` is zeroed with no refund.
 7. Is 60 s the right timer against a Hard bot that attacks before minute 12? M6 play-bots decide.

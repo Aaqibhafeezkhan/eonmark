@@ -46,7 +46,7 @@ use sim::{Command, UnitId, scenarios};
 use crate::orders::{issue_stop, own_selected_units};
 use crate::palette;
 use crate::selection::Selection;
-use crate::sim_driver::{LOCAL_PLAYER, PendingCommands, SimHandle, SimSystems};
+use crate::sim_driver::{LOCAL_PLAYER, MatchOver, PendingCommands, SimHandle, SimSystems};
 
 /// Bottom bar height, logical px (authored in `Val::Px`: `UiScale` multiplies Px only).
 pub const BOTTOM_BAR_HEIGHT_PX: f32 = 96.0;
@@ -221,8 +221,19 @@ pub struct HudPlugin {
     pub hud_click_check: bool,
 }
 
+/// Stop [`WorldInputSet`] once the match is decided (M5a): from the
+/// outcome on, no drag box, selection click, order or placement reaches
+/// the frozen world (`outcome.rs` blocks picking under its overlay too).
+pub fn gate_world_input(app: &mut App) {
+    app.configure_sets(
+        Update,
+        WorldInputSet.run_if(not(resource_exists::<MatchOver>)),
+    );
+}
+
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
+        gate_world_input(app);
         app.init_resource::<PointerOverUi>()
             .add_systems(Startup, spawn_hud)
             .add_systems(

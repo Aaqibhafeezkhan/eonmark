@@ -8,7 +8,8 @@
 //! The shader reads a field texture with one RGBA8 texel per sim tile: R
 //! the owner code (0 neutral, else player index + 1), G the owning layer's
 //! strength (saturating at 255), B fog (255, all visible, until M7), A
-//! supply (0 until M5a). After every stepped tick the texture is rewritten
+//! supply (0 until M7: M5a owner decision 10 defers the supply hatching to
+//! M7, with fog). After every stepped tick the texture is rewritten
 //! when the field's border sources differ from the ones it shows; the
 //! sources determine every layer and owner, so nothing else can change it.
 //! The GPU texture is updated in place (`GpuImage::prepare_asset` reuses a

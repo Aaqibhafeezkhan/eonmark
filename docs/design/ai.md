@@ -136,8 +136,8 @@ Both knobs are data in `rules.ron` and exist so that tuning never needs Rust cha
 
 | Knob | Effect | Default |
 | --- | --- | --- |
-| Charter Age Harrying bonus | raises attrition damage for a player in the Charter Age (see [attrition.md](attrition.md)) | set at M5a; present from the first `rules.ron` that has ages |
-| Yield Cap decay after minute 30 | optional: lowers every player's Yield Cap by a data-defined step per interval after tick 36000, so a turtled economy stops growing | off (0) until a fun-gate iteration turns it on |
+| Charter Age Harrying bonus | raises attrition damage for a player in the Charter Age (see [attrition.md](attrition.md)) | set at M5a; present from the first `rules.ron` that has ages. Implemented in the M5a attrition slice (`harrying_bonus_age`, `harrying_bonus_hp`), shipped at 0 until M6 |
+| Yield Cap decay after minute 30 | optional: lowers every player's Yield Cap by a data-defined step per interval after tick 36000, so a turtled economy stops growing | off (0) until a fun-gate iteration turns it on. Implemented in the M5a annexation slice (`yield_cap_decay_after_ds`, `yield_cap_decay_every_ds`, `yield_cap_decay_step`; see [economy.md](economy.md), "Yield Cap"), shipped with step 0 |
 
 Turning a knob on is a `rules_version` bump with a one-line reason and a `play-bots` table in the PR.
 

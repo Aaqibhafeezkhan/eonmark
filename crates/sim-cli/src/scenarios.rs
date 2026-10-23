@@ -89,6 +89,25 @@ impl Scenario {
         }
     }
 
+    /// Ticks between `Hash` records in this scenario's recording:
+    /// [`sim::scenarios::STALEMATE_45MIN_HASH_EVERY`] (1000) for the
+    /// 54000-tick `stalemate_45min`, the replay default (20) otherwise.
+    /// `record --hash-every` and `--hash-every-tick` override it.
+    pub fn default_hash_every(self) -> u32 {
+        match self {
+            Scenario::Fixture("stalemate_45min") => sim::scenarios::STALEMATE_45MIN_HASH_EVERY,
+            _ => sim::replay::DEFAULT_HASH_EVERY,
+        }
+    }
+
+    /// Whether a recording of this scenario ends right after the step that
+    /// decides the match (M5a): `capture_seat`, whose by-name length is
+    /// only an upper bound. Its fixture then ends at the deciding tick, so
+    /// its final hash is the one the game shows on the outcome overlay.
+    pub fn stops_at_outcome(self) -> bool {
+        matches!(self, Scenario::Fixture("capture_seat"))
+    }
+
     /// The tick before whose step a recording snapshots the sim, builds a
     /// fresh one and restores into it, so `verify` passing on the fixture
     /// proves the restore was exact. Only `snapshot_restore` has one.
@@ -217,10 +236,10 @@ fn selftest(tick: u32) -> Vec<PlayerCommand> {
 /// Stops for player 0, and invalid commands of every rejectable kind
 /// (unknown player, no valid units, unknown unit kind, not enough techs,
 /// unknown building (`Cancel`, `Gather`, `Train`, `SetRally`, `Research`),
-/// a `Build` by a unit that does not exist, an `Attack` on a unit that does
-/// not exist, and everything player 1 issues after it surrenders). Returns
-/// the
-/// per-tick commands and the `(player, seq)` keys the sim must reject.
+/// a `Build` by a unit that does not exist, an `Attack` or a `DebugDamage`
+/// on a unit that does not exist, and everything player 1 issues after it
+/// surrenders). Returns the per-tick commands and the `(player, seq)` keys
+/// the sim must reject.
 /// `movement` enables Move commands.
 pub fn random_commands(
     seed: u64,
@@ -415,6 +434,19 @@ pub fn random_commands(
                 Command::Attack {
                     units: vec![UnitId(1)],
                     target: TargetId::Unit(UnitId(0)),
+                },
+            ));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
+        } else if (65..69).contains(&bad) {
+            // InvalidTarget: a DebugDamage on UnitId(0), which is never
+            // allocated (M5a).
+            cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq[0],
+                Command::DebugDamage {
+                    target: TargetId::Unit(UnitId(0)),
+                    amount: 1 + rng.next_u32() % 100,
                 },
             ));
             rejected.push((PlayerId(0), seq[0]));

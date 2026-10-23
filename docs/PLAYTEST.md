@@ -94,6 +94,28 @@ Run on 2026-10-22 on a 4-vCPU Linux cloud VM under Xvfb with Mesa's lavapipe (so
 
 The bar target counts stay far below the 400 units because a bar shows only for a damaged or selected target and the hits land mostly on units that then die: P1 keeps 131 of its 200 units, but only 15 of those survivors were ever hit (a scratch count of P1's units with `damage_taken > 0` at tick 811, not in the repository), and units never heal, so each damaged survivor keeps its bar. At most 37 targets were damaged or selected at once (`bar_targets_max=37` in this run and in the S3 runs), so `bar_targets_max` is informational and the plan's ">= 300" guess does not apply.
 
+## Controls checklist (M5a)
+
+Run `cargo run -p game --features dev -- --scenario capture_seat` (it opens over P1's Seat at 40 m; `--camera 101,72,45` also shows the bleeding Bowman to the south). Sign each row in the PR.
+
+| Control | Expected | Proxy | Pass/Fail | Date | Commit | Signed | Notes |
+|---|---|---|---|---|---|---|---|
+| Watch a unit on enemy land the enemy has researched Harrying for, away from your Supply Wain | A steady amber diamond on the ground around its feet while it bleeds (from the first exposed step, not only at a pulse); gone once it is supplied, on its own or neutral land, or dead | `markers::tests::markers_follow_exposure_selection_and_the_timer`; [screenshots/m5a-attrition.png](screenshots/m5a-attrition.png) (the Bowman at tick 150) | | | | | |
+| Click a Supply Wain | A thin Timber ring of 14.5 m around the tile it stands on, with the cream selection ring at its feet; the ring goes when it is deselected | `markers` tests; [screenshots/m5a-markers.png](screenshots/m5a-markers.png) (selected with a real X click, see below) | | | | | |
+| Your Skirmishers stand next to an enemy Town at 0 HP with no defender near | "Town is being annexed" on the message line; a dark circle just outside the units around the Town and your team's arc filling it clockwise from north over a minute; "Annexing Town: 0:42" above the message line, counting down | `markers::tests::markers_follow_exposure_selection_and_the_timer` (the readout for the attacker, the defender and a bystander) and `economy_hud::tests::annexation_notices_name_the_owner_and_the_attacker`; [screenshots/m5a-markers.png](screenshots/m5a-markers.png) (tick 1000, "Annexing Town: 0:32") | | | | | |
+| A defender walks within 6 tiles of the Town (or the Skirmishers leave) | "Annexation stopped"; the circle and the readout are gone | `economy_hud` notices test (the message line); the `markers` test above (the readout is empty while no timer runs); the circle: owner | | | | | |
+| The Seat flips | "Town annexed"; the overlay over the whole window: "Victory", "The Seat was captured", "1:21, tick 1628", "Final hash 0x2c9a9ef52a5184d0", "Replay <file>"; stdout has the `outcome:` line; the units stand still and no tick advances; the Seat's health bar fills a quarter in your colour | `just m5a-checks`; `sim_driver` and `outcome` tests; `health_bars::tests::an_annexed_building_s_fill_takes_the_new_owner_s_colour`; [screenshots/m5a-victory-overlay.png](screenshots/m5a-victory-overlay.png) | | | | | |
+| Click, drag, right-click, A, S, the card and the Stop button after the overlay | Nothing happens to the frozen world (no selection change, no order, no marker); the camera still pans and zooms | `outcome::tests::the_overlay_shows_once_the_match_is_over_and_input_stops` (the input gate; a drag box held at the outcome is dropped, the placement ghost hidden, a marker placed just before it still expires); the blocking overlay: owner | | | | | |
+| Cmd-Q, or `kill -9`, after the overlay; then `verify` the newest replay | One `OK final_hash=<the overlay's hash> ticks=1628` line with no truncation warning either way: the replay was finished at the outcome | `sim_driver::tests::match_over_is_inserted_once_finishes_the_recorder_and_settles_interp`; `just m5a-checks` step 3 | | | | | |
+
+## Automated proxies (M5a)
+
+| Proxy | Command (prefix `xvfb-run -a -s '-screen 0 1280x800x24' env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` on Linux where noted) | Covers | Pass when | Observed |
+|---|---|---|---|---|
+| `just m5a-checks` (ROADMAP M5a line 3, local only: owner decision 14) | `just m5a-checks out` (`scripts/m5a_checks.sh target/ci/eonmark target/release/sim-cli out`; on Linux without a display it wraps the game in `xvfb-run` on lavapipe itself; 150 s, the default, is enough on lavapipe and on the Mac: the sim keeps its 20 ticks a second on both, so the outcome comes about 82 s in; `M5A_SECONDS=240` only as a margin on a slower or loaded host) | the golden's `sim-cli verify`; the game in background mode on `--scenario capture_seat` with `--screenshot-at <deciding tick>`; the `outcome:` line against the golden's hash; `sim-cli verify` of the game's own replay; no process left | the script prints `m5a_checks: ok`: exit 0, no ERROR line, `outcome: victory player=0 decisive=true reason=seat_captured tick=1628 hash=0x2c9a9ef52a5184d0`, the PNG, `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628` for the game's replay, `pgrep -x eonmark` empty | 2026-10-23, Linux VM, lavapipe: every step `PASS`, `m5a_checks: ok, capture_seat decided at tick 1628 with hash 0x2c9a9ef52a5184d0`; the overlay picture is [screenshots/m5a-victory-overlay.png](screenshots/m5a-victory-overlay.png). Re-run at the M5a close (bench commit 7bb1318): the same lines, every step `PASS`. Re-run after the review fixes with the default 150 s (`just m5a-checks out`): every step `PASS`, the outcome 82 s in, `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628` for the game's replay; the picture was retaken from this run and shows the annexed Seat's bar a quarter full in P0's blue |
+| Line 3's own command (dev build) | prefix + `cargo run -p game --locked --profile ci --features dev -- --scenario capture_seat --background --exit-after-seconds 240 --replay-dir out --screenshot-at 1628:out/overlay.png`, then `target/release/sim-cli verify out/<file>.eonreplay` (`--profile ci`: this VM has no dev-profile build of the game, and new target dirs are not used) | the acceptance command as written, with background mode and a deadline appended (rule 25) | exit 0, the `outcome:` line, `verify` OK with the same hash and tick, the clean-exit trailer | 2026-10-23: exit 0, 0 ERROR lines, `replay finished: ... (84 records, tick 1628, hash 0x2c9a9ef52a5184d0)` and `outcome: victory player=0 decisive=true reason=seat_captured tick=1628 hash=0x2c9a9ef52a5184d0` 82 s in; 158 s later `exit-after-seconds reached: seed=31 tick=1628 hash=0x2c9a9ef52a5184d0` (frozen); `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628`; the file ends in `EONRDONE`. The dev Sim panel in its picture reads tick 1628, the same hash and "recording off". Re-run at the M5a close: the same `replay finished`, `outcome:` and `exit-after-seconds reached` lines, 0 ERROR lines, `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628` (ROADMAP M5a line 3) |
+| Marker pictures | prefix + `target/ci/eonmark --background --scenario capture_seat --camera 101,72,45 --replay-dir out --screenshot-at 150:m5a-attrition.png --exit-after-seconds 75`; for the supply ring, the same with `--screenshot-at 1000:m5a-markers.png` and, 28 s in, `xdotool mousemove 600 258; sleep 0.8; xdotool mousedown 1; sleep 0.3; xdotool mouseup 1` on the Supply Wain (a slow click: the hover map needs a frame between the move and the press) | the attrition diamond, the supply ring, the annexation timer and the readout drawn by the game | the pictures show them; `verify` OK (selection is not a command, so the replay is the scenario's) | [screenshots/m5a-attrition.png](screenshots/m5a-attrition.png): `OK final_hash=0x4ea023ca600819a5 ticks=1503`; [screenshots/m5a-markers.png](screenshots/m5a-markers.png): `OK final_hash=0x582f9da6f6cfec81 ticks=1401` |
+
 ## Owner's Mac checklist (M4b)
 
 One session on the dev Mac closes what Linux cannot (owner decision 3 batches it with the M3b and M4a Mac checks). Run from `main` (or the PR branch) at the repository root, paste each command's output into the PR, and sign the [Controls checklist (M4b)](#controls-checklist-m4b) rows.
@@ -136,6 +158,25 @@ What to look for:
 7. `hud_click: ok`, exit 0.
 
 Still open from earlier milestones in the same session: M3b line 2 (`cargo run --release -p game -- --scenario economy_walkthrough` at >= 60 fps, draw calls under 500 from an Xcode Metal frame capture), the M3b [owner] border review (retake `docs/screenshots/m3b-border-40m.png` on the Mac), the M2 and M3b controls checklists above, and the M4a re-measures on the Mac: `cargo run -p sim-cli --release -- bench --units 400 --ticks 1200 --combat` (mean step under 5 ms) and `/usr/bin/time -p cargo test -p sim` (under 10 s).
+
+M5a adds to the same session (nothing of its game half has been drawn by Metal yet):
+
+```bash
+# 8. ROADMAP M5a line 3 as written, then verify its replay (the overlay must show the final hash).
+cargo run -p game --features dev -- --scenario capture_seat
+replay=$(ls -t ~/Library/Application\ Support/com.tonianev.Eonmark/replays/*.eonreplay | head -n 1)
+cargo run -p sim-cli --release -- verify "$replay"
+# 9. Its proxy in background mode (150 s by default; the 1628 ticks take about 82 s).
+just m5a-checks
+# 10. The attrition bench against the plain battle, alternated, and the sim suite with the 54000-step stalemate.
+for i in 1 2 3; do
+  cargo run -p sim-cli --release -- bench --units 400 --ticks 1200 --combat
+  cargo run -p sim-cli --release -- bench --units 400 --ticks 1200 --combat --harrying
+done
+/usr/bin/time -p cargo test -p sim
+```
+
+What to look for: 8. "Victory", "The Seat was captured", "1:21, tick 1628", "Final hash 0x2c9a9ef52a5184d0" over a still world, and `OK final_hash=0x2c9a9ef52a5184d0 ticks=1628`; sign the [Controls checklist (M5a)](#controls-checklist-m5a) rows on the way (the overlay blocking world clicks is an owner row), and look at the annexation arc (a 3 px gizmo line) and the scrim on Metal. 9. `m5a_checks: ok`. 10. Every `step_ms mean=` under 5 ms, the `--harrying` runs within about 0.1 ms of the plain ones (docs/BUILD_TIMES.md has the Linux pairs), and `real` under 10 s.
 
 ## Cmd-Q (M2)
 

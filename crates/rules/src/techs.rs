@@ -8,6 +8,11 @@
 //! need `ages.ron` (every tech is unlocked by exactly one age, after its
 //! host and its predecessor) and line continuity run in `Rules::load`, after
 //! the `ages.ron` references resolve.
+//!
+//! A tech counts toward the `techs_required` of the ages unless it sets
+//! `counts_toward_age: false` (M5a): the Watchtower's Harrying I and II are
+//! such side techs, so `AdvanceAge` and the reachability check count only
+//! the twelve Scriptorium techs.
 
 use crate::Error;
 use crate::modifiers::{Modifier, validate_rows};
@@ -39,6 +44,15 @@ pub struct Tech {
     pub research_time_ds: u32,
     /// What researching it changes.
     pub modifiers: Vec<Modifier>,
+    /// Whether the tech counts toward an age's `techs_required` (M5a);
+    /// `true` when absent. The Harrying techs set `false`.
+    #[serde(default = "default_true")]
+    pub counts_toward_age: bool,
+}
+
+/// Default for [`Tech::counts_toward_age`].
+fn default_true() -> bool {
+    true
 }
 
 /// Contents of `data/rules/techs.ron`.
@@ -182,6 +196,7 @@ mod tests {
                 op: ModOp::Mul,
                 value: 900,
             }],
+            counts_toward_age: true,
         }
     }
 
@@ -253,6 +268,16 @@ mod tests {
         let mut t = sample();
         t.techs[1].level = 3;
         assert!(err(&t).contains("techs[1].level"));
+    }
+
+    #[test]
+    fn counts_toward_age_defaults_to_true() {
+        let text = r#"(techs: [(id: "a_1", name: "A", line: "a", level: 1, host: "town", cost: {}, research_time_ds: 1, modifiers: [])])"#;
+        let t = crate::parse_ron::<Techs>(Path::new("t.ron"), text).unwrap();
+        assert!(t.techs[0].counts_toward_age);
+        let text = text.replace("modifiers: []", "modifiers: [], counts_toward_age: false");
+        let t = crate::parse_ron::<Techs>(Path::new("t.ron"), &text).unwrap();
+        assert!(!t.techs[0].counts_toward_age);
     }
 
     #[test]

@@ -171,7 +171,10 @@ impl Plugin for CommandCardPlugin {
                     update_tooltip,
                     update_selection_info,
                 )
-                    .chain(),
+                    .chain()
+                    // The card freezes with the world at the outcome (M5a);
+                    // the overlay blocks its clicks.
+                    .run_if(not(resource_exists::<crate::sim_driver::MatchOver>)),
             );
     }
 }
@@ -1864,6 +1867,142 @@ mod tests {
         );
         let text = selection_text(&view, &rules, &s, &selected(b));
         assert_eq!(text.lines().last(), Some("Queue: Letters I 50%"), "{text}");
+    }
+
+    /// A Watchtower hosts the Harrying line (M5a rules data), so its card
+    /// offers it as the Scriptorium's card offers its lines: Harrying I
+    /// greyed with "Masonry Age" in the Hearth Age, then enabled with its
+    /// quoted cost and time; in progress while researched; then Harrying
+    /// II greyed with "Charter Age", enabled in the Charter Age, and
+    /// "Researched" once done. Every verdict is the sim's
+    /// `check_research`, and the panel names the level done.
+    #[test]
+    fn watchtower_card_offers_harrying_from_masonry() {
+        let mut lab = Lab::new(standard());
+        let rules = lab.sim.rules().clone();
+        let s = strings();
+        let t = |id| tech(&rules, id);
+        assert!(rejections(&lab.run([place(&rules, "watchtower")])).is_empty());
+        let b = BuildingId(3);
+        let h1 = CardAction::Research(b, t("harrying_1"));
+        let h2 = CardAction::Research(b, t("harrying_2"));
+        // The card offers exactly `action`; its label, second line and
+        // state, enabled exactly when the sim accepts it.
+        let shown = |lab: &Lab, action: CardAction| {
+            let view = lab.sim.view();
+            assert_eq!(card_actions(&view, &rules, &selected(b)), [action]);
+            let CardAction::Research(_, tech) = action else {
+                unreachable!("a Research button")
+            };
+            let (state, line) = card_state(&view, &rules, &s, action);
+            assert_eq!(
+                state.enabled,
+                view.check_research(LOCAL_PLAYER, b, tech).is_ok(),
+                "{state:?}"
+            );
+            (card_label(&rules, &s, action), line, state)
+        };
+        let quote = |lab: &Lab, action: CardAction| {
+            let CardAction::Research(_, tech) = action else {
+                unreachable!("a Research button")
+            };
+            lab.sim.view().research_quote(LOCAL_PLAYER, tech)
+        };
+        let grants = |cost: &[i64]| -> Vec<Command> {
+            cost.iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .map(|(r, c)| grant(u8::try_from(r).unwrap(), u32::try_from(*c).unwrap()))
+                .collect()
+        };
+
+        // The Hearth Age: Harrying I waits for Masonry.
+        let (label, line, state) = shown(&lab, h1);
+        assert_eq!(
+            (label.as_str(), line.as_str(), state.tooltip.as_str()),
+            (
+                "Harrying I",
+                "Masonry Age",
+                "Not available in this age. Requires Masonry Age"
+            )
+        );
+        assert!(!state.enabled);
+
+        // The Masonry Age (two Scriptorium techs, no Letters, so the quote
+        // is the base cost), with exactly Harrying I's cost in Ore and Lore.
+        let mut cmds = vec![debug_research(t("arms_1")), debug_research(t("trade_1"))];
+        cmds.extend(grants(&rules.amounts(&rules.ages[1].cost)));
+        cmds.push(Command::AdvanceAge {
+            player: LOCAL_PLAYER,
+        });
+        assert!(rejections(&lab.run(cmds)).is_empty());
+        let (cost, ticks) = quote(&lab, h1);
+        assert!(rejections(&lab.run(grants(&cost))).is_empty());
+        let (label, line, state) = shown(&lab, h1);
+        assert_eq!(
+            (label.as_str(), line.as_str(), state.enabled),
+            ("Harrying I", "75 Ore 100 Lore", true)
+        );
+        assert_eq!(
+            state.tooltip,
+            "Research Harrying I, 40 s. Costs 75 Ore 100 Lore"
+        );
+        assert_eq!(ticks, 800);
+
+        // A click's command researches it; the button shows the progress.
+        let cmd = card_command(h1).expect("Research issues a command");
+        assert!(rejections(&lab.run([cmd])).is_empty());
+        let (_, line, state) = shown(&lab, h1);
+        assert!(line.starts_with("Researching "), "{line}");
+        assert!(!state.enabled);
+        for _ in 0..ticks {
+            lab.sim.step(&[]);
+        }
+        let events = lab.sim.drain_events();
+        assert!(events.contains(&sim::SimEvent::ResearchCompleted {
+            player: LOCAL_PLAYER,
+            tech: t("harrying_1"),
+        }));
+        let (label, line, state) = shown(&lab, h2);
+        assert_eq!(
+            (label.as_str(), line.as_str(), state.tooltip.as_str()),
+            (
+                "Harrying II",
+                "Charter Age",
+                "Not available in this age. Requires Harrying I, Charter Age"
+            )
+        );
+        let view = lab.sim.view();
+        let text = selection_text(&view, &rules, &s, &selected(b));
+        assert_eq!(
+            text.lines().last(),
+            Some("Researched: Harrying I"),
+            "{text}"
+        );
+        assert_fits_the_panel(&text);
+
+        // The Charter Age: five Scriptorium techs (Harrying counts toward no
+        // age), the age's cost and Harrying II's quote.
+        let mut cmds: Vec<Command> = ["statecraft_1", "letters_1", "letters_2"]
+            .iter()
+            .map(|id| debug_research(t(id)))
+            .collect();
+        cmds.extend(grants(&rules.amounts(&rules.ages[2].cost)));
+        cmds.push(Command::AdvanceAge {
+            player: LOCAL_PLAYER,
+        });
+        assert!(rejections(&lab.run(cmds)).is_empty());
+        assert_eq!(lab.sim.view().age(LOCAL_PLAYER), 2);
+        let (cost, _) = quote(&lab, h2);
+        assert!(rejections(&lab.run(grants(&cost))).is_empty());
+        let (_, line, state) = shown(&lab, h2);
+        assert_eq!((line, state.enabled), (cost_text(&rules, &cost), true));
+        assert!(rejections(&lab.run([debug_research(t("harrying_2"))])).is_empty());
+        let (_, line, state) = shown(&lab, h2);
+        assert_eq!(
+            (line.as_str(), state.enabled, state.tooltip.as_str()),
+            ("Researched", false, "Already researched")
+        );
     }
 
     /// A line with every level researched keeps its button, the top level

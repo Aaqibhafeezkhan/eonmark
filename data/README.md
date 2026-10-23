@@ -15,7 +15,7 @@ reads these files; it never defines gameplay constants of its own.
 | `rules/resources.ron` | The four resources: Grain, Lumber, Ore, Lore | `crates/rules/src/resources.rs` | M0 |
 | `rules/units.ron` | The eight unit kinds: movement, class, hit points, attack, cost and ramp, pop, training time, trainer, `requires_tech`, vision; then the counter table | `crates/rules/src/units.rs` (`Units`) | M1 (training fields M3a, combat M4a) |
 | `rules/buildings.ron` | The eight building kinds: footprint, cost, build time, hit points, vision, base yield, gather slots, per-Town limit, border radius, attack (Town and Watchtower) | `crates/rules/src/buildings.rs` (`Buildings`) | M3a |
-| `rules/techs.ron` | The 12 techs: line, level, host, cost, research time and Modifier rows | `crates/rules/src/techs.rs` (`Techs`) | M4a |
+| `rules/techs.ron` | The 12 Scriptorium techs and, from M5a, the Watchtower's Harrying I and II (side techs that count toward no age): line, level, host, cost, research time, Modifier rows and `counts_toward_age` | `crates/rules/src/techs.rs` (`Techs`) | M4a, M5a |
 | `rules/ages.ron` | The three ages: tech-count gate, cost and what each unlocks | `crates/rules/src/ages.rs` (`Ages`) | M4a |
 | `rules/factions.ron` | The factions and their Modifier rows (Freeholders, none) | `crates/rules/src/factions.rs` (`Factions`) | M4a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |

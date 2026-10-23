@@ -3,10 +3,11 @@
 //! radius a Town derives from its buildings, its owner's age and the
 //! owner's Statecraft rows.
 
+use crate::annexation;
 use crate::construction::{self, centre_fx};
 use crate::economy::building_kind;
 use crate::ids::{BuildingId, PlayerId, Tile, UnitKindId};
-use crate::state::{Construction, SimEvent, State, TownState, Unit};
+use crate::state::{Construction, Hold, SimEvent, State, TownState, Unit};
 use crate::tech;
 use crate::territory::{Source, SourceOwner};
 use rules::{MapDef, Rules};
@@ -25,8 +26,10 @@ pub(crate) fn town_count(state: &State, rules: &Rules, p: PlayerId) -> u32 {
 }
 
 /// The Town a new building centred at `centre` belongs to: the nearest own
-/// complete Town by squared distance between footprint centres, ties by
-/// `BuildingId`. `None` when `p` has no complete Town.
+/// complete Town whose annexation timer is not running, by squared distance
+/// between footprint centres, ties by `BuildingId`. `None` when `p` has no
+/// such Town. A contested Town is skipped (M5a), so nothing new attaches to
+/// a Town that is about to change hands.
 pub(crate) fn attribute(
     state: &State,
     rules: &Rules,
@@ -37,7 +40,12 @@ pub(crate) fn attribute(
     state
         .buildings
         .values()
-        .filter(|b| b.owner == p && b.kind.0 == town && b.construction == Construction::Complete)
+        .filter(|b| {
+            b.owner == p
+                && b.kind.0 == town
+                && b.construction == Construction::Complete
+                && !annexation::is_contested(b)
+        })
         .min_by_key(|b| {
             let c = centre_fx(building_kind(rules, b.kind), b.tile);
             (c.dist_sq_i64(centre), b.id)
@@ -53,7 +61,9 @@ pub(crate) fn attribute(
 /// `TownBorderRadius` rows ([`tech::town_radius`]). A tier change emits
 /// `TownTierChanged`; a radius change, which a tier change or a Statecraft
 /// level makes, moves the Town's border source with
-/// `TerritoryField::change_source` and emits `TerritoryChanged`. Runs when a
+/// `TerritoryField::change_source` and emits `TerritoryChanged`. Only the
+/// radius changes: the source keeps its layer, so a Town whose annexation
+/// timer runs keeps stamping the neutral layer (M5a). Runs when a
 /// building attributed to the Town completes and, through [`refresh_all`],
 /// when the owner completes a tech or advances an age. Does nothing for a
 /// site or a building that is not a Town.
@@ -158,6 +168,7 @@ pub(crate) fn apply_standard_start(state: &mut State, rules: &Rules, def: &MapDe
         b.town_state = Some(TownState {
             seat: true,
             tier: 1,
+            hold: Hold::Held,
         });
         let radius = tech::town_radius(state, rules, p, 1);
         state.territory.add_source(

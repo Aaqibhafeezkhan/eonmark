@@ -76,7 +76,7 @@ Any edit to a RON file changes `rules_hash`, and every golden replay fixture rec
 ```bash
 # 1. Edit a value, for example the Croft gather rate in data/rules/buildings.ron
 #    (rate_per_worker: 10 -> 12).
-# 2. Bump rules_version in data/rules/rules.ron (for example 17 -> 18) and
+# 2. Bump rules_version in data/rules/rules.ron (for example 20 -> 21) and
 #    update the one-line reason in the comment above it.
 # 3. Validate every file under data/. Errors name the file and the field.
 cargo run -p sim-cli -- data-check data
@@ -117,7 +117,7 @@ $ git status --short
 
 Only `economy_second_town` changes its final hash: it is the only fixture with a worked Croft. A test that hard-codes a number the data controls fails this walkthrough; read the value from `Rules` instead.
 
-Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, and since M3b it names the checked UI strings, so with the repository at `rules_version` 17 and the bump to 18 of step 2, step 3 now prints a line of the form `OK rules_version=18 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 factions=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=17`).
+Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, and since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, so with the repository at `rules_version` 20 and the bump to 21 of step 2, step 3 now prints a line of the form `OK rules_version=21 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=20`).
 
 ## Golden replay fixtures
 

@@ -8,6 +8,8 @@
 //! rates are per 30 s ([`crate::RATE_PERIOD_DS`]). Cross-references to
 //! `resources.ron` and `units.ron` are checked here, the reverse ones
 //! (`resources[i].gathered_from`, `units[i].trainer`) in `Rules::load`.
+//! M5a adds `stays_on_annexation`: a kind that stays with the defender
+//! when the Town it belongs to is annexed (the Watchtower), never the Town.
 
 use crate::Error;
 use crate::attack::{Attack, Prefer};
@@ -61,6 +63,12 @@ pub struct BuildingKind {
     /// default) for a kind that does not shoot. `prefer` must be `Units`.
     #[serde(default)]
     pub attack: Option<Attack>,
+    /// Whether buildings and sites of this kind stay with their owner when
+    /// the Town they belong to is annexed (M5a, the Watchtower); the rest
+    /// transfer to the attacker with the Town. `false` when absent; never
+    /// `true` on the Town kind.
+    #[serde(default)]
+    pub stays_on_annexation: bool,
 }
 
 impl BuildingKind {
@@ -265,6 +273,13 @@ fn validate_kind(
         }
         in_range("border_radius_tiles", r, 1, MAX_RADIUS_TILES)?;
     }
+    if b.town && b.stays_on_annexation {
+        return Err(Error::invalid(
+            path,
+            &field("stays_on_annexation"),
+            "an annexed Town is the building that changes hands; only other kinds can stay",
+        ));
+    }
     if let Some(a) = &b.attack {
         crate::attack::validate(path, &field("attack"), a)?;
         if a.prefer != Prefer::Units {
@@ -337,6 +352,7 @@ mod tests {
             max_per_town: None,
             border_radius_tiles: None,
             attack: None,
+            stays_on_annexation: false,
         }
     }
 
@@ -473,6 +489,15 @@ mod tests {
         let mut b = sample();
         b.buildings[0].border_radius_tiles = Some(3);
         assert!(err(&b).contains("buildings[0].border_radius_tiles"));
+    }
+
+    #[test]
+    fn only_a_non_town_kind_stays_on_annexation() {
+        let mut b = sample();
+        b.buildings[3].stays_on_annexation = true;
+        b.validate(Path::new("b.ron"), &RES, &UNITS).unwrap();
+        b.buildings[0].stays_on_annexation = true;
+        assert!(err(&b).contains("buildings[0].stays_on_annexation"));
     }
 
     #[test]

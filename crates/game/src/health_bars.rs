@@ -298,8 +298,9 @@ pub struct SyncedFor {
 /// After a tick or a selection change: spawn a bar pair for every target
 /// that became damaged or selected (top-level entities with the shared
 /// quad, `NotShadowCaster`, `NotShadowReceiver`, no `Pickable`, no
-/// `ChildOf`), update the values of the others, and despawn the pairs of
-/// targets that died or are neither damaged nor selected.
+/// `ChildOf`), update the values of the others (and the fill's material
+/// when an annexation changed the owner), and despawn the pairs of targets
+/// that died or are neither damaged nor selected.
 pub fn sync_bar_targets(
     sim: NonSend<SimHandle>,
     selection: Res<Selection>,
@@ -337,7 +338,16 @@ pub fn sync_bar_targets(
     });
     for (target, spec) in specs {
         match bars.0.get_mut(&target) {
-            Some(bar) => bar.spec = spec,
+            Some(bar) => {
+                // Annexation (M5a) hands a damaged building to a new owner
+                // under the same id: its fill takes the new owner's colour.
+                if bar.spec.owner != spec.owner {
+                    commands
+                        .entity(bar.fill)
+                        .try_insert(MeshMaterial3d(assets.fill_for(spec.owner)));
+                }
+                bar.spec = spec;
+            }
             None => {
                 let back = spawn_part(&mut commands, &assets, target, BarPart::Back, spec.owner);
                 let fill = spawn_part(&mut commands, &assets, target, BarPart::Fill, spec.owner);
@@ -1296,6 +1306,124 @@ mod tests {
         let (back, fill) = entities.expect("the tower had a bar");
         assert!(app.world().get_entity(back).is_err());
         assert!(app.world().get_entity(fill).is_err());
+    }
+
+    /// An annexed building keeps its bar but takes its new owner's fill:
+    /// P1's Town (`BuildingId` 1) at nw (20, 30) is taken to 0 HP, so it has
+    /// a bar in P1's red with the fill hidden; four P0 Skirmishers on the
+    /// tiles north of it annex it, it flips to P0 at a quarter of its hit
+    /// points, and the same bar now fills in P0's blue.
+    #[test]
+    fn an_annexed_building_s_fill_takes_the_new_owner_s_colour() {
+        let rules = rules();
+        let (town_kind, _) = rules.building_kind_by_id("town").unwrap();
+        let sk = unit_kind(&rules, "skirmisher");
+        let town = BuildingId(1);
+        let mut attackers = vec![PlayerCommand::new(
+            LOCAL_PLAYER,
+            0,
+            Command::DebugDamage {
+                target: TargetId::Building(town),
+                amount: u32::MAX,
+            },
+        )];
+        for (seq, x) in (1..).zip(20..24) {
+            attackers.push(PlayerCommand::new(
+                LOCAL_PLAYER,
+                seq,
+                Command::DebugSpawn {
+                    owner: LOCAL_PLAYER,
+                    kind: sk,
+                    at: FxVec2::new(
+                        sim::Fx::from_ratio(2 * x + 1, 2),
+                        sim::Fx::from_ratio(59, 2),
+                    ),
+                    count: 1,
+                },
+            ));
+        }
+        let stream = vec![
+            (
+                0,
+                vec![PlayerCommand::new(
+                    P1,
+                    0,
+                    Command::DebugPlaceBuilding {
+                        owner: P1,
+                        kind: sim::BuildingKindId(town_kind),
+                        tile: Tile::new(20, 30),
+                        complete: true,
+                    },
+                )],
+            ),
+            (1, attackers),
+        ];
+        let mut app = bar_app(stream);
+        let target = TargetId::Building(town);
+        let assets = app.world().resource::<BarAssets>().clone();
+        let fill_material = |app: &App, bar: &Bar| {
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(bar.fill)
+                .expect("the fill entity")
+                .0
+                .id()
+        };
+        let owner_of = |app: &App| {
+            let sim = app.world().non_send::<SimHandle>();
+            sim.view().building(town).map(|b| b.owner)
+        };
+        // Until the Town is at 0 HP and has its (empty) bar in P1's colour.
+        for _ in 0..20 {
+            app.update();
+            if bars(&app).contains_key(&target) {
+                break;
+            }
+        }
+        let before = *bars(&app).get(&target).expect("the 0 HP Town has a bar");
+        assert_eq!(before.spec.owner, P1);
+        assert_eq!(before.spec.hp, 0);
+        assert_eq!(
+            fill_material(&app, &before),
+            assets.fill[1].id(),
+            "P1's red"
+        );
+        // Until it changes hands.
+        for _ in 0..3000 {
+            if owner_of(&app) == Some(LOCAL_PLAYER) {
+                break;
+            }
+            app.update();
+        }
+        assert_eq!(owner_of(&app), Some(LOCAL_PLAYER), "the Town was annexed");
+        app.update();
+        let after = *bars(&app)
+            .get(&target)
+            .expect("the annexed Town is damaged");
+        assert_eq!(
+            (after.back, after.fill),
+            (before.back, before.fill),
+            "the same pair"
+        );
+        assert_eq!(after.spec.owner, LOCAL_PLAYER);
+        assert_eq!(
+            after.spec.hp * 4,
+            after.spec.max,
+            "a quarter of its hit points"
+        );
+        assert_eq!(
+            fill_material(&app, &after),
+            assets.fill[0].id(),
+            "the fill is now P0's blue"
+        );
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(after.back)
+                .unwrap()
+                .0
+                .id(),
+            assets.back.id(),
+            "the track keeps its neutral colour"
+        );
     }
 
     /// The batching guard: however many bars, one mesh and at most three
