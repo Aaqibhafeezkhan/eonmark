@@ -31,7 +31,7 @@ This document lists every third-party crate Eonmark uses, the version it is pinn
 | Crate | Pinned | Purpose | Used by | Notes |
 |---|---|---|---|---|
 | `pathfinding` | 4.16.0 | Test oracle for the in-house A*: reachability and cost equality | `sim` (dev only) | Its `astar` runs to completion and has no budget or resume API, so it is never used at runtime. `cargo tree -p sim -e normal` must not list it. |
-| `proptest` | 1.11.0 | Random-command determinism, cache on/off equivalence, territory incremental-equals-full | `sim` (dev only) | Locally 16 cases in `m1.rs` (32 until the M4a combat behaviour slice kept `cargo test -p sim` under 10 s), 32 in `m3a.rs`, 8 in `m4a.rs`; `PROPTEST_CASES=256` in CI. |
+| `proptest` | 1.11.0 | Random-command determinism, cache on/off equivalence, territory incremental-equals-full | `sim` (dev only) | Locally 8 cases in `m1.rs` (32 until the M4a combat behaviour slice, then 16 until the M4b combat UI slice, each lowered to keep `cargo test -p sim` under 10 s), 16 in `m3a.rs` (32 until the M4b combat UI slice), 8 in `m4a.rs`; `PROPTEST_CASES=256` in CI. |
 | `criterion` | 0.8.2 | `step_500_units`, `territory_recompute`, `astar_budget` benches | `sim` (dev only), from M1 | Declared in `[workspace.dependencies]`; enters `Cargo.lock` when `crates/sim/benches` lands. `sim-cli bench` is the CI-facing wrapper. |
 
 ## Toolchain and dev tools

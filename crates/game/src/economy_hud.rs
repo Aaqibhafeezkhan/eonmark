@@ -5,14 +5,26 @@
 //! the local player's stockpile (`stock / cap` for a capped stockpile such
 //! as Lore) and the income per 30 s from `SimView::income`. The rate turns
 //! amber while production is discarded at the Yield Cap (`raw > credited`,
-//! `docs/design/economy.md`). The pop readout is `SimView::pop`.
+//! `docs/design/economy.md`). The pop readout is `SimView::pop`, at the
+//! right end of the top bar; since M4b the age readout and the Advance
+//! button hang under it on `age_hud`'s age strip, so the top bar's room
+//! goes to the readouts. The top bar's texts never wrap: a bar too full
+//! for the window runs off its right end instead of splitting every
+//! readout onto a second line over the world.
 //!
 //! The message line shows the local player's last command rejection, in the
-//! words of `data/rules/strings/en.ron`, or a short notice (a building of
-//! theirs completed), for [`MESSAGE_SECONDS`]. Rejections arrive as
-//! `SimEventMsg` from the sim driver, `cmd_delay` ticks after the command.
+//! words of `data/rules/strings/en.ron`, or a short notice, for
+//! [`MESSAGE_SECONDS`]: a building of theirs completed, and since M4b a
+//! tech of theirs researched, their next age reached, a building destroyed
+//! (another player's "destroyed", their own "lost") and their Town held at
+//! 0 hit points ([`notice_text`]). Rejections and events arrive as
+//! `SimEventMsg` from the sim driver, rejections `cmd_delay` ticks after
+//! the command.
+//! An `InvalidTarget` for a right-click `Attack` whose target died in those
+//! ticks is not shown (`orders::IssuedAttacks`, M4b).
 //! Every text and number comes from data or the sim; nothing is hard-coded
-//! but the layout.
+//! but the layout. [`HUD_KEYS`] lists every HUD string key the game reads
+//! with the placeholders it fills, and a test holds `en.ron` to it.
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
@@ -21,8 +33,59 @@ use rules::strings::{Strings, fill};
 use sim::{RejectReason, SimEvent};
 
 use crate::hud::{BOTTOM_BAR_HEIGHT_PX, HUD_FONT_PX, HudRoot, PADDING_PX, TopBar, spawn_hud};
+use crate::orders::{IssuedAttacks, target_gone};
 use crate::palette;
 use crate::sim_driver::{LOCAL_PLAYER, SimEventMsg, SimHandle};
+
+/// Every key of the `hud` table in `data/rules/strings/en.ron` that the
+/// game reads, with the placeholders the code fills into it. A value may
+/// use only those (any other would reach the screen as `{name}`), and
+/// each is one of `rules::strings::PLACEHOLDERS`
+/// (`every_hud_key_the_game_reads_exists_with_whitelisted_placeholders`,
+/// which also checks that every key the game's sources pass to
+/// `UiStrings::hud` as a literal is listed here).
+pub const HUD_KEYS: &[(&str, &[&str])] = &[
+    // Top bar (M3b; M4b age readout and Advance button).
+    ("pop", &["used", "cap"]),
+    ("rate", &["rate"]),
+    ("rate.capped", &["rate", "cap"]),
+    ("stockpile.capped", &["count", "cap"]),
+    ("age", &["name"]),
+    ("button.advance", &["name"]),
+    ("button.advance_techs", &["count", "cap"]),
+    ("tooltip.techs", &["count", "cap"]),
+    // Command card (M3b; M4b Attack-move and research).
+    ("button.building", &["building"]),
+    ("button.train", &["unit"]),
+    ("button.cancel", &[]),
+    ("button.attack_move", &[]),
+    ("button.research", &["name"]),
+    ("button.needs", &["name"]),
+    ("button.researching", &["count"]),
+    ("button.researched", &[]),
+    ("tooltip.cost", &["cost"]),
+    ("tooltip.place", &["building"]),
+    ("tooltip.cancel_site", &[]),
+    ("tooltip.attack_move", &[]),
+    ("tooltip.research", &["name", "count"]),
+    ("tooltip.requires", &["name"]),
+    // Selection panel.
+    ("info.units", &["name", "count"]),
+    ("info.hp", &["count", "cap"]),
+    ("info.site", &["count"]),
+    ("info.seat", &["count"]),
+    ("info.town", &["count"]),
+    ("info.workers", &["count", "cap"]),
+    ("info.researched", &["name"]),
+    ("info.queue", &["name"]),
+    // Message line notices.
+    ("notice.completed", &["building"]),
+    ("notice.researched", &["name"]),
+    ("notice.age", &["name"]),
+    ("notice.destroyed", &["building"]),
+    ("notice.lost", &["building"]),
+    ("notice.town_down", &["building"]),
+];
 
 /// How long the message line shows a message, in seconds.
 pub const MESSAGE_SECONDS: f64 = 4.0;
@@ -185,8 +248,9 @@ fn hud_text(text: &str) -> impl Bundle {
     )
 }
 
-/// Fills the top bar with one readout per resource and the pop readout,
-/// and adds the message line above the bottom bar.
+/// Fills the top bar with one readout per resource and, at its right end,
+/// the pop readout, each one line that never wraps, and adds the message
+/// line above the bottom bar.
 pub fn spawn_economy_hud(
     mut commands: Commands,
     sim: Option<NonSend<SimHandle>>,
@@ -213,10 +277,16 @@ pub fn spawn_economy_hud(
                         Name::new(format!("Resource {i}")),
                         ResourceReadout(i),
                         hud_text(""),
+                        TextLayout::no_wrap(),
                     ));
                 }
             });
-            bar.spawn((Name::new("Pop"), PopReadout, hud_text("")));
+            bar.spawn((
+                Name::new("Pop"),
+                PopReadout,
+                hud_text(""),
+                TextLayout::no_wrap(),
+            ));
         });
     }
     if let Ok(root) = root.single() {
@@ -289,12 +359,80 @@ pub fn update_resource_bar(
     }
 }
 
-/// Turn the local player's rejections, and completions of their buildings,
-/// into the message line's text.
+/// The message line's notice for `event`, if the local player gets one:
+/// "Scriptorium complete" (their building), "Letters I researched" (their
+/// tech), "Masonry Age reached" (their age), "Watchtower destroyed"
+/// (another player's building) or "Muster Hall lost" (theirs), and
+/// "Town has fallen" when their Town reaches 0 hit points. Names come from
+/// the rules, by the event's ids (`BuildingDestroyed` carries the owner and
+/// kind of the building it removed) or the building in the view.
+pub fn notice_text(
+    view: &sim::SimView<'_>,
+    rules: &Rules,
+    strings: &UiStrings,
+    event: &SimEvent,
+) -> Option<String> {
+    let building_name = |kind: u16| {
+        rules
+            .building_kind(kind)
+            .map_or("?", |k| k.name.as_str())
+            .to_string()
+    };
+    let own_building = |id: sim::BuildingId| {
+        view.building(id)
+            .filter(|b| b.owner == LOCAL_PLAYER)
+            .map(|b| building_name(b.kind.0))
+    };
+    match event {
+        SimEvent::BuildingCompleted { building } => {
+            let name = own_building(*building)?;
+            Some(fill(
+                strings.hud("notice.completed"),
+                &[("building", &name)],
+            ))
+        }
+        SimEvent::ResearchCompleted { player, tech } if *player == LOCAL_PLAYER => {
+            let name = rules.tech(tech.0).map_or("?", |t| t.name.as_str());
+            Some(fill(strings.hud("notice.researched"), &[("name", name)]))
+        }
+        SimEvent::AgeAdvanced { player, age } if *player == LOCAL_PLAYER => {
+            let name = rules
+                .ages
+                .get(usize::from(*age))
+                .map_or("?", |a| a.name.as_str());
+            Some(fill(strings.hud("notice.age"), &[("name", name)]))
+        }
+        SimEvent::BuildingDestroyed { owner, kind, .. } => {
+            let key = if *owner == LOCAL_PLAYER {
+                "notice.lost"
+            } else {
+                "notice.destroyed"
+            };
+            Some(fill(
+                strings.hud(key),
+                &[("building", &building_name(kind.0))],
+            ))
+        }
+        SimEvent::TownAtZeroHp { town } => {
+            let name = own_building(*town)?;
+            Some(fill(
+                strings.hud("notice.town_down"),
+                &[("building", &name)],
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Turn the local player's rejections, and the events [`notice_text`]
+/// names, into the message line's text; the latest wins. A rejection
+/// [`IssuedAttacks::hides`] (an attack on a target that died before it
+/// applied) is skipped.
 pub fn collect_messages(
     mut events: MessageReader<SimEventMsg>,
     sim: NonSend<SimHandle>,
     strings: Option<Res<UiStrings>>,
+    attacks: Option<Res<IssuedAttacks>>,
     time: Res<Time>,
     mut state: ResMut<MessageState>,
 ) {
@@ -305,20 +443,26 @@ pub fn collect_messages(
     let rules = sim.rules();
     for msg in events.read() {
         let text = match &msg.event {
-            SimEvent::CommandRejected { player, reason, .. } if *player == LOCAL_PLAYER => {
+            SimEvent::CommandRejected {
+                player,
+                seq,
+                reason,
+            } if *player == LOCAL_PLAYER => {
+                let view = sim.view();
+                if attacks
+                    .as_ref()
+                    .is_some_and(|a| a.hides(*seq, reason, |t| target_gone(&view, t)))
+                {
+                    continue;
+                }
                 reject_text(&strings, rules, reason)
             }
-            SimEvent::BuildingCompleted { building } => {
-                let view = sim.view();
-                let Some(b) = view.building(*building).filter(|b| b.owner == LOCAL_PLAYER) else {
+            event => {
+                let Some(text) = notice_text(&sim.view(), rules, &strings, event) else {
                     continue;
                 };
-                let name = rules
-                    .building_kind(b.kind.0)
-                    .map_or("?", |k| k.name.as_str());
-                fill(strings.hud("notice.completed"), &[("building", name)])
+                text
             }
-            _ => continue,
         };
         state.text = text;
         state.since = time.elapsed_secs_f64();
@@ -412,6 +556,290 @@ mod tests {
             all_reasons().len(),
             "no stale reject keys"
         );
+    }
+
+    /// The message line drops an `InvalidTarget` for a remembered attack
+    /// whose target is gone, and shows every other rejection.
+    #[test]
+    fn invalid_target_for_a_dead_target_is_not_shown() {
+        use sim::{TargetId, UnitId};
+        let rules = rules();
+        let setup = sim::MatchSetup::scenario(&rules, 1);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<SimEventMsg>()
+            .insert_resource(strings())
+            .init_resource::<MessageState>()
+            .init_resource::<IssuedAttacks>()
+            .add_systems(Update, collect_messages);
+        app.world_mut()
+            .insert_non_send(SimHandle::from_setup(setup, rules));
+        {
+            let mut attacks = app.world_mut().resource_mut::<IssuedAttacks>();
+            // No unit exists in this empty match: both targets are gone.
+            attacks.record(4, TargetId::Unit(UnitId(7)));
+            attacks.record(5, TargetId::Unit(UnitId(8)));
+        }
+        let rejected = |seq, reason| SimEventMsg {
+            tick: 3,
+            event: SimEvent::CommandRejected {
+                player: LOCAL_PLAYER,
+                seq,
+                reason,
+            },
+        };
+        app.world_mut()
+            .write_message(rejected(4, RejectReason::InvalidTarget));
+        app.update();
+        assert_eq!(app.world().resource::<MessageState>().text, "", "hidden");
+        // Not a remembered attack: shown.
+        app.world_mut()
+            .write_message(rejected(6, RejectReason::InvalidTarget));
+        app.update();
+        assert_eq!(
+            app.world().resource::<MessageState>().text,
+            "Cannot attack that"
+        );
+        // A remembered attack rejected for another reason: shown.
+        app.world_mut()
+            .write_message(rejected(5, RejectReason::NoValidUnits));
+        app.update();
+        assert_eq!(
+            app.world().resource::<MessageState>().text,
+            "No selected unit can do that"
+        );
+    }
+
+    /// Real events from a small match, each named with the view of its
+    /// tick: P0's research and age, P0's Scriptorium placed complete, a P1
+    /// Croft that P0's idle Mangonels destroy and the Scriptorium that P1's
+    /// destroy; P1's own research and Croft get no notice. A Town held at
+    /// 0 needs a long siege, so its event is written by hand: the local
+    /// player's Seat gets the notice, the other player's does not. So is an
+    /// age reached by P1, which has no two techs here: only the local
+    /// player's age is named. The message line shows the latest.
+    #[test]
+    fn notices_name_research_age_and_destroyed_buildings() {
+        use sim::{BuildingId, Command, PlayerCommand, PlayerId};
+        let rules = rules();
+        let s = strings();
+        let mut setup = sim::MatchSetup::scenario(&rules, 1);
+        setup.start = sim::StartKind::Standard;
+        let mut sim = SimHandle::from_setup(setup, rules.clone());
+        let p1 = PlayerId(1);
+        let tech = |id| sim::TechId(rules.tech_by_id(id).unwrap().0);
+        let res = |id| u8::try_from(rules.resource_index(id).unwrap()).unwrap();
+        let bkind = |id| sim::BuildingKindId(rules.building_kind_by_id(id).unwrap().0);
+        let mangonel = sim::UnitKindId(
+            u16::try_from(rules.units.iter().position(|u| u.id == "mangonel").unwrap()).unwrap(),
+        );
+        let place = |owner, kind, x, y| Command::DebugPlaceBuilding {
+            owner,
+            kind: bkind(kind),
+            tile: sim::Tile::new(x, y),
+            complete: true,
+        };
+        let spawn = |owner, x, y| Command::DebugSpawn {
+            owner,
+            kind: mangonel,
+            at: sim::FxVec2::from_ints(x, y),
+            count: 3,
+        };
+        let batch = |p: PlayerId, first: u32, cmds: Vec<Command>| {
+            (first..)
+                .zip(cmds)
+                .map(|(seq, c)| PlayerCommand::new(p, seq, c))
+                .collect::<Vec<_>>()
+        };
+        let mut cmds = batch(
+            LOCAL_PLAYER,
+            0,
+            vec![
+                Command::DebugResearch {
+                    owner: LOCAL_PLAYER,
+                    tech: tech("letters_1"),
+                },
+                Command::DebugResearch {
+                    owner: LOCAL_PLAYER,
+                    tech: tech("trade_1"),
+                },
+                Command::DebugGrant {
+                    owner: LOCAL_PLAYER,
+                    resource: res("grain"),
+                    amount: 250,
+                },
+                Command::DebugGrant {
+                    owner: LOCAL_PLAYER,
+                    resource: res("lore"),
+                    amount: 100,
+                },
+                Command::AdvanceAge {
+                    player: LOCAL_PLAYER,
+                },
+                // BuildingId(3), and P0's Mangonels 11..=13.
+                place(LOCAL_PLAYER, "scriptorium", 34, 28),
+                spawn(LOCAL_PLAYER, 10, 34),
+            ],
+        );
+        cmds.extend(batch(
+            p1,
+            0,
+            vec![
+                Command::DebugResearch {
+                    owner: p1,
+                    tech: tech("arms_1"),
+                },
+                // BuildingId(4), and P1's Mangonels 14..=16.
+                place(p1, "croft", 10, 28),
+                spawn(p1, 34, 36),
+            ],
+        ));
+        // Mangonels prefer buildings: idle, each trio destroys the enemy
+        // building in its reach.
+        let (mut events, mut notices) = (Vec::new(), Vec::new());
+        sim.step(&cmds);
+        for _ in 0..sim.setup().cmd_delay {
+            sim.step(&[]);
+        }
+        for _ in 0..2000 {
+            let view = sim.view();
+            if view.building(BuildingId(3)).is_none() && view.building(BuildingId(4)).is_none() {
+                break;
+            }
+            let stepped = sim.drain_events();
+            let view = sim.view();
+            notices.extend(
+                stepped
+                    .iter()
+                    .filter_map(|e| notice_text(&view, &rules, &s, e)),
+            );
+            events.extend(stepped);
+            sim.step(&[]);
+        }
+        let stepped = sim.drain_events();
+        notices.extend(
+            stepped
+                .iter()
+                .filter_map(|e| notice_text(&sim.view(), &rules, &s, e)),
+        );
+        events.extend(stepped);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SimEvent::CommandRejected { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            notices,
+            [
+                "Letters I researched",
+                "Trade I researched",
+                "Masonry Age reached",
+                "Scriptorium complete",
+                "Croft destroyed",
+                "Scriptorium lost",
+            ],
+            "{events:?}"
+        );
+        let view = sim.view();
+        // A Town held at 0: only the local player's.
+        let down = |town| SimEvent::TownAtZeroHp {
+            town: BuildingId(town),
+        };
+        assert_eq!(
+            notice_text(&view, &rules, &s, &down(1)).as_deref(),
+            Some("Town has fallen")
+        );
+        assert_eq!(notice_text(&view, &rules, &s, &down(2)), None);
+        // An age reached: only the local player's.
+        let aged = |player| SimEvent::AgeAdvanced { player, age: 1 };
+        assert_eq!(
+            notice_text(&view, &rules, &s, &aged(LOCAL_PLAYER)).as_deref(),
+            Some("Masonry Age reached")
+        );
+        assert_eq!(notice_text(&view, &rules, &s, &aged(p1)), None);
+
+        // The message line: the latest notice of a frame wins.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<SimEventMsg>()
+            .insert_resource(s)
+            .init_resource::<MessageState>()
+            .add_systems(Update, collect_messages);
+        app.world_mut().insert_non_send(sim);
+        for event in events {
+            app.world_mut()
+                .write_message(SimEventMsg { tick: 3, event });
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<MessageState>().text,
+            "Scriptorium lost"
+        );
+        app.world_mut().write_message(SimEventMsg {
+            tick: 4,
+            event: down(1),
+        });
+        app.update();
+        assert_eq!(
+            app.world().resource::<MessageState>().text,
+            "Town has fallen"
+        );
+    }
+
+    /// `HUD_KEYS` names every `hud` key the game reads: each exists in
+    /// `en.ron`; its value uses only the placeholders the code fills, each
+    /// of them on the strings file's whitelist; and every `hud("...")`
+    /// literal in the game's sources is listed (keys read through a
+    /// variable, the Seat's and a Town's, are listed by hand).
+    #[test]
+    fn every_hud_key_the_game_reads_exists_with_whitelisted_placeholders() {
+        let s = strings();
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, filled) in HUD_KEYS {
+            assert!(seen.insert(*key), "{key} is listed twice");
+            let value =
+                s.0.hud(key)
+                    .unwrap_or_else(|| panic!("en.ron has no hud[\"{key}\"]"));
+            for name in *filled {
+                assert!(
+                    rules::strings::PLACEHOLDERS.contains(name),
+                    "{key}: {{{name}}} is not a whitelisted placeholder"
+                );
+            }
+            let mut rest = value;
+            while let Some(open) = rest.find('{') {
+                let close = rest[open..].find('}').expect("data-check balances braces");
+                let name = &rest[open + 1..open + close];
+                assert!(
+                    filled.contains(&name),
+                    "hud[\"{key}\"] = {value:?} uses {{{name}}}, which the game does not fill"
+                );
+                rest = &rest[open + close + 1..];
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut literals = 0;
+        for entry in std::fs::read_dir(&src).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read");
+            // The game's code, not its tests.
+            let code = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
+            for (i, _) in code.match_indices("hud(\"") {
+                let rest = &code[i + 5..];
+                let key = &rest[..rest.find('"').expect("closing quote")];
+                literals += 1;
+                assert!(
+                    seen.contains(key),
+                    "{}: hud(\"{key}\") is not in HUD_KEYS",
+                    path.display()
+                );
+            }
+        }
+        assert!(literals > 30, "found {literals} hud(\"...\") reads");
     }
 
     #[test]

@@ -83,11 +83,15 @@ impl TechState {
 /// `target`, through [`modifiers::resolve`]. Unclamped; the wrappers below
 /// clamp.
 pub(crate) fn stat(state: &State, rules: &Rules, p: PlayerId, target: &StatPath, base: i64) -> i64 {
-    let researched = state.tech.player(p).researched.iter().map(|t| t.0);
+    stat_after(rules, &state.tech.player(p).researched, target, base)
+}
+
+/// [`stat`] for a player who has completed exactly `researched`.
+fn stat_after(rules: &Rules, researched: &BTreeSet<TechId>, target: &StatPath, base: i64) -> i64 {
     modifiers::resolve(
         base,
         rules
-            .modifier_rows(FACTION, researched)
+            .modifier_rows(FACTION, researched.iter().map(|t| t.0))
             .filter(|m| m.target == *target),
     )
 }
@@ -200,14 +204,30 @@ pub(crate) fn research_quote(
     p: PlayerId,
     tech: TechId,
 ) -> (Vec<i64>, u32) {
+    research_quote_after(rules, &state.tech.player(p).researched, tech)
+}
+
+/// [`research_quote`] for a player who has completed exactly `researched`:
+/// what a scripted scenario quotes ahead of time (the M4b `enemy_outpost`
+/// grants and beats) without a running sim.
+///
+/// # Panics
+///
+/// If `tech` is not in the rules.
+pub(crate) fn research_quote_after(
+    rules: &Rules,
+    researched: &BTreeSet<TechId>,
+    tech: TechId,
+) -> (Vec<i64>, u32) {
     let t = rules.tech(tech.0).expect("validated tech");
     let mut cost = vec![0i64; rules.resources.resources.len()];
     for (id, &amount) in &t.cost {
         let r = rules.resource_index(id).expect("validated resource id");
-        cost[r] = stat(state, rules, p, &StatPath::ResearchCost, i64::from(amount)).max(0);
+        let base = i64::from(amount);
+        cost[r] = stat_after(rules, researched, &StatPath::ResearchCost, base).max(0);
     }
     let base = i64::from(t.research_time_ds);
-    let ds = stat(state, rules, p, &StatPath::ResearchTime, base).max(0);
+    let ds = stat_after(rules, researched, &StatPath::ResearchTime, base).max(0);
     let ds = u32::try_from(ds).expect("data-check bounds research times");
     (cost, rules.ticks_from_ds(ds).max(1))
 }

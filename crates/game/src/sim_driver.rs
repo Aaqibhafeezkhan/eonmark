@@ -1032,8 +1032,10 @@ fn step_sim(
 /// `App::should_exit` only after the frame, so this system sees messages
 /// written in `Update` (Cmd-Q, `--exit-after-seconds`) and, thanks to the
 /// ordering, the one `exit_on_all_closed` writes in `Last` for the close
-/// button (verified with `--close-window-after-seconds`, M2-C).
-fn finish_recorder_on_exit(
+/// button (verified with `--close-window-after-seconds`, M2-C). Public so
+/// a `Last` system that may itself write `AppExit` (the dev-only
+/// `health_bars::BarHierarchyCheckPlugin`) can run before it.
+pub fn finish_recorder_on_exit(
     mut exits: MessageReader<AppExit>,
     sim: NonSend<SimHandle>,
     mut recorder: ResMut<ReplayRecorder>,
@@ -1065,6 +1067,7 @@ fn finish_recorder_on_exit(
 mod tests {
     use super::*;
     use sim::replay::HashRecord;
+    use sim::{FxVec2, UnitId};
     use std::path::Path;
 
     fn rules() -> Rules {
@@ -1337,6 +1340,91 @@ mod tests {
         let outcome = sim::replay::verify(&path, &data, Box::new(ai::Passive)).unwrap();
         assert_eq!(outcome.exit_code(), 0, "{outcome}");
         assert_eq!(stats.commands_recorded, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An `enemy_outpost` session as the game runs it (plan section 7,
+    /// line 1): `SimPlugin` with the scenario's scripted stream merged with
+    /// local commands, recording through the plugin until an `AppExit`, and
+    /// the file verifies as `sim-cli verify` would. The local commands are
+    /// pushed after tick 0, so their seqs must start above the scripted P0
+    /// seqs 0..=7.
+    #[test]
+    fn enemy_outpost_session_replay_verifies() {
+        let rules = rules();
+        let (setup, stream, _) = scenarios::by_name("enemy_outpost", &rules).unwrap();
+        let scripted_p0 = stream
+            .iter()
+            .flat_map(|(_, cmds)| cmds)
+            .filter(|c| c.player == LOCAL_PLAYER)
+            .count();
+        let path = temp("enemy_outpost_session.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        app.add_plugins(
+            SimPlugin::new(
+                SimHandle::from_setup(setup, rules),
+                Box::new(ScenarioInput::new(stream)),
+            )
+            .recording(Some(path.clone())),
+        );
+        let run_to = |app: &mut App, t: u32| {
+            for _ in 0..1000 {
+                if app.world().non_send::<SimHandle>().tick() >= t {
+                    return;
+                }
+                app.update();
+            }
+            panic!("tick {t} not reached");
+        };
+        run_to(&mut app, 10);
+        let yeomen = vec![UnitId(1), UnitId(2), UnitId(3)];
+        let mut pending = app.world_mut().resource_mut::<PendingCommands>();
+        let moved = pending.push_local(Command::Move {
+            units: yeomen.clone(),
+            target: FxVec2::from_ints(30, 60),
+            queue: false,
+        });
+        assert_eq!(
+            usize::try_from(moved).unwrap(),
+            scripted_p0,
+            "local seqs continue after the scripted P0 seqs"
+        );
+        run_to(&mut app, 60);
+        app.world_mut()
+            .resource_mut::<PendingCommands>()
+            .push_local(Command::Stop { units: yeomen });
+        run_to(&mut app, 150);
+        assert!(app.should_exit().is_none());
+        app.world_mut().write_message(AppExit::Success);
+        // `finish_recorder_on_exit` writes the trailer in this frame's `Last`.
+        app.update();
+        let file = ReplayReader::open(&path).unwrap();
+        assert!(!file.truncated, "the trailer was written");
+        // Every scripted P0 command is issued during tick 0.
+        let local: Vec<&PlayerCommand> = file
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Tick(TickBatch { tick, cmds }) if *tick > 0 => Some(cmds),
+                _ => None,
+            })
+            .flatten()
+            .filter(|c| c.player == LOCAL_PLAYER)
+            .collect();
+        assert_eq!(local.len(), 2, "the two local commands: {local:?}");
+        assert_eq!(local[0].seq, moved);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let outcome = sim::replay::verify(&path, &data, Box::new(ai::Passive)).unwrap();
+        assert_eq!(outcome.exit_code(), 0, "{outcome}");
+        assert!(
+            matches!(outcome, sim::replay::VerifyOutcome::Ok { ticks, .. } if ticks >= 150),
+            "{outcome}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

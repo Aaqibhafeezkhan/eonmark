@@ -5,7 +5,9 @@
 //! derived render-side from the unit's facing vector with `atan2` in f32.
 //! Meshes come from `data/visuals.ron` (`rules::Visual`), one shared mesh
 //! per kind and one material per `(kind, team)` so 200 units are a handful
-//! of draw calls.
+//! of draw calls. Every look is built low-poly and flat-shaded by
+//! [`body_mesh`] (M4b, `docs/ART_STYLE.md`), and [`look_top_y`] gives its
+//! height analytically for whatever is drawn above a unit.
 //!
 //! Coordinates: one tile is one metre; sim `(x, y)` maps to world
 //! `(x - HALF_EXTENT, y_up, y - HALF_EXTENT)` so the 128 x 128 ground mesh
@@ -34,8 +36,30 @@ use crate::sim_driver::{LOCAL_PLAYER, SimHandle, SimSystems, sim_stepped};
 /// the ground, so the pivot is half the total height.
 pub const UNIT_Y: f32 = 0.0;
 
-/// Capsule length (cylinder part) as a multiple of the unit's radius.
+/// Capsule length (cylinder part) as a multiple of the unit's radius, for
+/// `Primitive(Capsule)` (a `Body` capsule carries its own length).
 pub const CAPSULE_LENGTH_PER_RADIUS: f32 = 1.4;
+
+/// Facets around a round look: the capsule's longitudes and the
+/// cylinder's and cone's sides. Low enough to read as flat-shaded low poly
+/// (`docs/ART_STYLE.md`), high enough that the ring of vertices includes
+/// both ends of the x axis, so a lying capsule touches the ground.
+pub const LOOK_SIDES: u32 = 10;
+
+/// Capsule latitudes (the two half-spheres together). Bevy 0.19.1's
+/// builder needs at least 4 (it computes `latitudes / 2 - 2`).
+pub const CAPSULE_LATITUDES: u32 = 6;
+
+/// Icosphere subdivisions of `Primitive(Sphere)`: 80 faces.
+pub const SPHERE_SUBDIVISIONS: u32 = 1;
+
+/// Vertex budget per look. Flat shading gives every triangle its own three
+/// vertices, so this is three times the triangle budget.
+pub const MAX_LOOK_VERTICES: usize = 600;
+
+/// What [`body_mesh`] draws for a `Visual::Scene` until M7 loads glTF, and
+/// for a kind with no visual.
+pub const FALLBACK_VISUAL: Visual = Visual::Primitive(Primitive::Capsule);
 
 /// `StandardMaterial::perceptual_roughness` for every unit (`docs/ART_STYLE.md`: matte).
 pub const MATTE_ROUGHNESS: f32 = 0.95;
@@ -105,30 +129,40 @@ impl Interp {
 pub struct UnitEntities(pub HashMap<UnitId, Entity>);
 
 /// Shared mesh per unit kind and material per `(kind, team)`, created on
-/// first use so draw calls stay low (one batch per combination).
+/// first use so draw calls stay low (one batch per combination), and the
+/// height of each kind's look ([`look_top_y`]), cached with its mesh.
 #[derive(Resource, Default)]
 pub struct UnitVisuals {
     meshes: HashMap<u16, Handle<Mesh>>,
+    top_y: HashMap<u16, f32>,
     materials: HashMap<(u16, u8), Handle<StandardMaterial>>,
 }
 
 impl UnitVisuals {
-    /// The mesh for `kind`, built from its `Visual` and `radius_tiles_x100`.
-    /// A `Visual::Scene` falls back to a capsule until M7.
+    /// The mesh for `kind`, built by [`body_mesh`] from its `Visual` and
+    /// `radius_tiles_x100`. A `Visual::Scene` falls back to
+    /// [`FALLBACK_VISUAL`] until M7. Also caches the look's height for
+    /// [`UnitVisuals::top_y`].
     pub fn mesh(&mut self, kind: u16, rules: &Rules, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
-        self.meshes
-            .entry(kind)
-            .or_insert_with(|| {
-                let radius = rules
-                    .unit_kind(kind)
-                    .map_or(0.35, |k| k.radius_tiles_x100 as f32 / 100.0);
-                let primitive = match rules.visual(kind) {
-                    Some(Visual::Primitive(p)) => *p,
-                    Some(Visual::Scene { .. }) | None => Primitive::Capsule,
-                };
-                meshes.add(primitive_mesh(primitive, radius))
-            })
-            .clone()
+        if let Some(mesh) = self.meshes.get(&kind) {
+            return mesh.clone();
+        }
+        let radius = rules
+            .unit_kind(kind)
+            .map_or(0.35, |k| k.radius_tiles_x100 as f32 / 100.0);
+        let visual = rules.visual(kind).unwrap_or(&FALLBACK_VISUAL);
+        self.top_y.insert(kind, look_top_y(visual, radius));
+        let mesh = meshes.add(body_mesh(visual, radius));
+        self.meshes.insert(kind, mesh.clone());
+        mesh
+    }
+
+    /// Height above the ground of the top of `kind`'s look, in metres, once
+    /// [`UnitVisuals::mesh`] has built it (every kind on screen has). The
+    /// one place anything drawn above a unit takes its height from, so the
+    /// art pass changes only [`look_top_y`].
+    pub fn top_y(&self, kind: u16) -> Option<f32> {
+        self.top_y.get(&kind).copied()
     }
 
     /// The matte team-coloured material for `(kind, team)`.
@@ -203,30 +237,120 @@ pub fn yaw_from_facing(facing: FxVec2) -> f32 {
     }
 }
 
-/// The mesh for a primitive sized from the unit's collision radius: the
-/// capsule and cylinder stand on the ground (their origin is lifted so the
-/// bottom touches y = 0), the cuboid is a radius-wide box of twice the
-/// radius in height, the sphere sits on the ground.
-pub fn primitive_mesh(primitive: Primitive, radius: f32) -> Mesh {
-    let lift = |mut mesh: Mesh, dy: f32| {
-        mesh.translate_by(Vec3::Y * dy);
-        mesh
-    };
-    match primitive {
-        Primitive::Capsule => {
-            let length = radius * CAPSULE_LENGTH_PER_RADIUS;
-            lift(
-                Mesh::from(Capsule3d::new(radius, length)),
-                radius + length * 0.5,
-            )
+/// A unit's look resolved to one primitive shape and its size in metres:
+/// what [`body_mesh`] builds and [`look_top_y`] measures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    /// The shape.
+    pub shape: Primitive,
+    /// Half the width (the kind's collision radius).
+    pub radius: f32,
+    /// Extent along the shape's own axis: the height when upright, the
+    /// length along the unit's facing when `lying`. A sphere's is its
+    /// diameter.
+    pub length: f32,
+    /// Lying on its side, long axis along the facing (+X at yaw 0).
+    pub lying: bool,
+}
+
+impl Look {
+    /// The look `visual` gives a unit of collision radius `radius`:
+    /// `Primitive` sizes the shape from the radius (a capsule 3.4 radii
+    /// tall, everything else 2), `Body` takes its own height, `Scene` is
+    /// [`FALLBACK_VISUAL`] until M7.
+    pub fn of(visual: &Visual, radius: f32) -> Look {
+        let diameter = 2.0 * radius;
+        match visual {
+            Visual::Primitive(shape) => Look {
+                shape: *shape,
+                radius,
+                length: match shape {
+                    Primitive::Capsule => diameter + radius * CAPSULE_LENGTH_PER_RADIUS,
+                    Primitive::Cuboid
+                    | Primitive::Cylinder
+                    | Primitive::Sphere
+                    | Primitive::Cone => diameter,
+                },
+                lying: false,
+            },
+            Visual::Body {
+                shape,
+                height_tiles_x100,
+                lying,
+            } => Look {
+                shape: *shape,
+                radius,
+                // The validator rejects a Body sphere; were one drawn, it
+                // would still be a ball of the kind's radius.
+                length: if *shape == Primitive::Sphere {
+                    diameter
+                } else {
+                    *height_tiles_x100 as f32 / 100.0
+                },
+                lying: *lying,
+            },
+            Visual::Scene { .. } => Look::of(&FALLBACK_VISUAL, radius),
         }
-        Primitive::Cuboid => lift(
-            Mesh::from(Cuboid::new(radius * 2.0, radius * 2.0, radius * 2.0)),
-            radius,
-        ),
-        Primitive::Cylinder => lift(Mesh::from(Cylinder::new(radius, radius * 2.0)), radius),
-        Primitive::Sphere => lift(Mesh::from(Sphere::new(radius)), radius),
     }
+
+    /// Height of the top of the look above the ground: its length when
+    /// upright, its width when lying.
+    pub fn top_y(&self) -> f32 {
+        if self.lying {
+            2.0 * self.radius
+        } else {
+            self.length
+        }
+    }
+}
+
+/// Height above the ground of the top of `visual`'s look for a unit of
+/// collision radius `radius`, in metres, computed from the visual rather
+/// than measured on the mesh (`top_y_matches_the_mesh_aabb` holds them
+/// together). Health bars and other markers above a unit read it through
+/// [`UnitVisuals::top_y`].
+pub fn look_top_y(visual: &Visual, radius: f32) -> f32 {
+    Look::of(visual, radius).top_y()
+}
+
+/// The mesh for a unit look ([`Look::of`]), low-poly and flat-shaded
+/// (`docs/ART_STYLE.md`), standing on the ground at the origin: every
+/// shape is built centred with Bevy's low-resolution builders
+/// ([`LOOK_SIDES`] facets, [`CAPSULE_LATITUDES`], an icosphere of
+/// [`SPHERE_SUBDIVISIONS`]), a lying shape is turned so its long axis is
+/// +X (the facing at yaw 0, see [`yaw_from_facing`]), and the result is
+/// lifted so its bottom touches y = 0. Then every triangle gets its own
+/// vertices and a face normal. The mesh keeps `RenderAssetUsages::default()`
+/// (main and render world): picking ray-casts it on the CPU.
+pub fn body_mesh(visual: &Visual, radius: f32) -> Mesh {
+    let look = Look::of(visual, radius);
+    let (r, length) = (look.radius, look.length);
+    let mesh = match look.shape {
+        Primitive::Capsule => Capsule3d::new(r, (length - 2.0 * r).max(0.0))
+            .mesh()
+            .longitudes(LOOK_SIDES)
+            .latitudes(CAPSULE_LATITUDES)
+            .build(),
+        Primitive::Cuboid => Cuboid::new(2.0 * r, length, 2.0 * r).mesh().build(),
+        Primitive::Cylinder => Cylinder::new(r, length)
+            .mesh()
+            .resolution(LOOK_SIDES)
+            .build(),
+        Primitive::Cone => Cone::new(r, length).mesh().resolution(LOOK_SIDES).build(),
+        Primitive::Sphere => Sphere::new(r)
+            .mesh()
+            .ico(SPHERE_SUBDIVISIONS)
+            .expect("an icosphere of 1 subdivision is far below Bevy's 80-subdivision limit"),
+    };
+    let mut mesh = if look.lying {
+        mesh.rotated_by(Quat::from_rotation_z(-FRAC_PI_2))
+            .translated_by(Vec3::Y * r)
+    } else {
+        mesh.translated_by(Vec3::Y * (length * 0.5))
+    };
+    mesh.duplicate_vertices();
+    mesh.compute_flat_normals();
+    mesh
 }
 
 /// Rotation that lays a gizmo circle (drawn in XY) flat on the ground.
@@ -412,20 +536,213 @@ mod tests {
         assert_eq!(i.sample(2.0).0, Vec3::X * 2.0, "clamped");
     }
 
-    #[test]
-    fn primitive_meshes_stand_on_the_ground() {
-        use bevy::camera::primitives::MeshAabb;
-        for p in [
+    fn repo_rules() -> Rules {
+        Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap()
+    }
+
+    /// `(name, visual, radius)` of every repository unit kind's look.
+    fn repo_looks(rules: &Rules) -> Vec<(String, Visual, f32)> {
+        (0u16..)
+            .zip(&rules.units)
+            .map(|(i, kind)| {
+                let visual = rules.visual(i).expect("every kind has a visual").clone();
+                (
+                    kind.id.clone(),
+                    visual,
+                    kind.radius_tiles_x100 as f32 / 100.0,
+                )
+            })
+            .collect()
+    }
+
+    /// Every repository look plus every shape as a `Primitive`, upright and
+    /// lying `Body`s of each shape a `Body` may have, and a `Scene`.
+    fn every_look(rules: &Rules) -> Vec<(String, Visual, f32)> {
+        let mut looks = repo_looks(rules);
+        for shape in [
             Primitive::Capsule,
             Primitive::Cuboid,
             Primitive::Cylinder,
             Primitive::Sphere,
+            Primitive::Cone,
         ] {
-            let mesh = primitive_mesh(p, 0.35);
+            looks.push((
+                format!("Primitive({shape:?})"),
+                Visual::Primitive(shape),
+                0.35,
+            ));
+            if shape == Primitive::Sphere {
+                continue;
+            }
+            for lying in [false, true] {
+                looks.push((
+                    format!("Body({shape:?}, lying {lying})"),
+                    Visual::Body {
+                        shape,
+                        height_tiles_x100: 150,
+                        lying,
+                    },
+                    0.4,
+                ));
+            }
+        }
+        looks.push((
+            "Scene".into(),
+            Visual::Scene {
+                path: "models/x.glb".into(),
+                scale_x100: 100,
+                y_offset_tiles_x100: 0,
+                yaw_deg: 0,
+            },
+            0.35,
+        ));
+        looks
+    }
+
+    #[test]
+    fn primitive_meshes_stand_on_the_ground() {
+        use bevy::camera::primitives::MeshAabb;
+        for (name, visual, radius) in every_look(&repo_rules()) {
+            let mesh = body_mesh(&visual, radius);
             let aabb = mesh.compute_aabb().expect("positions");
             let min_y = aabb.min().y;
-            assert!(min_y.abs() < 1e-4, "{p:?} bottom at {min_y}");
-            assert!(aabb.max().y > 0.3, "{p:?}");
+            assert!(min_y.abs() < 1e-4, "{name} bottom at {min_y}");
+            assert!(aabb.max().y > 0.3, "{name}");
+            // Centred on the unit's position in the ground plane.
+            let c = aabb.center;
+            assert!(c.x.abs() < 1e-4 && c.z.abs() < 1e-4, "{name} centre {c}");
+        }
+    }
+
+    #[test]
+    fn top_y_matches_the_mesh_aabb() {
+        use bevy::camera::primitives::MeshAabb;
+        let rules = repo_rules();
+        for (name, visual, radius) in every_look(&rules) {
+            let aabb = body_mesh(&visual, radius)
+                .compute_aabb()
+                .expect("positions");
+            let top = look_top_y(&visual, radius);
+            assert!(
+                (aabb.max().y - top).abs() < 1e-4,
+                "{name}: mesh top {} vs look_top_y {top}",
+                aabb.max().y
+            );
+        }
+        // The cache answers once the mesh is built, and only then.
+        let mut meshes = Assets::<Mesh>::default();
+        let mut v = UnitVisuals::default();
+        for (i, (name, visual, radius)) in (0u16..).zip(repo_looks(&rules)) {
+            assert_eq!(v.top_y(i), None, "{name}");
+            v.mesh(i, &rules, &mut meshes);
+            assert_eq!(v.top_y(i), Some(look_top_y(&visual, radius)), "{name}");
+        }
+        // The repository looks, as data/visuals.ron describes them.
+        let tops: Vec<(String, f32)> = repo_looks(&rules)
+            .into_iter()
+            .map(|(name, visual, radius)| (name, look_top_y(&visual, radius)))
+            .collect();
+        let expected = [
+            ("yeoman", 1.19),
+            ("scribe", 0.7),
+            ("skirmisher", 1.5),
+            ("shieldbearer", 1.3),
+            ("bowman", 1.9),
+            ("outrider", 0.9),
+            ("mangonel", 1.0),
+            ("supply_wain", 0.6),
+        ];
+        assert_eq!(tops.len(), expected.len());
+        for ((name, top), (want_name, want)) in tops.iter().zip(expected) {
+            assert_eq!(name, want_name);
+            assert!((top - want).abs() < 1e-5, "{name}: {top} vs {want}");
+        }
+    }
+
+    #[test]
+    fn looks_stay_under_600_vertices() {
+        for (name, visual, radius) in every_look(&repo_rules()) {
+            let mesh = body_mesh(&visual, radius);
+            let n = mesh.count_vertices();
+            assert!(n <= MAX_LOOK_VERTICES, "{name}: {n} vertices");
+            // Flat-shaded: no shared vertices, one face normal per triangle.
+            assert!(mesh.indices().is_none(), "{name} is still indexed");
+            assert_eq!(n % 3, 0, "{name}");
+            let Some(bevy::mesh::VertexAttributeValues::Float32x3(normals)) =
+                mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+            else {
+                panic!("{name} has float3 normals");
+            };
+            for tri in normals.as_chunks::<3>().0 {
+                assert!(tri[0] == tri[1] && tri[1] == tri[2], "{name}: {tri:?}");
+            }
+            // Picking ray-casts the mesh on the CPU, so it stays in the main world.
+            assert!(
+                mesh.asset_usage
+                    .contains(bevy::asset::RenderAssetUsages::MAIN_WORLD),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unit_kind_has_its_own_silhouette() {
+        use bevy::camera::primitives::MeshAabb;
+        let rules = repo_rules();
+        let looks: Vec<(String, Primitive, Vec3)> = repo_looks(&rules)
+            .into_iter()
+            .map(|(name, visual, radius)| {
+                let aabb = body_mesh(&visual, radius)
+                    .compute_aabb()
+                    .expect("positions");
+                let shape = Look::of(&visual, radius).shape;
+                (name, shape, Vec3::from(aabb.half_extents) * 2.0)
+            })
+            .collect();
+        assert_eq!(looks.len(), 8, "eight kinds in units.ron");
+        for (i, (a, shape_a, size_a)) in looks.iter().enumerate() {
+            for (b, shape_b, size_b) in &looks[i + 1..] {
+                if shape_a != shape_b {
+                    continue;
+                }
+                // The same shape must differ by at least 1.4x on some axis.
+                let ratio = (*size_a / *size_b).max(*size_b / *size_a).max_element();
+                assert!(
+                    ratio >= 1.4,
+                    "{a} and {b} are both {shape_a:?} and only {ratio:.2}x apart ({size_a} vs {size_b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lying_bodies_point_along_facing() {
+        use bevy::camera::primitives::MeshAabb;
+        let rules = repo_rules();
+        let lying: Vec<_> = every_look(&rules)
+            .into_iter()
+            .filter(|(_, visual, radius)| Look::of(visual, *radius).lying)
+            .collect();
+        assert!(
+            lying.iter().any(|(name, ..)| name == "outrider"),
+            "the Outrider lies"
+        );
+        for (name, visual, radius) in lying {
+            let look = Look::of(&visual, radius);
+            let mesh = body_mesh(&visual, radius);
+            let size = Vec3::from(mesh.compute_aabb().expect("positions").half_extents) * 2.0;
+            // At yaw 0 (facing +x) the long axis is world x.
+            assert!((size.x - look.length).abs() < 1e-4, "{name}: {size}");
+            assert!((size.y - 2.0 * radius).abs() < 1e-4, "{name}: {size}");
+            assert!(size.z <= 2.0 * radius + 1e-4, "{name}: {size}");
+            assert!(look.length > size.z, "{name} is longer than it is wide");
+            // Turned by the yaw `sync_transforms` gives a unit facing +sim y
+            // (world +z), the long axis follows: it is the world z extent.
+            let yaw = yaw_from_facing(FxVec2::from_ints(0, 1));
+            let turned = mesh.rotated_by(Quat::from_rotation_y(yaw));
+            let size = Vec3::from(turned.compute_aabb().expect("positions").half_extents) * 2.0;
+            assert!((size.z - look.length).abs() < 1e-4, "{name} turned: {size}");
+            assert!(size.x <= 2.0 * radius + 1e-4, "{name} turned: {size}");
         }
     }
 
@@ -495,9 +812,7 @@ mod tests {
 
     #[test]
     fn visuals_are_shared_per_kind_and_team() {
-        let rules =
-            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
-                .unwrap();
+        let rules = repo_rules();
         let mut meshes = Assets::<Mesh>::default();
         let mut materials = Assets::<StandardMaterial>::default();
         let mut v = UnitVisuals::default();

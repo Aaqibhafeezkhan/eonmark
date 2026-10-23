@@ -17,7 +17,7 @@ use bevy::window::{PresentMode, PrimaryWindow, WindowCloseRequested, WindowResol
 use rules::Rules;
 use sim::scenarios;
 
-use crate::cli::Cli;
+use crate::cli::{CameraStart, Cli};
 use crate::frame_stats::FrameStatsPlugin;
 use crate::hud::HudPlugin;
 use crate::monitor_loss::MonitorLossPlugin;
@@ -66,6 +66,37 @@ pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputS
             ))
         }
     }
+}
+
+/// Where the camera starts for a scenario run without `--camera`: the
+/// `unit_looks` lineup is framed at the 40 m acceptance zoom of
+/// `docs/ART_STYLE.md` ("Readability at 40 m"), centred between its two
+/// rows; `enemy_outpost` and `enemy_outpost_walkthrough` open on their
+/// 200 vs 200 prologue east of the river at 55 m, which puts all 400 units
+/// on screen between the HUD bars (ROADMAP M4b acceptance line 2 measures
+/// that fight; the player pans home, Period jumps to an idle Yeoman).
+/// Every other scenario, and a skirmish, starts over the local player's
+/// first units (`present::focus_camera_on_first_units`).
+pub fn default_framing(scenario: Option<&str>) -> Option<CameraStart> {
+    match scenario? {
+        "unit_looks" => Some(CameraStart {
+            x: 20.0,
+            y: 32.0,
+            zoom: 40.0,
+        }),
+        "enemy_outpost" | "enemy_outpost_walkthrough" => Some(CameraStart {
+            x: 106.0,
+            y: 32.0,
+            zoom: 55.0,
+        }),
+        _ => None,
+    }
+}
+
+/// `true` for the scenarios whose prologue is the M4b 200 vs 200 fight:
+/// they print the frame-time lines on exit.
+pub fn is_enemy_outpost(scenario: Option<&str>) -> bool {
+    scenario.is_some_and(|s| s.starts_with("enemy_outpost"))
 }
 
 /// `--exit-after-seconds`: wall-clock deadline for smoke tests.
@@ -142,6 +173,9 @@ pub fn run(cli: &Cli) -> AppExit {
         let (_, stream) = scenarios::units200_auto(&rules);
         (scenarios::EAST, spawn_total(&stream))
     });
+    // The walkthrough's director beats come from the rules too (M4b).
+    let director_beats = (cli.scenario.as_deref() == Some("enemy_outpost_walkthrough"))
+        .then(|| crate::director::walkthrough_beats(&rules));
     let strings = match rules::strings::Strings::load(cli.resolve_data_dir(), "en") {
         Ok(s) => s,
         Err(err) => {
@@ -190,7 +224,10 @@ pub fn run(cli: &Cli) -> AppExit {
     }
     app.insert_resource(ClearColor(palette::SKY));
     app.insert_resource(crate::economy_hud::UiStrings(strings));
-    if let Some(start) = cli.camera {
+    if let Some(start) = cli
+        .camera
+        .or_else(|| default_framing(cli.scenario.as_deref()))
+    {
         app.insert_resource(camera::StartFraming(start));
     }
     app.add_plugins(
@@ -205,13 +242,20 @@ pub fn run(cli: &Cli) -> AppExit {
         crate::render_watchdog::RenderWatchdogPlugin,
         PresentPlugin,
         crate::buildings::BuildingsPlugin,
+        crate::health_bars::HealthBarsPlugin,
         crate::economy_hud::EconomyHudPlugin,
+        crate::age_hud::AgeHudPlugin,
         crate::command_card::CommandCardPlugin,
         crate::placement::PlacementPlugin,
         SelectionPlugin,
         OrdersPlugin,
         HudPlugin { hud_click_check },
     ));
+
+    // Presentation only: frames and selects the walkthrough's beats.
+    if let Some(beats) = director_beats {
+        app.add_plugins(crate::director::DirectorPlugin { beats });
+    }
 
     #[cfg(target_os = "macos")]
     app.add_plugins(crate::macos_menu::MacosMenuPlugin {
@@ -224,6 +268,10 @@ pub fn run(cli: &Cli) -> AppExit {
 
     #[cfg(feature = "dev")]
     app.add_plugins(crate::dev_tools::DevToolsPlugin);
+    // M4b acceptance line 2: health bars and rings stay top-level entities;
+    // prints `hierarchy_check: ...` on exit and exits 1 on a violation.
+    #[cfg(feature = "dev")]
+    app.add_plugins(crate::health_bars::BarHierarchyCheckPlugin);
     #[cfg(feature = "dev")]
     if units200_auto {
         app.add_plugins(crate::selection::SyntheticBoxSelectPlugin);
@@ -235,10 +283,16 @@ pub fn run(cli: &Cli) -> AppExit {
     }
 
     // Frame-time lines on exit: the `units200_auto` owner proxy (with the
-    // arrival count for its scripted move to EAST) and any `--max-fps` run,
-    // whose achieved rate they document.
-    if units200_auto || cli.max_fps.is_some() {
-        app.add_plugins(FrameStatsPlugin { arrival });
+    // arrival count for its scripted move to EAST), the `enemy_outpost`
+    // scenarios' 200 vs 200 prologue (M4b, with the fight window of
+    // acceptance line 2) and any `--max-fps` run, whose achieved rate they
+    // document.
+    let outpost = is_enemy_outpost(cli.scenario.as_deref());
+    if units200_auto || outpost || cli.max_fps.is_some() {
+        app.add_plugins(FrameStatsPlugin {
+            arrival,
+            fight: outpost,
+        });
     }
 
     if let Some(secs) = cli.close_window_after_seconds {
@@ -414,6 +468,150 @@ mod tests {
         let (_, stream) = scenarios::units200_auto(&rules);
         assert_eq!(spawn_total(&stream), 200);
         assert_eq!(spawn_total(&Vec::new()), 0);
+    }
+
+    #[test]
+    fn unit_looks_is_framed_on_its_lineup_at_40_m() {
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let framing = default_framing(Some("unit_looks")).expect("framed");
+        assert_eq!(framing.zoom, 40.0, "the ART_STYLE acceptance distance");
+        assert!(
+            CameraStart::parse(&format!("{},{},{}", framing.x, framing.y, framing.zoom)).is_ok(),
+            "a framing `--camera` would accept"
+        );
+        // Centred on the lineup: within a tile of the middle of its spawns.
+        let (_, stream) = scenarios::unit_looks(&rules);
+        let spawns: Vec<(f32, f32)> = stream
+            .iter()
+            .flat_map(|(_, cmds)| cmds.iter())
+            .filter_map(|c| match &c.cmd {
+                sim::Command::DebugSpawn { at, .. } => Some((
+                    crate::present::fx_to_f32(at.x),
+                    crate::present::fx_to_f32(at.y),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawns.len(), 2 * rules.units.len());
+        let (min_x, max_x, min_y, max_y) = spawns.iter().fold(
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+            |(a, b, c, d), &(x, y)| (a.min(x), b.max(x), c.min(y), d.max(y)),
+        );
+        assert!(
+            (framing.x - (min_x + max_x) / 2.0).abs() <= 1.0,
+            "{min_x}..{max_x}"
+        );
+        assert!(
+            (framing.y - (min_y + max_y) / 2.0).abs() <= 1.0,
+            "{min_y}..{max_y}"
+        );
+        // Nothing else is framed by default but the enemy_outpost pair.
+        for name in scenarios::NAMES.iter().filter(|n| {
+            !matches!(
+                **n,
+                "unit_looks" | "enemy_outpost" | "enemy_outpost_walkthrough"
+            )
+        }) {
+            assert_eq!(default_framing(Some(name)), None, "{name}");
+        }
+        assert_eq!(default_framing(None), None);
+    }
+
+    /// Both `enemy_outpost` scenarios open on their prologue: at tick 3
+    /// every one of the 400 battle units projects inside a 1280 x 800
+    /// window between the HUD's bottom bar and the age strip under its top
+    /// bar, through the RTS camera's own pose and lens at the default
+    /// framing.
+    #[test]
+    fn enemy_outpost_is_framed_on_its_prologue_battle() {
+        use crate::camera::{RtsCamera, ZOOM_MAX, ZOOM_MIN};
+        use crate::hud::{BOTTOM_BAR_HEIGHT_PX, TOP_BAR_HEIGHT_PX};
+        struct NoAi;
+        impl sim::AiController for NoAi {
+            fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
+                Vec::new()
+            }
+        }
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let framing = default_framing(Some("enemy_outpost")).expect("framed");
+        assert_eq!(
+            default_framing(Some("enemy_outpost_walkthrough")),
+            Some(framing)
+        );
+        assert!((ZOOM_MIN..=ZOOM_MAX).contains(&framing.zoom));
+        assert!(is_enemy_outpost(Some("enemy_outpost_walkthrough")));
+        assert!(!is_enemy_outpost(Some("unit_looks")) && !is_enemy_outpost(None));
+        // Centred on the battle: within a tile of the middle of the groups.
+        let centres: Vec<(i32, i32)> = scenarios::OUTPOST_BATTLE_P0_CENTRES
+            .iter()
+            .chain(&scenarios::OUTPOST_BATTLE_P1_CENTRES)
+            .copied()
+            .collect();
+        let mid = |f: fn(&(i32, i32)) -> i32| {
+            let (lo, hi) = (
+                centres.iter().map(f).min().unwrap(),
+                centres.iter().map(f).max().unwrap(),
+            );
+            (lo + hi) as f32 / 2.0
+        };
+        assert!((framing.x - mid(|c| c.0)).abs() <= 1.0, "{framing:?}");
+        assert!((framing.y - mid(|c| c.1)).abs() <= 1.0, "{framing:?}");
+
+        // The camera `camera.rs` spawns (40 degree vertical fov) at this
+        // framing, looking at a 1280 x 800 window.
+        let rts = RtsCamera {
+            focus: Vec3::new(
+                framing.x - crate::ground::HALF_EXTENT,
+                0.0,
+                framing.y - crate::ground::HALF_EXTENT,
+            ),
+            zoom: framing.zoom,
+            zoom_target: framing.zoom,
+        };
+        let transform = GlobalTransform::from(
+            Transform::from_translation(rts.eye()).looking_at(rts.focus, Vec3::Y),
+        );
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(bevy::camera::RenderTargetInfo {
+            physical_size: UVec2::new(WINDOW_SIZE.0, WINDOW_SIZE.1),
+            scale_factor: 1.0,
+        });
+        let projection = Projection::Perspective(PerspectiveProjection {
+            fov: 40.0_f32.to_radians(),
+            near: 0.5,
+            far: 400.0,
+            aspect_ratio: WINDOW_SIZE.0 as f32 / WINDOW_SIZE.1 as f32,
+            ..default()
+        });
+        camera.computed.clip_from_view = projection.get_clip_from_view();
+        let visible = Rect::new(
+            0.0,
+            TOP_BAR_HEIGHT_PX + crate::age_hud::AGE_STRIP_HEIGHT_PX,
+            WINDOW_SIZE.0 as f32,
+            WINDOW_SIZE.1 as f32 - BOTTOM_BAR_HEIGHT_PX,
+        );
+        for name in ["enemy_outpost", "enemy_outpost_walkthrough"] {
+            let (setup, stream, _) = scenarios::by_name(name, &rules).unwrap();
+            let mut sim = sim::Sim::new(setup, rules.clone(), Box::new(NoAi));
+            for t in 0..3 {
+                sim.step(scenarios::commands_at(&stream, t));
+            }
+            let view = sim.view();
+            let battle: Vec<Vec3> = view
+                .units()
+                .filter(|u| u.id.0 > 10)
+                .map(|u| crate::present::world_from_sim(u.pos, 0.0))
+                .collect();
+            assert_eq!(battle.len(), 400, "{name}");
+            for p in battle {
+                let at = camera.world_to_viewport(&transform, p).expect("in front");
+                assert!(visible.contains(at), "{name}: {p} at {at} is off screen");
+            }
+        }
     }
 
     #[test]

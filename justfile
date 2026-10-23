@@ -93,10 +93,10 @@ headless RUN="200":
 m2-checks SCRATCH="":
     EONMARK_BACKGROUND=1 scripts/m2_checks.sh {{SCRATCH}}
 
-# Linux, as CI's game-linux job: render the walkthrough under Xvfb on lavapipe and fail on any render error, such as a WGSL shader that does not compile or a pipeline that never becomes ready (needs xvfb, mesa-vulkan-drivers, libxkbcommon-x11-0); see scripts/render_smoke.sh.
-render-smoke OUT="":
+# Linux, as CI's game-linux job: render the walkthrough under Xvfb on lavapipe and fail on any render error, such as a WGSL shader that does not compile or a pipeline that never becomes ready (needs xvfb, mesa-vulkan-drivers, libxkbcommon-x11-0); see scripts/render_smoke.sh. Optional scenario, camera and tick, with the script's defaults (`just render-smoke out unit_looks 20,32,40 100`); an empty camera passes no --camera, so the game frames the scenario itself (`just render-smoke out unit_looks '' 100`). Each value is passed quoted, so an empty one keeps its place.
+render-smoke OUT="" SCENARIO="economy_walkthrough" CAMERA="38,64,60" TICK="100":
     cargo build -p game --locked --profile ci
-    scripts/render_smoke.sh target/ci/eonmark {{OUT}}
+    scripts/render_smoke.sh target/ci/eonmark "{{OUT}}" "{{SCENARIO}}" "{{CAMERA}}" "{{TICK}}"
 
 # Determinism self-test: scripted ticks twice on two threads, hashes must match.
 selftest:

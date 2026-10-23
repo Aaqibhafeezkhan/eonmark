@@ -12,19 +12,32 @@
 //!   (display sleep, screen lock), which Bevy 0.19.1 would treat as closed.
 //! - [`sim_driver`]: `SimHandle`, the `FixedUpdate` driver, `InputSource`
 //!   (local, replay, scenario), `PendingCommands`, the replay recorder thread.
-//! - [`present`]: `UnitId -> Entity` mirror, interpolation, visuals.
+//! - [`present`]: `UnitId -> Entity` mirror, interpolation, visuals (M4b:
+//!   one low-poly, flat-shaded look per unit kind and its height).
 //! - [`selection`]: picking, click/box/group selection, rings and markers.
-//! - [`orders`]: ground ray-plane hit to `Move` / `Stop` / `AttackMove`.
+//! - [`orders`]: ground ray-plane hit to `Move` / `Stop` / `AttackMove`,
+//!   the contextual right click (M4b: `Attack` on an enemy) and the
+//!   attack-move cursor; orders name only the local player's units.
+//! - [`health_bars`]: team-coloured health bars over damaged or selected
+//!   units and buildings, flat entities keyed by `TargetId` (M4b), and the
+//!   dev-only hierarchy check.
 //! - [`hud`]: top and bottom bars, `PointerOverUi`, the `hud_click` check.
+//! - [`age_hud`]: the age readout and the Advance button on a strip under
+//!   the top bar (M4b), greyed by `SimView::check_advance_age`.
 //! - [`camera`]: the yaw-locked RTS camera.
 //! - [`ground`] and [`palette`]: the flat 128 x 128 m ground mesh and colours.
 //! - [`headless`]: `--headless-run <ticks | replay>` on `MinimalPlugins`.
 //! - [`frame_stats`]: frame-time and arrival lines printed on exit
-//!   (`--scenario units200_auto`, `--max-fps`).
+//!   (`--scenario units200_auto`, the `enemy_outpost` scenarios, `--max-fps`);
+//!   for the `enemy_outpost` scenarios also the 200 vs 200 fight window
+//!   (M4b).
+//! - [`director`]: camera and selection beats for
+//!   `--scenario enemy_outpost_walkthrough` (M4b); never issues a command.
 //! - `macos_menu`: muda menu with the custom Cmd-Q item (macOS only).
 //! - `dev_tools`: FPS overlay, egui inspector (F12) and sim panel (`dev` only).
 #![forbid(unsafe_code)]
 
+pub mod age_hud;
 pub mod app;
 pub mod background;
 pub mod buildings;
@@ -33,11 +46,13 @@ pub mod cli;
 pub mod command_card;
 #[cfg(feature = "dev")]
 pub mod dev_tools;
+pub mod director;
 pub mod economy_hud;
 pub mod field;
 pub mod frame_stats;
 pub mod ground;
 pub mod headless;
+pub mod health_bars;
 pub mod hud;
 #[cfg(target_os = "macos")]
 pub mod macos_menu;

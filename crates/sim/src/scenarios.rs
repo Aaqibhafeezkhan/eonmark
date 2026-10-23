@@ -20,9 +20,17 @@
 //! [`counter_duel_setup`], [`combat_bench`]): its offsets come from the
 //! sim's own RNG, so a stream stays plain data.
 //!
+//! [`unit_looks`] (M4b) is the one scenario that only shows something: a
+//! lineup of every unit kind per player for the 40 m silhouette screenshot.
+//! [`enemy_outpost`] (M4b) is the interactive acceptance scenario, a 200 vs
+//! 200 prologue that frees the player's pop and a lone enemy Watchtower;
+//! [`enemy_outpost_walkthrough`] plays it through as the scripted owner
+//! proxy and golden fixture, at beat ticks derived from the rules
+//! ([`enemy_outpost_beats`]).
+//!
 //! Scenarios start empty ([`StartKind::Empty`]) except
-//! [`economy_second_town`] and [`economy_walkthrough`], which start from
-//! the standard start. On
+//! [`economy_second_town`], [`economy_walkthrough`] and the two outpost
+//! scenarios, which start from the standard start. On
 //! `plains_1v1` that start creates the Seats `BuildingId(1)` (P0) and
 //! `BuildingId(2)` (P1), P0's Yeomen `UnitId(1..=5)` and P1's
 //! `UnitId(6..=10)`, so a stream's own buildings begin at `BuildingId(3)`.
@@ -30,7 +38,7 @@
 use crate::ai_hook::{AiController, SimView};
 use crate::command::{Command, PlayerCommand};
 use crate::fx::FxVec2;
-use crate::ids::{BuildingKindId, PlayerId, Tile, UnitId, UnitKindId};
+use crate::ids::{BuildingId, BuildingKindId, PlayerId, TechId, Tile, UnitId, UnitKindId};
 use crate::state::{MatchSetup, Sim, StartKind};
 use rules::Rules;
 
@@ -117,8 +125,11 @@ pub const ECONOMY_WALKTHROUGH_TICKS: u32 = 2400;
 /// the game's `--scenario`. The first four are the M1 golden fixtures; the
 /// M2 names are windowed scenarios (they may be recorded too);
 /// `economy_second_town` is the M3a golden fixture, `economy_walkthrough`
-/// the M3b one and `combat_skirmish` the M4a one.
-pub const NAMES: [&str; 11] = [
+/// the M3b one and `combat_skirmish` the M4a one; `unit_looks` (M4b) is
+/// windowed only, `enemy_outpost` (M4b) is the interactive acceptance
+/// scenario and `enemy_outpost_walkthrough` its scripted proxy, the M4b
+/// golden fixture.
+pub const NAMES: [&str; 14] = [
     "move_500",
     "move_500_short",
     "group_spiral",
@@ -130,6 +141,9 @@ pub const NAMES: [&str; 11] = [
     "economy_second_town",
     "economy_walkthrough",
     "combat_skirmish",
+    "unit_looks",
+    "enemy_outpost",
+    "enemy_outpost_walkthrough",
 ];
 
 /// Spawn rows of [`bench_cross`]: a band along the west side from the
@@ -1009,6 +1023,573 @@ pub fn combat_bench(rules: &Rules, units: u16, seed: u64) -> (MatchSetup, Stream
     (setup, stream)
 }
 
+/// Length of [`unit_looks`] (informational: the windowed game runs until
+/// it exits).
+pub const UNIT_LOOKS_TICKS: u32 = 600;
+/// Rows of [`unit_looks`]: P0's lineup along y 25, P1's along y 40, both in
+/// the all-grass west rectangle of `plains_1v1` (x 0..43, y 24..41). The
+/// 15 tiles between them are beyond every kind's reach (6 tiles, the
+/// Mangonel's 8.5), so nothing fights.
+pub const UNIT_LOOKS_ROWS: [i32; 2] = [25, 40];
+/// Column of the first kind in [`unit_looks`]; kind `k` (in `units.ron`
+/// order) stands at `UNIT_LOOKS_FIRST_X + k * UNIT_LOOKS_STEP_X`.
+pub const UNIT_LOOKS_FIRST_X: i32 = 6;
+/// Columns between neighbours in [`unit_looks`].
+pub const UNIT_LOOKS_STEP_X: i32 = 4;
+
+/// The M4b looks lineup (`--scenario unit_looks`), the 40 m silhouette
+/// check of `docs/ART_STYLE.md`: on an empty start on `plains_1v1` (seed
+/// 1), during tick 0 each player `DebugSpawn`s one unit of every kind in
+/// `units.ron` order, P0 along row [`UNIT_LOOKS_ROWS`]`[0]` and P1 along
+/// row [`UNIT_LOOKS_ROWS`]`[1]`, kind `k` at column
+/// `UNIT_LOOKS_FIRST_X + k * UNIT_LOOKS_STEP_X`, so with the 8 kinds P0's
+/// units are `UnitId(1..=8)` and P1's `UnitId(9..=16)`. Nothing else is
+/// issued and nothing fights. Windowed only, never a fixture. Length
+/// [`UNIT_LOOKS_TICKS`].
+pub fn unit_looks(rules: &Rules) -> (MatchSetup, Stream) {
+    let setup = MatchSetup::scenario(rules, 1);
+    let mut spawns = Vec::new();
+    for (owner, row) in (0u8..).zip(UNIT_LOOKS_ROWS) {
+        for k in 0..u16::try_from(rules.units.len()).expect("validated unit count") {
+            let x = UNIT_LOOKS_FIRST_X + i32::from(k) * UNIT_LOOKS_STEP_X;
+            spawns.push(PlayerCommand::new(
+                PlayerId(owner),
+                u32::from(k),
+                Command::DebugSpawn {
+                    owner: PlayerId(owner),
+                    kind: UnitKindId(k),
+                    at: FxVec2::from_ints(x, row),
+                    count: 1,
+                },
+            ));
+        }
+    }
+    (setup, vec![(0, spawns)])
+}
+
+/// Seed of [`enemy_outpost`] and [`enemy_outpost_walkthrough`].
+pub const ENEMY_OUTPOST_SEED: u64 = 13;
+/// P1's lone Watchtower in [`enemy_outpost`] (north-west tile, 1x1): the
+/// west bank of the middle ford. Its reach (the Watchtower's range plus a
+/// unit's radius) covers no tile P0 owns at the start, no walkthrough site
+/// and no Mountain tile on P0's side of the river.
+pub const ENEMY_OUTPOST_TOWER: Tile = Tile::new(58, 64);
+/// The Watchtower's id in both scenarios: the standard start's Seats are
+/// `BuildingId(1)` and `BuildingId(2)`, and P1 places the tower during
+/// tick 0, before P0 builds anything.
+pub const ENEMY_OUTPOST_TOWER_ID: BuildingId = BuildingId(3);
+/// Line kinds of the [`enemy_outpost`] prologue battle, one group of each
+/// per side in this order: [`combat_bench`]'s composition, no Mangonels.
+pub const OUTPOST_BATTLE_KINDS: [&str; 4] = COMBAT_BENCH_KINDS;
+/// Units per group in the prologue battle: 4 groups of 50, 200 a side.
+pub const OUTPOST_BATTLE_PER_GROUP: u16 = 50;
+/// Centres of P0's vanguard groups, in [`OUTPOST_BATTLE_KINDS`] order, in
+/// the all-grass east rectangle of `plains_1v1` (x 84..127, y 24..41), on
+/// P1's side of the river: 8 tiles apart, so no two spawns share a tile.
+pub const OUTPOST_BATTLE_P0_CENTRES: [(i32, i32); 4] = [(88, 28), (88, 36), (96, 28), (96, 36)];
+/// Centres of P1's army groups, in [`OUTPOST_BATTLE_KINDS`] order, east of
+/// the vanguard: P0's columns 88 and 96 mirrored across x = 105.5, so the
+/// two armies start at least 9 tiles apart, beyond every kind's reach.
+pub const OUTPOST_BATTLE_P1_CENTRES: [(i32, i32); 4] = [(123, 28), (123, 36), (115, 28), (115, 36)];
+/// Spawn jitter of every prologue group, in hundredths of a tile per axis.
+pub const OUTPOST_BATTLE_JITTER_X100: u8 = 100;
+/// The techs P1 has from tick 0 (`DebugResearch`): Arms I to III, about
+/// 1.33x hit points and damage for every military kind.
+pub const OUTPOST_BATTLE_ARMS: [&str; 3] = ["arms_1", "arms_2", "arms_3"];
+/// Where P1's army attack-moves during [`ENEMY_OUTPOST_T_CHARGE`]: the
+/// middle of the vanguard, so the attack-movers end as guards spread over
+/// its spawn and no straggler is out of their reach.
+pub const OUTPOST_BATTLE_GOAL: FxVec2 = FxVec2::from_ints(92, 32);
+/// Tick during which P1's army attack-moves into the vanguard: after the
+/// game's startup frames, so the first hits land in a running window.
+pub const ENEMY_OUTPOST_T_CHARGE: u32 = 100;
+/// Tick by which the prologue is over: every vanguard unit is dead and
+/// P0's pop is back to its five Yeomen. The last vanguard unit dies during
+/// tick 711 (measured); this is that plus 100, and
+/// `enemy_outpost_battle_clears_the_vanguard` in `crates/sim/tests/m4b.rs`
+/// asserts it. The walkthrough's P0 commands draw nothing from the RNG
+/// and stay out of the battle, so the prologue is the same in both
+/// scenarios.
+pub const ENEMY_OUTPOST_CLEAR_TICK: u32 = 811;
+/// Length of [`enemy_outpost`] (informational: the windowed game runs
+/// until it exits).
+pub const ENEMY_OUTPOST_TICKS: u32 = ENEMY_OUTPOST_CLEAR_TICK + 200;
+/// P0's grants in both outpost scenarios are this many permille of
+/// [`enemy_outpost_bill`] (1.5x), clamped to the stockpile caps.
+pub const OUTPOST_GRANT_PERMILLE: i64 = 1500;
+
+/// The walkthrough's Scriptorium (north-west tile), `BuildingId(4)`, built
+/// by Yeoman 1.
+pub const ENEMY_OUTPOST_SCRIPTORIUM: Tile = Tile::new(27, 58);
+/// The walkthrough's Muster Hall, `BuildingId(5)`, built by Yeoman 2.
+pub const ENEMY_OUTPOST_MUSTER_HALL: Tile = Tile::new(28, 68);
+/// The walkthrough's Engine Yard, `BuildingId(6)`, built by Yeoman 3 once
+/// P0 is in the Masonry Age.
+pub const ENEMY_OUTPOST_ENGINE_YARD: Tile = Tile::new(40, 62);
+/// Where Yeoman 3 walks during the build beat, at least a tile off the
+/// Engine Yard's footprint, so its later walk to the site is short.
+pub const ENEMY_OUTPOST_PREWALK: FxVec2 = FxVec2::from_ints(38, 60);
+/// The rally point of the Muster Hall and the Engine Yard: out of the
+/// Watchtower's reach and out of the Mangonel's own acquisition reach of
+/// the tower, so the army waits there until the siege beat.
+pub const ENEMY_OUTPOST_STAGING: FxVec2 = FxVec2::from_ints(47, 63);
+/// Where the mixed army attack-moves during the siege beat: beside the
+/// Watchtower.
+pub const ENEMY_OUTPOST_SIEGE_GOAL: FxVec2 = FxVec2::from_ints(56, 64);
+/// Tick during which the walkthrough's Yeomen 1 and 2 place the
+/// Scriptorium and the Muster Hall and Yeoman 3 pre-walks: after P1's
+/// tick-0 tower, so the Watchtower is `BuildingId(3)` in both scenarios.
+pub const ENEMY_OUTPOST_BUILD_TICK: u32 = 2;
+/// Ticks added to a construction or training time for the walk to the site
+/// or the rally point, in every beat derived from them.
+pub const ENEMY_OUTPOST_WALK_MARGIN: u32 = 120;
+/// Ticks from a research or the Muster Hall completing to the command
+/// that needs it; the beats test asserts at least this margin for every
+/// prerequisite of every beat.
+pub const ENEMY_OUTPOST_PREREQ_MARGIN: u32 = 40;
+/// Ticks after the siege beat by which the Watchtower is destroyed: the
+/// measured siege (destroyed during tick `siege + 147`) plus 100; the
+/// beats test asserts it.
+pub const ENEMY_OUTPOST_SIEGE_TICKS: u32 = 247;
+/// The two techs the walkthrough researches at its Scriptorium, in order:
+/// the second is queued once the first is complete, at its price.
+pub const ENEMY_OUTPOST_TECHS: [&str; 2] = ["letters_1", "trade_1"];
+/// What the walkthrough's Muster Hall trains, in queue order (the mixed
+/// army, `UnitId(411..=415)`).
+pub const ENEMY_OUTPOST_MUSTER_UNITS: [&str; 5] = [
+    "skirmisher",
+    "skirmisher",
+    "bowman",
+    "bowman",
+    "shieldbearer",
+];
+/// What the walkthrough's Engine Yard trains, in queue order
+/// (`UnitId(416)` and `UnitId(417)`).
+pub const ENEMY_OUTPOST_SIEGE_UNITS: [&str; 2] = ["mangonel", "mangonel"];
+
+/// The beat ticks of [`enemy_outpost_walkthrough`], each the tick during
+/// which its P0 commands are issued (they apply `cmd_delay` later), derived
+/// from the rules by [`enemy_outpost_beats`] so a data change moves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutpostBeats {
+    /// Yeomen 1 and 2 place the Scriptorium and the Muster Hall, Yeoman 3
+    /// pre-walks ([`ENEMY_OUTPOST_BUILD_TICK`]).
+    pub build: u32,
+    /// The Scriptorium is complete: research the first tech.
+    pub research_1: u32,
+    /// The Muster Hall is complete and the vanguard gone: rally to
+    /// [`ENEMY_OUTPOST_STAGING`] and train [`ENEMY_OUTPOST_MUSTER_UNITS`].
+    pub muster: u32,
+    /// The first tech is complete: research the second at its price.
+    pub research_2: u32,
+    /// Both techs are complete: `AdvanceAge`, then (next seq, same tick)
+    /// Yeoman 3 places the Engine Yard.
+    pub age: u32,
+    /// The Engine Yard is complete: rally to the staging point and train
+    /// [`ENEMY_OUTPOST_SIEGE_UNITS`].
+    pub yard: u32,
+    /// Every trained unit stands at the staging point: the Mangonels
+    /// `Attack` the Watchtower and the mixed army attack-moves to
+    /// [`ENEMY_OUTPOST_SIEGE_GOAL`].
+    pub siege: u32,
+    /// Tick by which the Watchtower is destroyed.
+    pub destroy_by: u32,
+    /// Length of the walkthrough: 100 ticks after `destroy_by`.
+    pub ticks: u32,
+}
+
+/// A tech's id by its `techs.ron` id.
+fn tech_id(rules: &Rules, id: &str) -> TechId {
+    TechId(
+        rules
+            .tech_by_id(id)
+            .unwrap_or_else(|| panic!("techs.ron has {id}"))
+            .0,
+    )
+}
+
+/// Units each player gets from the standard start; the outpost streams'
+/// own units begin after both players' (`UnitId(11)` on today's data).
+fn standard_start_units(rules: &Rules) -> u32 {
+    rules.standard_start.units.values().sum()
+}
+
+/// `(first, last)` ids of P0's vanguard, P1's army and P0's trained units
+/// (the Muster Hall's, then the Engine Yard's) in the outpost scenarios.
+fn outpost_ids(rules: &Rules) -> [(u32, u32); 3] {
+    let start = 2 * standard_start_units(rules);
+    let side = u32::from(OUTPOST_BATTLE_PER_GROUP)
+        * u32::try_from(OUTPOST_BATTLE_KINDS.len()).expect("four kinds");
+    let trained = u32::try_from(ENEMY_OUTPOST_MUSTER_UNITS.len() + ENEMY_OUTPOST_SIEGE_UNITS.len())
+        .expect("a handful of units");
+    [
+        (start + 1, start + side),
+        (start + side + 1, start + 2 * side),
+        (start + 2 * side + 1, start + 2 * side + trained),
+    ]
+}
+
+/// The ids of P0's units trained by [`enemy_outpost_walkthrough`], in
+/// training order: the Muster Hall's [`ENEMY_OUTPOST_MUSTER_UNITS`], then
+/// the Engine Yard's [`ENEMY_OUTPOST_SIEGE_UNITS`] (`UnitId(411..=417)` on
+/// today's data).
+pub fn enemy_outpost_trained_ids(rules: &Rules) -> Vec<UnitId> {
+    let (first, last) = outpost_ids(rules)[2];
+    ids(first..=last)
+}
+
+/// Ticks to train `kinds` one after another at one building.
+fn train_ticks(rules: &Rules, kinds: &[&str]) -> u32 {
+    kinds
+        .iter()
+        .map(|k| {
+            let def = rules.unit_kind(unit_kind(rules, k).0).expect("unit kind");
+            rules.train_time_ticks(def)
+        })
+        .sum()
+}
+
+/// Ticks to construct the building kind `id`.
+fn build_ticks(rules: &Rules, id: &str) -> u32 {
+    let (_, def) = rules
+        .building_kind_by_id(id)
+        .unwrap_or_else(|| panic!("buildings.ron has {id}"));
+    rules.build_time_ticks(def)
+}
+
+/// [`ENEMY_OUTPOST_TECHS`] with the quote each is queued at: the second
+/// after the first is complete, so the first's `ResearchCost` and
+/// `ResearchTime` rows (Letters) apply to it.
+fn outpost_research_quotes(rules: &Rules) -> Vec<(TechId, Vec<i64>, u32)> {
+    let mut researched = std::collections::BTreeSet::new();
+    ENEMY_OUTPOST_TECHS
+        .iter()
+        .map(|id| {
+            let tech = tech_id(rules, id);
+            let (cost, ticks) = crate::tech::research_quote_after(rules, &researched, tech);
+            researched.insert(tech);
+            (tech, cost, ticks)
+        })
+        .collect()
+}
+
+/// The walkthrough's beats from the rules: each construction takes its
+/// `build_time_ds` plus [`ENEMY_OUTPOST_WALK_MARGIN`] from the tick its
+/// command applies; each research its quote ([`ENEMY_OUTPOST_TECHS`], the
+/// second at the first's Letters price) plus
+/// [`ENEMY_OUTPOST_PREREQ_MARGIN`]; the Muster Hall trains that margin
+/// after it is complete and no earlier than [`ENEMY_OUTPOST_CLEAR_TICK`]
+/// plus 100 (pop is over the cap until the vanguard is gone); the siege
+/// waits for every queued unit's
+/// `train_time_ds` plus the walk to the staging point; the Watchtower is
+/// destroyed within [`ENEMY_OUTPOST_SIEGE_TICKS`] of it.
+pub fn enemy_outpost_beats(rules: &Rules) -> OutpostBeats {
+    let delay = rules.cmd_delay_ticks;
+    let walk = ENEMY_OUTPOST_WALK_MARGIN;
+    let prereq = ENEMY_OUTPOST_PREREQ_MARGIN;
+    let quotes = outpost_research_quotes(rules);
+    let build = ENEMY_OUTPOST_BUILD_TICK;
+    let research_1 = build + delay + build_ticks(rules, "scriptorium") + walk;
+    let research_2 = research_1 + delay + quotes[0].2 + prereq;
+    let age = research_2 + delay + quotes[1].2 + prereq;
+    let muster_hall = build + delay + build_ticks(rules, "muster_hall") + walk;
+    let muster = (muster_hall + prereq).max(ENEMY_OUTPOST_CLEAR_TICK + 100);
+    let yard = age + delay + build_ticks(rules, "engine_yard") + walk;
+    let siege = (muster + delay + train_ticks(rules, &ENEMY_OUTPOST_MUSTER_UNITS) + walk)
+        .max(yard + delay + train_ticks(rules, &ENEMY_OUTPOST_SIEGE_UNITS) + walk);
+    let destroy_by = siege + ENEMY_OUTPOST_SIEGE_TICKS;
+    OutpostBeats {
+        build,
+        research_1,
+        muster,
+        research_2,
+        age,
+        yard,
+        siege,
+        destroy_by,
+        ticks: destroy_by + 100,
+    }
+}
+
+/// What [`enemy_outpost_walkthrough`] spends, `resources.ron` order, from
+/// the rules: the Scriptorium, the Muster Hall and the Engine Yard (P0's
+/// first of each kind), the two research quotes, the Masonry Age's cost,
+/// and every queued unit at its ramped cost in queue order (the military
+/// ramp counts the entries queued before it at the trainer kind).
+pub fn enemy_outpost_bill(rules: &Rules) -> Vec<i64> {
+    let mut bill = vec![0i64; rules.resources.resources.len()];
+    let mut add = |cost: Vec<i64>| {
+        for (b, c) in bill.iter_mut().zip(cost) {
+            *b += c;
+        }
+    };
+    for id in ["scriptorium", "muster_hall", "engine_yard"] {
+        let (_, def) = rules
+            .building_kind_by_id(id)
+            .unwrap_or_else(|| panic!("buildings.ron has {id}"));
+        add(rules.building_cost(def, 0));
+    }
+    for (_, cost, _) in outpost_research_quotes(rules) {
+        add(cost);
+    }
+    let masonry = rules.age_index("masonry").expect("ages.ron has masonry");
+    add(rules.amounts(&rules.ages[usize::from(masonry)].cost));
+    for queue in [
+        &ENEMY_OUTPOST_MUSTER_UNITS[..],
+        &ENEMY_OUTPOST_SIEGE_UNITS[..],
+    ] {
+        for (i, id) in queue.iter().enumerate() {
+            let def = rules.unit_kind(unit_kind(rules, id).0).expect("unit kind");
+            // `k`: its 1-based position in the trainer kind's queue (the
+            // military ramp); `n`: units of its kind queued before it (P0
+            // has none alive once the vanguard is gone), what a `PerUnit`
+            // ramp reads.
+            let k = u32::try_from(i + 1).expect("a handful of units");
+            let n = queue[..i].iter().filter(|q| *q == id).count();
+            add(rules.unit_cost(def, u32::try_from(n).expect("small"), k));
+        }
+    }
+    bill
+}
+
+/// P0's `DebugGrant`s in both outpost scenarios, `resources.ron` order:
+/// [`OUTPOST_GRANT_PERMILLE`] of [`enemy_outpost_bill`], each clamped to
+/// its resource's stockpile cap.
+pub fn outpost_grants(rules: &Rules) -> Vec<u32> {
+    enemy_outpost_bill(rules)
+        .into_iter()
+        .zip(&rules.resources.resources)
+        .map(|(b, r)| {
+            let v = b * OUTPOST_GRANT_PERMILLE / 1000;
+            let v = r.stockpile_cap.map_or(v, |cap| v.min(i64::from(cap)));
+            u32::try_from(v).expect("grant fits u32")
+        })
+        .collect()
+}
+
+/// The setup both M4b outpost scenarios share (seed
+/// [`ENEMY_OUTPOST_SEED`], the standard start on `plains_1v1`: P0's Seat
+/// `BuildingId(1)` and Yeomen `UnitId(1..=5)`, P1's `BuildingId(2)` and
+/// `UnitId(6..=10)`), and its stream:
+///
+/// - during tick 0, P0 `DebugSpawnJittered`s its 200-unit vanguard on P1's
+///   side of the river ([`OUTPOST_BATTLE_P0_CENTRES`], `UnitId(11..=210)`),
+///   given no orders, so its units guard, and is granted
+///   [`outpost_grants`]; P1 `DebugResearch`es [`OUTPOST_BATTLE_ARMS`],
+///   places its complete Watchtower at [`ENEMY_OUTPOST_TOWER`]
+///   ([`ENEMY_OUTPOST_TOWER_ID`]) and spawns its army east of the vanguard
+///   ([`OUTPOST_BATTLE_P1_CENTRES`], `UnitId(211..=410)`);
+/// - during [`ENEMY_OUTPOST_T_CHARGE`], P1's army attack-moves to
+///   [`OUTPOST_BATTLE_GOAL`]: the 200 vs 200 prologue, which P1 wins, so
+///   P0's pop drops from 255 to its five Yeomen by
+///   [`ENEMY_OUTPOST_CLEAR_TICK`].
+///
+/// P0 uses seq 0..=7 and P1 seq 0..=8.
+pub fn outpost_setup(rules: &Rules) -> (MatchSetup, Stream) {
+    let mut setup = MatchSetup::scenario(rules, ENEMY_OUTPOST_SEED);
+    setup.start = StartKind::Standard;
+    let [p0_ids, p1_ids, _] = outpost_ids(rules);
+    let mut seq = [0u32; 2];
+    let mut cmd = |owner: u8, c: Command| {
+        let i = usize::from(owner);
+        seq[i] += 1;
+        PlayerCommand::new(PlayerId(owner), seq[i] - 1, c)
+    };
+    let jittered = |owner: u8, kind: &str, (x, y): (i32, i32)| Command::DebugSpawnJittered {
+        owner: PlayerId(owner),
+        kind: unit_kind(rules, kind),
+        at: FxVec2::from_ints(x, y),
+        count: OUTPOST_BATTLE_PER_GROUP,
+        jitter_x100: OUTPOST_BATTLE_JITTER_X100,
+    };
+    let mut tick0 = Vec::new();
+    for (kind, at) in OUTPOST_BATTLE_KINDS.iter().zip(OUTPOST_BATTLE_P0_CENTRES) {
+        tick0.push(cmd(0, jittered(0, kind, at)));
+    }
+    for (r, amount) in (0u8..).zip(outpost_grants(rules)) {
+        tick0.push(cmd(
+            0,
+            Command::DebugGrant {
+                owner: PlayerId(0),
+                resource: r,
+                amount,
+            },
+        ));
+    }
+    for id in OUTPOST_BATTLE_ARMS {
+        tick0.push(cmd(
+            1,
+            Command::DebugResearch {
+                owner: PlayerId(1),
+                tech: tech_id(rules, id),
+            },
+        ));
+    }
+    tick0.push(cmd(
+        1,
+        Command::DebugPlaceBuilding {
+            owner: PlayerId(1),
+            kind: building_kind(rules, "watchtower"),
+            tile: ENEMY_OUTPOST_TOWER,
+            complete: true,
+        },
+    ));
+    for (kind, at) in OUTPOST_BATTLE_KINDS.iter().zip(OUTPOST_BATTLE_P1_CENTRES) {
+        tick0.push(cmd(1, jittered(1, kind, at)));
+    }
+    let charge = cmd(
+        1,
+        Command::AttackMove {
+            units: ids(p1_ids.0..=p1_ids.1),
+            target: OUTPOST_BATTLE_GOAL,
+        },
+    );
+    debug_assert_eq!(p0_ids.1 + 1, p1_ids.0);
+    (
+        setup,
+        vec![(0, tick0), (ENEMY_OUTPOST_T_CHARGE, vec![charge])],
+    )
+}
+
+/// The M4b interactive scenario (`--scenario enemy_outpost`): exactly
+/// [`outpost_setup`]. The prologue battle runs on its own and frees P0's
+/// pop; the player then builds up on top of it and destroys the
+/// Watchtower. Length [`ENEMY_OUTPOST_TICKS`] (informational).
+pub fn enemy_outpost(rules: &Rules) -> (MatchSetup, Stream) {
+    outpost_setup(rules)
+}
+
+/// The M4b scripted owner proxy (`enemy_outpost_walkthrough`, a golden
+/// fixture): [`outpost_setup`] plus P0's real commands from seq 8 on, at
+/// the [`enemy_outpost_beats`] ticks:
+///
+/// - `build`: Yeoman 1 places the Scriptorium at
+///   [`ENEMY_OUTPOST_SCRIPTORIUM`] (`BuildingId(4)`), Yeoman 2 the Muster
+///   Hall at [`ENEMY_OUTPOST_MUSTER_HALL`] (`BuildingId(5)`), Yeoman 3
+///   walks to [`ENEMY_OUTPOST_PREWALK`];
+/// - `research_1`: the Scriptorium researches Letters I;
+/// - `muster`: the Muster Hall rallies to [`ENEMY_OUTPOST_STAGING`] and
+///   queues [`ENEMY_OUTPOST_MUSTER_UNITS`] (`UnitId(411..=415)`);
+/// - `research_2`: Trade I, at the Letters price;
+/// - `age`: `AdvanceAge` to the Masonry Age, then Yeoman 3 places the
+///   Engine Yard at [`ENEMY_OUTPOST_ENGINE_YARD`] (`BuildingId(6)`);
+/// - `yard`: the Engine Yard rallies to the staging point and queues two
+///   Mangonels (`UnitId(416)`, `UnitId(417)`);
+/// - `siege`: the Mangonels `Attack` the Watchtower, which they outrange,
+///   and the mixed army attack-moves to [`ENEMY_OUTPOST_SIEGE_GOAL`]; the
+///   tower is destroyed by `destroy_by`.
+///
+/// No command is rejected. Length `enemy_outpost_beats(rules).ticks`.
+pub fn enemy_outpost_walkthrough(rules: &Rules) -> (MatchSetup, Stream) {
+    let (setup, mut stream) = outpost_setup(rules);
+    let beats = enemy_outpost_beats(rules);
+    let p0 = PlayerId(0);
+    let next_seq = stream
+        .iter()
+        .flat_map(|(_, cmds)| cmds)
+        .filter(|c| c.player == p0)
+        .map(|c| c.seq + 1)
+        .max()
+        .unwrap_or(0);
+    // Building ids: the Seats, P1's tower, then P0's in placement order.
+    let first_own = ENEMY_OUTPOST_TOWER_ID.0 + 1;
+    let (scriptorium, muster_hall, yard) = (
+        BuildingId(first_own),
+        BuildingId(first_own + 1),
+        BuildingId(first_own + 2),
+    );
+    let trained = enemy_outpost_trained_ids(rules);
+    let (army, siege) = trained.split_at(ENEMY_OUTPOST_MUSTER_UNITS.len());
+    let place = |unit: u32, kind: &str, at: Tile| Command::Build {
+        unit: UnitId(unit),
+        kind: building_kind(rules, kind),
+        tile: at,
+    };
+    let research = |tech: &str| Command::Research {
+        building: scriptorium,
+        tech: tech_id(rules, tech),
+    };
+    let rally = |building| Command::SetRally {
+        building,
+        target: ENEMY_OUTPOST_STAGING,
+    };
+    let trains = |building, kinds: &[&str]| -> Vec<Command> {
+        kinds
+            .iter()
+            .map(|k| Command::Train {
+                building,
+                kind: unit_kind(rules, k),
+            })
+            .collect()
+    };
+    let mut beat_cmds: Vec<(u32, Vec<Command>)> = vec![
+        (
+            beats.build,
+            vec![
+                place(1, "scriptorium", ENEMY_OUTPOST_SCRIPTORIUM),
+                place(2, "muster_hall", ENEMY_OUTPOST_MUSTER_HALL),
+                Command::Move {
+                    units: vec![UnitId(3)],
+                    target: ENEMY_OUTPOST_PREWALK,
+                    queue: false,
+                },
+            ],
+        ),
+        (beats.research_1, vec![research(ENEMY_OUTPOST_TECHS[0])]),
+        (
+            beats.muster,
+            std::iter::once(rally(muster_hall))
+                .chain(trains(muster_hall, &ENEMY_OUTPOST_MUSTER_UNITS))
+                .collect(),
+        ),
+        (beats.research_2, vec![research(ENEMY_OUTPOST_TECHS[1])]),
+        (
+            beats.age,
+            vec![
+                Command::AdvanceAge { player: p0 },
+                place(3, "engine_yard", ENEMY_OUTPOST_ENGINE_YARD),
+            ],
+        ),
+        (
+            beats.yard,
+            std::iter::once(rally(yard))
+                .chain(trains(yard, &ENEMY_OUTPOST_SIEGE_UNITS))
+                .collect(),
+        ),
+        (
+            beats.siege,
+            vec![
+                Command::Attack {
+                    units: siege.to_vec(),
+                    target: crate::ids::TargetId::Building(ENEMY_OUTPOST_TOWER_ID),
+                },
+                Command::AttackMove {
+                    units: army.to_vec(),
+                    target: ENEMY_OUTPOST_SIEGE_GOAL,
+                },
+            ],
+        ),
+    ];
+    // Seq numbers follow the ticks (a stable sort keeps a tick's commands
+    // in the order above); then merge into the setup's stream.
+    beat_cmds.sort_by_key(|(t, _)| *t);
+    let mut seq = next_seq;
+    for (tick, cmds) in beat_cmds {
+        let cmds: Vec<PlayerCommand> = cmds
+            .into_iter()
+            .map(|c| {
+                seq += 1;
+                PlayerCommand::new(p0, seq - 1, c)
+            })
+            .collect();
+        match stream.binary_search_by_key(&tick, |(t, _)| *t) {
+            Ok(i) => stream[i].1.extend(cmds),
+            Err(i) => stream.insert(i, (tick, cmds)),
+        }
+    }
+    (setup, stream)
+}
+
 /// Look a scenario up by name: `(setup, stream, ticks)`.
 pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
     let (setup, stream, ticks) = match name {
@@ -1055,6 +1636,18 @@ pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
         "combat_skirmish" => {
             let (s, c) = combat_skirmish(rules);
             (s, c, COMBAT_SKIRMISH_TICKS)
+        }
+        "unit_looks" => {
+            let (s, c) = unit_looks(rules);
+            (s, c, UNIT_LOOKS_TICKS)
+        }
+        "enemy_outpost" => {
+            let (s, c) = enemy_outpost(rules);
+            (s, c, ENEMY_OUTPOST_TICKS)
+        }
+        "enemy_outpost_walkthrough" => {
+            let (s, c) = enemy_outpost_walkthrough(rules);
+            (s, c, enemy_outpost_beats(rules).ticks)
         }
         _ => return None,
     };
@@ -1123,6 +1716,62 @@ mod tests {
             assert_eq!(keys.len(), n, "{name}");
         }
         assert!(by_name("nope", &rules).is_none());
+    }
+
+    /// The M4b looks lineup: one unit of every kind per player on two rows
+    /// of grass, in `units.ron` order, too far apart for anything to fight.
+    #[test]
+    fn unit_looks_lines_up_every_kind_per_player_out_of_reach() {
+        let rules = rules();
+        let kinds = rules.units.len();
+        let map = crate::map::Map::from_def(rules.map(&rules.default_map).unwrap());
+        // The rows are farther apart than any kind reaches, radii included.
+        let gap_x100 = u32::try_from(UNIT_LOOKS_ROWS[1] - UNIT_LOOKS_ROWS[0]).unwrap() * 100;
+        let widest = rules
+            .units
+            .iter()
+            .map(|k| k.radius_tiles_x100)
+            .max()
+            .unwrap();
+        for kind in &rules.units {
+            if let Some(attack) = &kind.attack {
+                let reach = rules.acquire_reach(attack) + kind.radius_tiles_x100 + widest;
+                assert!(gap_x100 > reach, "{} reaches {reach}", kind.id);
+            }
+        }
+        let (setup, stream) = unit_looks(&rules);
+        assert_eq!(setup.seed, 1);
+        assert_eq!(stream.len(), 1, "only the tick-0 spawns");
+        assert_eq!(commands_at(&stream, 0).len(), 2 * kinds);
+        // 200 ticks: the spawns apply after cmd_delay and then nothing happens.
+        let sim = run(setup, rules.clone(), &stream, 200);
+        let view = sim.view();
+        assert_eq!(
+            view.unit_count(),
+            2 * kinds,
+            "every spawn applied, nobody died"
+        );
+        let mut seen = Vec::new();
+        for unit in view.units() {
+            let owner = usize::from(unit.owner.0);
+            let x = UNIT_LOOKS_FIRST_X + i32::from(unit.kind.0) * UNIT_LOOKS_STEP_X;
+            let tile = map.tile_of(FxVec2::from_ints(x, UNIT_LOOKS_ROWS[owner]));
+            assert!(map.passable(tile), "{tile:?}");
+            assert_eq!(
+                map.tile_of(unit.pos),
+                tile,
+                "{:?} stayed on its spot",
+                unit.id
+            );
+            assert_eq!(unit.damage_taken, 0, "{:?}", unit.id);
+            // P0's units first, each player's in kind order.
+            let expected_id = u32::try_from(owner * kinds).unwrap() + u32::from(unit.kind.0) + 1;
+            assert_eq!(unit.id, UnitId(expected_id));
+            seen.push((unit.owner, unit.kind));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 2 * kinds, "one of each kind per player");
     }
 
     /// The economy fixture's ids follow from the standard start: its own

@@ -43,7 +43,7 @@ use bevy::text::FontSize;
 use bevy::window::{PrimaryWindow, WindowRef};
 use sim::{Command, UnitId, scenarios};
 
-use crate::orders::issue_stop;
+use crate::orders::{issue_stop, own_selected_units};
 use crate::palette;
 use crate::selection::Selection;
 use crate::sim_driver::{LOCAL_PLAYER, PendingCommands, SimHandle, SimSystems};
@@ -345,20 +345,20 @@ pub fn update_pointer_over_ui(
 }
 
 /// A primary `Pointer<Click>` on the Stop button issues `orders::issue_stop`
-/// for the selection (observer attached by [`spawn_hud`]).
+/// for the local player's selected units (observer attached by
+/// [`spawn_hud`]).
 fn on_stop_click(
     click: On<Pointer<Click>>,
+    sim: NonSend<SimHandle>,
     selection: Res<Selection>,
     mut pending: ResMut<PendingCommands>,
 ) {
     if click.event().event.button != PointerButton::Primary {
         return;
     }
-    if let Some(seq) = issue_stop(&mut pending, &selection) {
-        info!(
-            "stop button: Stop seq {seq} for {} units",
-            selection.units.len()
-        );
+    let own = own_selected_units(&sim.view(), &selection);
+    if let Some(seq) = issue_stop(&mut pending, &own) {
+        info!("stop button: Stop seq {seq} for {} units", own.len());
     }
 }
 
@@ -688,6 +688,76 @@ mod tests {
         assert_eq!(
             verdict_line(Some("a Move was queued")),
             "hud_click: FAIL a Move was queued"
+        );
+    }
+
+    /// The Stop button's observer orders only the local player's selected
+    /// units: nothing for another player's units alone, the own ones of a
+    /// mixed selection.
+    #[test]
+    fn the_stop_button_stops_only_own_units() {
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let mut setup = sim::MatchSetup::scenario(&rules, 1);
+        setup.start = sim::StartKind::Standard;
+        // P0's Yeomen are 1..=5, P1's 6..=10.
+        let mut handle = SimHandle::from_setup(setup, rules);
+        for _ in 0..=handle.setup().cmd_delay {
+            handle.step(&[]);
+        }
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<PendingCommands>()
+            .init_resource::<Selection>();
+        app.world_mut().insert_non_send(handle);
+        let button = app
+            .world_mut()
+            .spawn(StopButton)
+            .observe(on_stop_click)
+            .id();
+        app.update();
+        let click = |app: &mut App| {
+            app.world_mut().trigger(Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+                Click {
+                    button: PointerButton::Primary,
+                    hit: bevy::picking::backend::HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+                    duration: std::time::Duration::ZERO,
+                    count: 1,
+                },
+                button,
+            ));
+        };
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .set([UnitId(6), UnitId(7)]);
+        click(&mut app);
+        assert!(
+            app.world().resource::<PendingCommands>().is_empty(),
+            "another player's units are never ordered"
+        );
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .set([UnitId(1), UnitId(6)]);
+        click(&mut app);
+        let cmds = app
+            .world_mut()
+            .resource_mut::<PendingCommands>()
+            .drain_sorted();
+        let cmds: Vec<&Command> = cmds.iter().map(|c| &c.cmd).collect();
+        assert_eq!(
+            cmds,
+            [&Command::Stop {
+                units: vec![UnitId(1)]
+            }]
         );
     }
 

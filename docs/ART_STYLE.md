@@ -74,12 +74,29 @@ Primitive silhouettes (M2 to M7):
 
 | Kind | Primitive | Notes |
 |---|---|---|
-| Units | `Capsule` | Height per kind from M4b; five distinct looks for the military kinds |
+| Units | One shape per kind (table below) | Since M4b each kind has its own silhouette and height, low-poly and flat-shaded; M2 drew every unit as a smooth `Capsule` |
 | Buildings | `Cuboid` | Footprint from `buildings.ron` |
 | Town | `Cylinder` | Larger when it reaches the second radius tier |
 | Resource node | `Sphere` | Grain gold, timber, ore colours |
 | Selection ring, rally marker, move marker | Retained gizmo lines | Separate entities keyed by id, never children of moving units |
-| Health bar | Flat quad entity | Same rule |
+| Health bar | Flat quad entity | Same rule; unlit, a team-colour fill on a #3A3A3F track, no green-to-red, shown only while the target is damaged or selected (M4b, `health_bars.rs`) |
+
+Unit looks (M4b, `data/visuals.ron`), one silhouette per kind. Width is the kind's collision diameter from `units.ron`; each mesh has 10 facets around (a 6-latitude capsule, an icosphere of 80 faces) and flat face normals, at most 600 vertices, one mesh per kind and one material per kind and team:
+
+| Kind | Look | Silhouette |
+|---|---|---|
+| Yeoman | `Primitive(Capsule)` | Upright pill, 0.7 m wide, 1.19 m tall |
+| Scribe | `Primitive(Cylinder)` | Drum, 0.7 x 0.7 m |
+| Skirmisher | `Body(shape: Cone, height_tiles_x100: 150)` | Spike, 1.5 m |
+| Shieldbearer | `Body(shape: Cuboid, height_tiles_x100: 130)` | Block, 0.8 x 1.3 x 0.8 m |
+| Bowman | `Body(shape: Cylinder, height_tiles_x100: 190)` | Tall post, 1.9 m |
+| Outrider | `Body(shape: Capsule, height_tiles_x100: 180, lying: true)` | Pill lying along its facing, 1.8 m long (twice its collision diameter; see the crowd check below), 0.9 m tall |
+| Mangonel | `Primitive(Sphere)` | Ball, 1.0 m |
+| Supply Wain | `Body(shape: Cuboid, height_tiles_x100: 60)` | Low box, 1.0 x 0.6 x 1.0 m |
+
+Two kinds share a shape only when they differ by at least 1.4 times on some axis (the Scribe's drum and the Bowman's post, the Shieldbearer's block and the Wain's low box, the Yeoman's upright pill and the Outrider's lying one); `present::tests::every_unit_kind_has_its_own_silhouette` checks it. The 40 m view is `--scenario unit_looks`: one unit of each kind per team in two rows 15 m apart, framed at 40 m unless `--camera` is given (`target/ci/eonmark --background --scenario unit_looks --exit-after-seconds 40 --screenshot-at 100:looks.png`; CI's render smoke test renders it on every PR). The owner chose single-shape silhouettes over multi-part looks on 2026-10-22 (ROADMAP M4b, Notes, decision 11); multi-part looks wait for the art pass. The looks themselves are signed off on the 40 m screenshot, and that sign-off is still pending: the owner's run on the Mac, with the P3 and sRGB check and the checklist below.
+
+The sign-off also looks at a crowd, because the lineup stands every unit alone 4 m from the next and cannot show how the looks pack in a fight: `target/ci/eonmark --background --scenario enemy_outpost --camera 100,32,40 --exit-after-seconds 60 --screenshot-at 250:crowd.png` (`just render-smoke out enemy_outpost 100,32,40 250` under Xvfb) frames the 200 vs 200 prologue at 40 m mid-fight. Every look is exactly its kind's collision diameter across except the Outrider's, whose lying pill is 1.8 m long against a 0.9 m diameter. Melee range is measured edge to edge (0.25 m for the Outrider) and the sim keeps units apart only by a soft push, so two Outriders holding on each other stand at most 1.15 m apart, centre to centre, while each pill reaches 0.9 m ahead of its centre: head-on they overlap by at least 0.65 m, and in a packed melee the pills visibly pass through each other. Shortening the pill is a data-only change, `height_tiles_x100` of `"outrider"` in `data/visuals.ron` (120 keeps a lying pill, cuts the head-on overlap to 0.05 m and still differs from the Yeoman's upright pill by 1.7 times along its length, and `present::tests::every_unit_kind_has_its_own_silhouette` passes with it, but reads closer to the Mangonel's 1.0 m ball); because `visuals.ron` is in `rules_hash`, it needs a `rules_version` bump and `just rerecord` in the same commit. The owner decides that trade at the sign-off.
 
 Motion is procedural (bob, swing, scale pulse), not animation clips, in v0.1.
 
@@ -106,14 +123,16 @@ wgpu on a wide-gamut display can render colours more saturated than authored. Ev
 
 ## Primitives first, models by data
 
-Every unit and building kind is drawn through one `Visual` value from `data/visuals.ron`:
+Every unit kind is drawn through one `Visual` value from `data/visuals.ron`, keyed by its `units.ron` id (buildings are drawn by `crates/game/src/buildings.rs` until M7 moves them into the file; a building key fails `data-check` today):
 
 ```ron
-Yeoman: Primitive(Capsule),
-Town: Scene(path: "models/town.glb", scale: 1000, y_offset: 0, yaw: 0),
+"yeoman": Primitive(Capsule),
+"skirmisher": Body(shape: Cone, height_tiles_x100: 150),
+"outrider": Body(shape: Capsule, height_tiles_x100: 180, lying: true),
+"mangonel": Scene(path: "models/mangonel.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0),
 ```
 
-`Visual::Primitive(kind)` draws a team-coloured primitive. `Visual::Scene(path, scale, y_offset, yaw)` loads a glTF scene; `scale` is permille, `y_offset` is in millimetres, `yaw` is in integer degrees, so the file stays float-free. Swapping a cube for a model is a RON edit, never a Rust change. M0 to M6 ship primitives only; M7 maps every kind to CC0 models and keeps the primitive as the fallback.
+`Visual::Primitive(shape)` draws a team-coloured primitive sized from the kind's radius (`Capsule`, `Cuboid`, `Cylinder`, `Sphere` or `Cone`). `Visual::Body(shape, height_tiles_x100, lying)` (M4b) draws the same primitive two radii wide with its own height in hundredths of a metre (20 to 400; never a `Sphere`); `lying: true` lays a `Capsule` or `Cylinder` along the unit's facing, that long and two radii tall. `Visual::Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` loads a glTF scene; the scale and offset are in hundredths and the yaw in whole degrees, so the file stays float-free. Swapping a cube for a model is a RON edit, never a Rust change. M0 to M6 ship primitives only; M7 maps every kind to CC0 models and keeps the primitive look as the fallback. Anything drawn above a unit (the M4b health bar) takes its height from `present::look_top_y`, computed from the `Visual`, so the art pass changes that one function. Until M7 the presenter draws a `Scene` as the fallback `Primitive(Capsule)` (`present::FALLBACK_VISUAL`).
 
 ## glTF import rules
 
@@ -162,6 +181,8 @@ Attach one 1280x720 screenshot at 40 m to every PR that adds or changes art, and
 | New files have `ATTRIBUTION.md` rows and `scripts/check_assets.sh` passes | |
 | `visuals.ron` changed, Rust did not (for a model swap) | |
 | Draw-call counter in the dev panel is under 500 with the test scene | |
+
+The last row has no counter to read yet: Bevy 0.19.1 keeps its batch counts `pub(crate)` and wgpu has no draw counters, so through M4b it is marked n/a in the PR with the expected counts instead (at 200 vs 200 about 75 to 100 batches, [design/ui.md](design/ui.md#health-bars-rings-and-markers)), and an Xcode Metal frame capture on the Mac stands in for it. The dev-panel counter arrives with the pre-stream art pass, where glTF models make it matter (ROADMAP M3b).
 
 ## Milestones
 

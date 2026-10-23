@@ -20,7 +20,7 @@
 //! | [`pathing`] | budgeted resumable A*, request queue, transparent cache |
 //! | [`movement`] | `SpatialGrid`, movement step, group targets |
 //! | [`replay`] | `.eonreplay` writer, reader, `verify` |
-//! | [`scenarios`] | scripted command streams shared by tests, benches, `record` and fixtures (the M4a counter duels and `combat_skirmish` among them) |
+//! | [`scenarios`] | scripted command streams shared by tests, benches, `record` and fixtures (the M4a counter duels and `combat_skirmish`, the M4b `enemy_outpost` pair among them) |
 //! | [`territory`] | `TerritoryField`: integer disc kernels per owner layer, tie-to-neutral ownership |
 //! | [`economy`] | `Economy` stockpiles and accumulators, `RateInfo`, exact income, jobs step, cost helpers |
 //! | [`construction`] | footprints, `Build` validation, sites, construction, site cancel |
@@ -29,7 +29,7 @@
 //! | [`training`] | `Train`, queue `Cancel`, `SetRally`, pop, the unit cost ramps, the training and research step |
 //! | [`tech`] | `TechState` (ages, researched techs), Modifier-resolved player stats, `Research`, `AdvanceAge`, `DebugResearch` |
 //! | [`combat`] | unit combat stats from the Modifier rows, explicit `Attack` (hold, direct chase, path chase, give up), target acquisition by guards and attack-movers, Watchtower and Town shooters, simultaneous hits, death and building destruction |
-//! | [`ai_hook`] | `AiController`, `SimView` |
+//! | [`ai_hook`] | `AiController`, `SimView` (read-only quotes and checks; `building_hp` from M4b) |
 //! | [`hash`] | xxh3 over postcard |
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -261,6 +261,20 @@ impl<'a> SimView<'a> {
         Some((max - u.damage_taken, max))
     }
 
+    /// A building's or site's hit points now and its maximum, the kind's
+    /// `hp` (no Modifier row touches buildings), `(hp, max_hp)`; `None`
+    /// when the building does not exist (or was destroyed). A complete
+    /// Town that reached 0 stays, at 0.
+    pub fn building_hp(&self, id: BuildingId) -> Option<(i32, i32)> {
+        let b = self.state.buildings.get(&id)?;
+        let def = self
+            .rules
+            .building_kind(b.kind.0)
+            .expect("a building's kind is in the rules");
+        let max = i32::try_from(def.hp).expect("data-check bounds building hp");
+        Some((b.hp, max))
+    }
+
     /// Whether `Attack { units, target }` from `p` would be accepted now,
     /// and which units would attack (`p`'s listed units of a kind that
     /// attacks, in id order).
@@ -341,4 +355,95 @@ pub trait AiController: Send {
     /// sim stamps them with the player's next sequence numbers and delays
     /// them by `cmd_delay_ticks` like any other command.
     fn think(&mut self, player: PlayerId, view: &SimView<'_>) -> Vec<Command>;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command::{Command, PlayerCommand};
+    use crate::fx::FxVec2;
+    use crate::ids::{BuildingId, BuildingKindId, PlayerId, Tile, UnitKindId};
+    use crate::state::{MatchSetup, Sim};
+    use rules::Rules;
+    use std::path::Path;
+
+    struct NoAi;
+
+    impl super::AiController for NoAi {
+        fn think(&mut self, _player: PlayerId, _view: &super::SimView<'_>) -> Vec<Command> {
+            Vec::new()
+        }
+    }
+
+    /// `building_hp` reads the building's hit points and its kind's `hp`:
+    /// full on placement, a site included, lower once a guard chips at it,
+    /// and `None` for an id that names no building.
+    #[test]
+    fn building_hp_is_hp_and_the_kinds_maximum() {
+        let rules = Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap();
+        let kind = |id: &str| BuildingKindId(rules.building_kind_by_id(id).unwrap().0);
+        let (tower, croft) = (kind("watchtower"), kind("croft"));
+        let skirmisher = UnitKindId(
+            u16::try_from(
+                rules
+                    .units
+                    .iter()
+                    .position(|u| u.id == "skirmisher")
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let place = |seq, owner: u8, kind, x, y, complete| {
+            PlayerCommand::new(
+                PlayerId(owner),
+                seq,
+                Command::DebugPlaceBuilding {
+                    owner: PlayerId(owner),
+                    kind,
+                    tile: Tile::new(x, y),
+                    complete,
+                },
+            )
+        };
+        let setup = MatchSetup::scenario(&rules, 1);
+        let delay = setup.cmd_delay;
+        let mut sim = Sim::new(setup, rules.clone(), Box::new(NoAi));
+        sim.step(&[
+            place(0, 1, tower, 20, 20, true),
+            place(1, 1, croft, 40, 40, false),
+            // A guard beside the tower: with no enemy unit in reach it
+            // acquires the tower and chips at it (and the tower shoots back).
+            PlayerCommand::new(
+                PlayerId(0),
+                0,
+                Command::DebugSpawn {
+                    owner: PlayerId(0),
+                    kind: skirmisher,
+                    at: FxVec2::from_ints(22, 20),
+                    count: 1,
+                },
+            ),
+        ]);
+        for _ in 0..delay {
+            sim.step(&[]);
+        }
+        let view = sim.view();
+        let max = |k: BuildingKindId| i32::try_from(rules.building_kind(k.0).unwrap().hp).unwrap();
+        assert_eq!(
+            view.building_hp(BuildingId(1)),
+            Some((max(tower), max(tower)))
+        );
+        assert_eq!(
+            view.building_hp(BuildingId(2)),
+            Some((max(croft), max(croft)))
+        );
+        assert_eq!(view.building_hp(BuildingId(3)), None);
+        for _ in 0..60 {
+            sim.step(&[]);
+        }
+        let view = sim.view();
+        let (hp, cap) = view.building_hp(BuildingId(1)).unwrap();
+        assert_eq!(cap, max(tower));
+        assert_eq!(hp, view.building(BuildingId(1)).unwrap().hp);
+        assert!(hp < cap, "the guard hit the tower: {hp} / {cap}");
+    }
 }

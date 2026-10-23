@@ -12,6 +12,7 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 
 use crate::camera::RtsCamera;
+use crate::health_bars::{HealthBar, HealthBars};
 use crate::present::UnitVisuals;
 use crate::selection::Selection;
 use crate::sim_driver::{ActiveInput, DriverStats, PendingCommands, ReplayRecorder, SimHandle};
@@ -60,6 +61,8 @@ fn sim_panel(
     selection: Res<Selection>,
     visuals: Res<UnitVisuals>,
     cameras: Query<&RtsCamera>,
+    bars: Res<HealthBars>,
+    bar_entities: Query<(), With<HealthBar>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("Sim")
@@ -142,6 +145,15 @@ fn sim_panel(
                 ui.label("meshes / materials");
                 ui.monospace(format!("{meshes} / {materials}"));
                 ui.end_row();
+                // Bars are lazy: a target has one only while it is damaged
+                // or selected, and two quad entities (track and fill).
+                ui.label("bar targets / entities");
+                ui.monospace(format!(
+                    "{} / {}",
+                    bars.0.len(),
+                    bar_entities.iter().count()
+                ));
+                ui.end_row();
                 if let Ok(cam) = cameras.single() {
                     ui.label("focus");
                     ui.monospace(format!("{:.1}, {:.1}", cam.focus.x, cam.focus.z));
@@ -161,6 +173,10 @@ fn command_kind(cmd: &sim::Command) -> &'static str {
         sim::Command::Move { .. } => "Move",
         sim::Command::Stop { .. } => "Stop",
         sim::Command::AttackMove { .. } => "AttackMove",
+        sim::Command::Attack { .. } => "Attack",
+        sim::Command::Train { .. } => "Train",
+        sim::Command::Research { .. } => "Research",
+        sim::Command::AdvanceAge { .. } => "AdvanceAge",
         sim::Command::DebugSpawn { .. } => "DebugSpawn",
         sim::Command::Surrender => "Surrender",
         _ => "other",

@@ -565,10 +565,11 @@ fn run_with(seed: u64, stream: &[Vec<PlayerCommand>], cache: bool) -> Vec<u64> {
     hashes
 }
 
-/// Proptest case count: `PROPTEST_CASES` when set, else 256 in CI and 16
+/// Proptest case count: `PROPTEST_CASES` when set, else 256 in CI and 8
 /// locally. M1 set 32 locally (`docs/ROADMAP.md`, M1); the M4a combat
-/// behaviour slice halved it when the warm `cargo test -p sim` reached its
-/// 10 s budget, as `docs/BUILD_TIMES.md` advises. CI still runs 256.
+/// behaviour slice halved it to 16 and M4b halved it again to 8, each time
+/// the warm `cargo test -p sim` reached its 10 s budget, as
+/// `docs/BUILD_TIMES.md` advises. CI still runs 256.
 fn proptest_cases() -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
@@ -576,7 +577,7 @@ fn proptest_cases() -> u32 {
         .unwrap_or(if std::env::var_os("CI").is_some() {
             256
         } else {
-            16
+            8
         })
 }
 

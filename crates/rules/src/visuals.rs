@@ -5,36 +5,64 @@
 //! visual) and so that it is part of `rules_hash`. The game crate maps a
 //! [`Visual`] to a Bevy mesh and material in `present.rs`.
 //!
-//! M2 ships primitives only. [`Visual::Scene`] is parsed and validated so the
-//! M7 glTF switch is a data change, but the presenter ignores it until then.
-//! Every number is an integer: fields ending in `_x100` are hundredths and
-//! `yaw_deg` is whole degrees, following `docs/DATA_FORMAT.md`.
+//! M2 shipped primitives only; M4b adds [`Visual::Body`], one primitive
+//! with its own height (or length, lying along the unit's facing), so each
+//! kind has its own silhouette. [`Visual::Scene`] is parsed and validated
+//! so the M7 glTF switch is a data change, but the presenter ignores it
+//! until then. Every number is an integer: fields ending in `_x100` are
+//! hundredths and `yaw_deg` is whole degrees, following
+//! `docs/DATA_FORMAT.md`.
 
 use crate::{Error, UnitKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// A built-in mesh shape. The presenter sizes it from the unit kind's
-/// `radius_tiles_x100` so a visual carries no dimensions of its own.
+/// A built-in mesh shape. Its width comes from the unit kind's
+/// `radius_tiles_x100`; a [`Visual::Primitive`] also takes its height from
+/// the radius, a [`Visual::Body`] carries its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Primitive {
-    /// Upright capsule (the M2 look for every unit).
+    /// Upright capsule (the M2 look for every unit): as a `Primitive`, its
+    /// straight part is 1.4 radii long, so it stands 3.4 radii tall.
     Capsule,
-    /// Axis-aligned box.
+    /// Axis-aligned box two radii wide and deep; as a `Primitive`, two
+    /// radii tall.
     Cuboid,
-    /// Upright cylinder.
+    /// Upright cylinder; as a `Primitive`, two radii tall.
     Cylinder,
-    /// Sphere.
+    /// Sphere of the kind's radius. Only as a `Primitive`: a `Body` is
+    /// never a sphere, since a sphere has no height of its own.
     Sphere,
+    /// Upright cone on its base (M4b); as a `Primitive`, two radii tall.
+    Cone,
 }
 
 /// How a kind is drawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Visual {
-    /// One shared primitive mesh, tinted with the owner's team colour.
+    /// One shared primitive mesh sized from the kind's radius, tinted with
+    /// the owner's team colour.
     Primitive(Primitive),
+    /// One shared primitive mesh with its own size (M4b): `shape` is two
+    /// radii wide and `height_tiles_x100` tall, or, when `lying`, that long
+    /// along the unit's facing and two radii tall. Tinted with the owner's
+    /// team colour.
+    Body {
+        /// The shape; never `Sphere`.
+        shape: Primitive,
+        /// Height in hundredths of a tile (a tile is a metre), or the
+        /// length along the facing when `lying`. In
+        /// [`MIN_BODY_HEIGHT_X100`]`..=`[`MAX_BODY_HEIGHT_X100`]; a
+        /// `Capsule` is at least two radii (its two half-spheres).
+        height_tiles_x100: u32,
+        /// Lay the shape on its side with its long axis along the unit's
+        /// facing. Only a `Capsule` or a `Cylinder` can lie. Defaults to
+        /// `false`.
+        #[serde(default)]
+        lying: bool,
+    },
     /// A glTF scene under `assets/` (M7). Parsed and validated at M2, unused
     /// by the presenter until M7.
     Scene {
@@ -60,10 +88,18 @@ pub struct Visuals {
 /// Upper bound on `scale_x100` (a 100x model is a data error).
 pub const MAX_SCALE_X100: u32 = 10_000;
 
+/// Lower bound on a [`Visual::Body`]'s `height_tiles_x100` (20 cm).
+pub const MIN_BODY_HEIGHT_X100: u32 = 20;
+
+/// Upper bound on a [`Visual::Body`]'s `height_tiles_x100` (4 m, a unit
+/// four tiles tall or long is a data error).
+pub const MAX_BODY_HEIGHT_X100: u32 = 400;
+
 impl Visuals {
     /// Validate against the loaded unit kinds: every kind has a visual, every
-    /// key names a kind, every `Scene` is well formed. Errors name `path`
-    /// and the field (`units["yeoman"]` or `units["yeoman"].scale_x100`).
+    /// key names a kind, every `Body` and `Scene` is well formed. Errors name
+    /// `path` and the field (`units["yeoman"]` or
+    /// `units["yeoman"].scale_x100`).
     pub fn validate(&self, path: &Path, kinds: &[UnitKind]) -> Result<(), Error> {
         for kind in kinds {
             if !self.units.contains_key(&kind.id) {
@@ -82,40 +118,79 @@ impl Visuals {
                     format!("units[{id:?}].{name}")
                 }
             };
-            if !kinds.iter().any(|k| &k.id == id) {
+            let Some(kind) = kinds.iter().find(|k| &k.id == id) else {
                 return Err(Error::invalid(
                     path,
                     &field(""),
                     "no unit kind with this id in units.ron",
                 ));
-            }
-            if let Visual::Scene {
-                path: scene,
-                scale_x100,
-                yaw_deg,
-                ..
-            } = visual
-            {
-                if !(scene.ends_with(".glb") || scene.ends_with(".gltf")) {
-                    return Err(Error::invalid(
-                        path,
-                        &field("path"),
-                        format!("{scene:?} must end in .glb or .gltf"),
-                    ));
+            };
+            match visual {
+                Visual::Primitive(_) => {}
+                Visual::Body {
+                    shape,
+                    height_tiles_x100,
+                    lying,
+                } => {
+                    if *shape == Primitive::Sphere {
+                        return Err(Error::invalid(
+                            path,
+                            &field("shape"),
+                            "a Body cannot be a Sphere (it has no height of its own); use Primitive(Sphere)",
+                        ));
+                    }
+                    if *lying && !matches!(shape, Primitive::Capsule | Primitive::Cylinder) {
+                        return Err(Error::invalid(
+                            path,
+                            &field("lying"),
+                            format!("only a Capsule or a Cylinder can lie, not a {shape:?}"),
+                        ));
+                    }
+                    if !(MIN_BODY_HEIGHT_X100..=MAX_BODY_HEIGHT_X100).contains(height_tiles_x100) {
+                        return Err(Error::invalid(
+                            path,
+                            &field("height_tiles_x100"),
+                            format!("must be in {MIN_BODY_HEIGHT_X100}..={MAX_BODY_HEIGHT_X100}"),
+                        ));
+                    }
+                    let diameter = kind.radius_tiles_x100.saturating_mul(2);
+                    if *shape == Primitive::Capsule && *height_tiles_x100 < diameter {
+                        return Err(Error::invalid(
+                            path,
+                            &field("height_tiles_x100"),
+                            format!(
+                                "a Capsule must be at least twice the kind's radius_tiles_x100 ({diameter})"
+                            ),
+                        ));
+                    }
                 }
-                if *scale_x100 == 0 || *scale_x100 > MAX_SCALE_X100 {
-                    return Err(Error::invalid(
-                        path,
-                        &field("scale_x100"),
-                        format!("must be in 1..={MAX_SCALE_X100}"),
-                    ));
-                }
-                if !(-360..=360).contains(yaw_deg) {
-                    return Err(Error::invalid(
-                        path,
-                        &field("yaw_deg"),
-                        "must be within -360..=360",
-                    ));
+                Visual::Scene {
+                    path: scene,
+                    scale_x100,
+                    yaw_deg,
+                    ..
+                } => {
+                    if !(scene.ends_with(".glb") || scene.ends_with(".gltf")) {
+                        return Err(Error::invalid(
+                            path,
+                            &field("path"),
+                            format!("{scene:?} must end in .glb or .gltf"),
+                        ));
+                    }
+                    if *scale_x100 == 0 || *scale_x100 > MAX_SCALE_X100 {
+                        return Err(Error::invalid(
+                            path,
+                            &field("scale_x100"),
+                            format!("must be in 1..={MAX_SCALE_X100}"),
+                        ));
+                    }
+                    if !(-360..=360).contains(yaw_deg) {
+                        return Err(Error::invalid(
+                            path,
+                            &field("yaw_deg"),
+                            "must be within -360..=360",
+                        ));
+                    }
                 }
             }
         }
@@ -253,5 +328,126 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn body_parses_and_validates() {
+        let ok = [
+            (
+                r#"(units: { "yeoman": Body(shape: Cone, height_tiles_x100: 150) })"#,
+                Visual::Body {
+                    shape: Primitive::Cone,
+                    height_tiles_x100: 150,
+                    lying: false,
+                },
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Capsule, height_tiles_x100: 180, lying: true) })"#,
+                Visual::Body {
+                    shape: Primitive::Capsule,
+                    height_tiles_x100: 180,
+                    lying: true,
+                },
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cylinder, height_tiles_x100: 20, lying: true) })"#,
+                Visual::Body {
+                    shape: Primitive::Cylinder,
+                    height_tiles_x100: MIN_BODY_HEIGHT_X100,
+                    lying: true,
+                },
+            ),
+            (
+                // A Capsule exactly two radii long (35 x 2) is the shortest one.
+                r#"(units: { "yeoman": Body(shape: Capsule, height_tiles_x100: 70) })"#,
+                Visual::Body {
+                    shape: Primitive::Capsule,
+                    height_tiles_x100: 70,
+                    lying: false,
+                },
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cuboid, height_tiles_x100: 400, lying: false) })"#,
+                Visual::Body {
+                    shape: Primitive::Cuboid,
+                    height_tiles_x100: MAX_BODY_HEIGHT_X100,
+                    lying: false,
+                },
+            ),
+            (
+                r#"(units: { "yeoman": Primitive(Cone) })"#,
+                Visual::Primitive(Primitive::Cone),
+            ),
+        ];
+        for (text, want) in ok {
+            let v = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            v.validate(Path::new("v.ron"), &kinds())
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(v.get("yeoman"), Some(&want), "{text}");
+        }
+    }
+
+    #[test]
+    fn bad_body_fields_are_rejected_with_field() {
+        let bad = [
+            (
+                r#"(units: { "yeoman": Body(shape: Sphere, height_tiles_x100: 100) })"#,
+                "shape",
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cone, height_tiles_x100: 150, lying: true) })"#,
+                "lying",
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cuboid, height_tiles_x100: 60, lying: true) })"#,
+                "lying",
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cuboid, height_tiles_x100: 19) })"#,
+                "height_tiles_x100",
+            ),
+            (
+                r#"(units: { "yeoman": Body(shape: Cylinder, height_tiles_x100: 401) })"#,
+                "height_tiles_x100",
+            ),
+            (
+                // Shorter than its two half-spheres (radius 35).
+                r#"(units: { "yeoman": Body(shape: Capsule, height_tiles_x100: 69, lying: true) })"#,
+                "height_tiles_x100",
+            ),
+        ];
+        for (text, field) in bad {
+            let v = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            let err = v
+                .validate(Path::new("v.ron"), &kinds())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("v.ron") && err.contains(&format!(r#"units["yeoman"].{field}"#)),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_body_shape_is_a_parse_error_with_line_and_column() {
+        let err =
+            parse("(units: {\n    \"yeoman\": Body(shape: Pyramid, height_tiles_x100: 100),\n})")
+                .unwrap_err()
+                .to_string();
+        // ron 0.12 names the span of the variant: line 2, columns 27-34.
+        assert!(err.starts_with("v.ron: 2:27"), "{err}");
+        assert!(err.contains("Pyramid") && err.contains("Cone"), "{err}");
+    }
+
+    #[test]
+    fn body_rejects_unknown_and_missing_fields_and_floats() {
+        for text in [
+            r#"(units: { "yeoman": Body(shape: Cone, height_tiles_x100: 150, width_tiles_x100: 50) })"#,
+            r#"(units: { "yeoman": Body(shape: Cone) })"#,
+            r#"(units: { "yeoman": Body(shape: Cone, height_tiles_x100: 1.5) })"#,
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
     }
 }

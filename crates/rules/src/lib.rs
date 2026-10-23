@@ -1421,7 +1421,19 @@ mod tests {
         );
         assert_eq!(
             rules.visual(3),
-            Some(&Visual::Primitive(visuals::Primitive::Cuboid))
+            Some(&Visual::Body {
+                shape: visuals::Primitive::Cuboid,
+                height_tiles_x100: 130,
+                lying: false,
+            })
+        );
+        assert_eq!(
+            rules.visual(5),
+            Some(&Visual::Body {
+                shape: visuals::Primitive::Capsule,
+                height_tiles_x100: 180,
+                lying: true,
+            })
         );
         assert!(rules.visual(8).is_none());
         assert_eq!(rules.ticks_from_ds(32), 64);

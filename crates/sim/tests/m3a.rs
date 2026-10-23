@@ -135,9 +135,10 @@ fn golden(name: &str) {
     }
 }
 
-/// 32 cases locally, 256 under CI, `PROPTEST_CASES` overrides (the same
-/// switch as m1.rs, which runs 16 locally since the M4a combat behaviour
-/// slice).
+/// 16 cases locally, 256 under CI, `PROPTEST_CASES` overrides (the same
+/// switch as m1.rs, which runs 8 locally). M3a set 32 locally; M4b halved
+/// it when the warm `cargo test -p sim` reached its 10 s budget, as
+/// `docs/BUILD_TIMES.md` advises. CI still runs 256.
 fn proptest_cases() -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
@@ -145,7 +146,7 @@ fn proptest_cases() -> u32 {
         .unwrap_or(if std::env::var_os("CI").is_some() {
             256
         } else {
-            32
+            16
         })
 }
 

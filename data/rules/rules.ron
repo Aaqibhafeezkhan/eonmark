@@ -3,8 +3,8 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  // 16: M4a combat behaviour (acquisition, AttackMove, shooters, spawn jitter; SIM_VERSION 14).
-  rules_version: 16,
+  // 17: M4b unit looks; visuals.ron is in rules_hash; no sim change.
+  rules_version: 17,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",

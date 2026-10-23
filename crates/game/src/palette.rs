@@ -60,6 +60,11 @@ pub const SELECTION_RING: Color = Color::srgb(0.96, 0.93, 0.80);
 /// Move marker ring at the click point, fading out: warm amber.
 pub const MOVE_MARKER: Color = Color::srgba(0.90, 0.70, 0.35, 0.9);
 
+/// Health bar track (#3A3A3F, M4b): the neutral dark grey the team-coloured
+/// fill sits on. The fill is the owner's [`TEAM`] colour, never a
+/// green-to-red ramp (team red is the [`INVALID`] hue).
+pub const BAR_BACK: Color = Color::srgb(0.227, 0.227, 0.247);
+
 /// Drag-box outline and fill (`bevy_ui` node drawn in screen space).
 pub const DRAG_BOX_BORDER: Color = Color::srgba(0.96, 0.93, 0.80, 0.9);
 /// Drag-box fill.

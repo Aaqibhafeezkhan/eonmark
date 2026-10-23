@@ -19,16 +19,34 @@
 # Needs xvfb (xvfb-run), mesa-vulkan-drivers (lavapipe) and the X libraries
 # winit loads at run time (libxkbcommon-x11-0, libx11-xcb1, libxcursor1,
 # libxi6, libxrandr2); CI's game-linux job installs them. Usage:
-# scripts/render_smoke.sh <eonmark binary> [out-dir] (out-dir keeps the PNG,
-# the log and the replay; default a temp dir).
+#   scripts/render_smoke.sh <eonmark binary> [out-dir] [scenario] [camera] [tick]
+# out-dir keeps the PNG, the log and the replay (default a temp dir; an
+# empty string also means a temp dir). The scenario (default
+# economy_walkthrough, the M3b walkthrough), the --camera framing as
+# x,y,zoom (default 38,64,60; an empty string passes no --camera, so the
+# game's own framing for the scenario applies) and the tick to capture
+# (default 100) select what is rendered. CI runs the default and, since
+# M4b, `unit_looks 20,32,40 100`, which draws every unit look, and
+# `enemy_outpost '' 400`, the 200 vs 200 prologue in the game's own framing
+# with health bars over the damaged units (the bars' unlit pipeline).
 set -euo pipefail
 
-bin="${1:?usage: scripts/render_smoke.sh <eonmark binary> [out-dir]}"
+usage="usage: scripts/render_smoke.sh <eonmark binary> [out-dir] [scenario] [camera] [tick]"
+bin="${1:?$usage}"
 out="${2:-$(mktemp -d)}"
+scenario="${3:-economy_walkthrough}"
+camera="${4-38,64,60}"
 # Ticks run in real time while frames take under 250 ms; lavapipe on a CI
 # runner can be slower, so the tick is early and the deadline generous.
-tick=100
+tick="${5:-100}"
 seconds=60
+case "$tick" in
+  '' | *[!0-9]*) echo "error: tick must be a number, got '$tick'" >&2; echo "$usage" >&2; exit 2 ;;
+esac
+camera_args=()
+if [ -n "$camera" ]; then
+  camera_args=(--camera "$camera")
+fi
 
 icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)
 if [ -z "$icd" ]; then
@@ -57,7 +75,7 @@ rm -f "$png"
 
 status=0
 xvfb-run -a -s "-screen 0 1280x800x24" env VK_ICD_FILENAMES="$icd" \
-  "$bin" --background --scenario economy_walkthrough --camera 38,64,60 \
+  "$bin" --background --scenario "$scenario" "${camera_args[@]}" \
   --exit-after-seconds "$seconds" --screenshot-at "$tick:$png" \
   --replay-dir "$out" >"$log" 2>&1 || status=$?
 
@@ -82,4 +100,4 @@ if [ "$fail" -ne 0 ]; then
   tail -n 40 "$log" >&2
   exit 1
 fi
-echo "render_smoke: ok ($png)"
+echo "render_smoke: ok, $scenario at tick $tick ($png)"

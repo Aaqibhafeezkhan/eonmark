@@ -25,6 +25,26 @@
 //! `within_3_tiles=<k>/<total>`, is the `sim-cli bench` gate (units within
 //! [`ARRIVED_TILES`] of the goal); 200 units of radius 0.35 cannot all pack
 //! into that circle, so it is informational for a single-point goal.
+//!
+//! With the fight window on (the `enemy_outpost` scenarios, M4b acceptance
+//! line 2), `fight frames=<n> seconds=<s> mean=<ms> p95=<ms> max=<ms>
+//! fps=<f> ticks=<a>..<b> on_screen_max=<n> on_screen_min=<n>/<alive>
+//! units_at_first_hit=<p0>/<p1>` summarises only the frames of the 200 vs
+//! 200 fight: a frame counts when a `Hit` landed within the last
+//! [`FIGHT_HIT_WINDOW_TICKS`] ticks while both players still had at least
+//! [`FIGHT_MIN_ARMED`] armed units alive (the `sim-cli bench --combat`
+//! threshold), so start-up, the walk to contact and the mop-up are left
+//! out. `ticks` are the first and last such tick. `on_screen_max` is the
+//! most armed units (kinds with an attack) of either player projected
+//! inside the world view between the HUD bars during a fight frame (by the
+//! drag box's projection, [`crate::selection::units_in_rect`], not by
+//! `ViewVisibility`, which the shadow cascades set for every unit), and
+//! `on_screen_min` the fight frame that showed the smallest share of the
+//! armed units then alive, as `<on screen>/<alive>`: equal numbers mean
+//! every timed frame drew the whole battle, while a pan or zoom during the
+//! fight shows as a lower first number though `on_screen_max` keeps its
+//! best frame. `units_at_first_hit` is each player's armed units alive at
+//! the first `Hit` of the match.
 
 use std::time::Duration;
 
@@ -32,9 +52,15 @@ use bevy::app::AppExit;
 use bevy::diagnostic::FrameCount;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, WindowFocused, WindowOccluded};
-use sim::FxVec2;
+use sim::{FxVec2, UnitId};
 
-use crate::sim_driver::{DriverStats, FLUSH_EVERY_TICKS, SimHandle};
+use crate::camera::RtsCamera;
+use crate::hud::{BOTTOM_BAR_HEIGHT_PX, TOP_BAR_HEIGHT_PX};
+use crate::present::world_from_sim;
+use crate::selection::units_in_rect;
+use crate::sim_driver::{
+    DriverStats, FLUSH_EVERY_TICKS, SimEventMsg, SimHandle, SimSystems, sim_stepped,
+};
 
 /// The `within_3_tiles` line counts units this close to the goal, the same
 /// gate `sim-cli bench` uses (docs/design/pathing.md). A measurement
@@ -56,6 +82,21 @@ pub const WORST_FRAMES: usize = 3;
 
 /// Window focus / occlusion changes kept for the `window` line.
 const MAX_WINDOW_EVENTS: usize = 12;
+
+/// A frame belongs to the fight while the latest fighting tick is fewer
+/// than this many ticks old (one second at 20 Hz). A measurement window
+/// for the M4b proxy line, not a gameplay number.
+pub const FIGHT_HIT_WINDOW_TICKS: u32 = 20;
+
+/// A tick is a fighting tick when it has a `Hit` and both players keep at
+/// least this many armed units alive: the `sim-cli bench --combat`
+/// threshold (`docs/BUILD_TIMES.md`), so the window ends when one army is
+/// down to stragglers.
+pub const FIGHT_MIN_ARMED: u32 = 50;
+
+/// The players the fight window counts: the two of the `enemy_outpost`
+/// scenarios.
+const FIGHT_PLAYERS: usize = 2;
 
 /// Collected frame periods and flush attribution.
 #[derive(Resource, Debug, Default)]
@@ -79,6 +120,8 @@ pub struct FrameStats {
     occluded: bool,
     /// Focus and occlusion changes as `(label, seconds)`.
     window_events: Vec<(&'static str, f64)>,
+    /// The exit lines were printed.
+    printed: bool,
 }
 
 /// Mean, 95th percentile and maximum of the samples (milliseconds).
@@ -173,6 +216,11 @@ impl FrameStats {
         )
     }
 
+    /// `true` once the exit lines were printed.
+    pub fn printed(&self) -> bool {
+        self.printed
+    }
+
     /// The `frames=... fps=...` line.
     pub fn rate_line(&self) -> String {
         let seconds = self.samples_ms.iter().sum::<f64>() / 1000.0;
@@ -249,20 +297,143 @@ impl ArrivalProxy {
     }
 }
 
+/// The frames of a battle: what the `fight ...` line reports.
+#[derive(Resource, Debug, Default, Clone, PartialEq)]
+pub struct FightWindow {
+    /// First and latest fighting tick: a completed tick with at least one
+    /// `Hit` while both players kept [`FIGHT_MIN_ARMED`] armed units.
+    pub ticks: Option<(u32, u32)>,
+    /// Armed units alive per player after the first tick with any `Hit`.
+    pub units_at_first_hit: Option<[u32; FIGHT_PLAYERS]>,
+    /// Periods of the fight frames, milliseconds, in order.
+    pub samples_ms: Vec<f64>,
+    /// Most armed units projected inside the world view in one fight frame.
+    pub on_screen_max: usize,
+    /// The fight frame with the smallest share of the armed units alive
+    /// projected inside the world view, as `(on screen, alive)`.
+    pub on_screen_min: Option<(usize, usize)>,
+}
+
+impl FightWindow {
+    /// Note a completed `tick` with `hits` `Hit` events, after which the
+    /// players had `armed` armed units alive.
+    pub fn observe_tick(&mut self, tick: u32, hits: u32, armed: [u32; FIGHT_PLAYERS]) {
+        if hits == 0 {
+            return;
+        }
+        self.units_at_first_hit.get_or_insert(armed);
+        if armed.iter().all(|&n| n >= FIGHT_MIN_ARMED) {
+            let first = self.ticks.map_or(tick, |(first, _)| first);
+            self.ticks = Some((first, tick));
+        }
+    }
+
+    /// `true` while the latest fighting tick is under
+    /// [`FIGHT_HIT_WINDOW_TICKS`] ticks before `tick`, the sim's tick in
+    /// the frame being measured.
+    pub fn is_fight_frame(&self, tick: u32) -> bool {
+        self.ticks
+            .is_some_and(|(_, last)| tick.saturating_sub(last) < FIGHT_HIT_WINDOW_TICKS)
+    }
+
+    /// Record one fight frame: its period, and how many of the `alive`
+    /// armed units were on screen in it.
+    pub fn record_frame(&mut self, frame: Duration, on_screen: usize, alive: usize) {
+        self.samples_ms.push(frame.as_secs_f64() * 1000.0);
+        self.on_screen_max = self.on_screen_max.max(on_screen);
+        // A smaller share `on_screen / alive`, compared without division; a
+        // frame with no armed unit alive has nothing to show.
+        if alive > 0
+            && self
+                .on_screen_min
+                .is_none_or(|(seen, of)| on_screen * of < seen * alive)
+        {
+            self.on_screen_min = Some((on_screen, alive));
+        }
+    }
+
+    /// The `fight ...` line.
+    pub fn line(&self) -> String {
+        let (mean, p95, max) = summarize(&self.samples_ms);
+        // `fold` from +0.0: an empty `f64` `sum` is -0.0, printed "-0.00".
+        let seconds = self.samples_ms.iter().fold(0.0, |a, b| a + b) / 1000.0;
+        let fps = if seconds > 0.0 {
+            self.samples_ms.len() as f64 / seconds
+        } else {
+            0.0
+        };
+        let ticks = self
+            .ticks
+            .map_or("none".to_string(), |(a, b)| format!("{a}..{b}"));
+        let first_hit = self
+            .units_at_first_hit
+            .map_or("none".to_string(), |[p0, p1]| format!("{p0}/{p1}"));
+        let on_screen_min = self
+            .on_screen_min
+            .map_or("none".to_string(), |(seen, alive)| {
+                format!("{seen}/{alive}")
+            });
+        format!(
+            "fight frames={} seconds={seconds:.2} mean={mean:.2} p95={p95:.2} max={max:.2} fps={fps:.1} ticks={ticks} on_screen_max={} on_screen_min={on_screen_min} units_at_first_hit={first_hit}",
+            self.samples_ms.len(),
+            self.on_screen_max
+        )
+    }
+}
+
+/// The part of a `size` logical window where the world shows: between the
+/// top bar and the bottom bar.
+pub fn world_view_rect(size: Vec2) -> Rect {
+    Rect::new(
+        0.0,
+        TOP_BAR_HEIGHT_PX,
+        size.x,
+        (size.y - BOTTOM_BAR_HEIGHT_PX).max(TOP_BAR_HEIGHT_PX),
+    )
+}
+
+/// How many of `positions` the camera projects inside the world view: the
+/// drag box's projection test ([`units_in_rect`]) over
+/// [`world_view_rect`] of the camera's logical viewport.
+pub fn units_on_screen(
+    camera: &Camera,
+    camera_transform: &GlobalTransform,
+    positions: impl IntoIterator<Item = (UnitId, Vec3)>,
+) -> usize {
+    let Some(size) = camera.logical_viewport_size() else {
+        return 0;
+    };
+    units_in_rect(world_view_rect(size), camera, camera_transform, positions).len()
+}
+
 /// Collects frame periods and prints the summary lines when the app exits.
 pub struct FrameStatsPlugin {
     /// Also count arrivals at this goal for this many units.
     pub arrival: Option<(FxVec2, u32)>,
+    /// Also measure the fight window (the `enemy_outpost` scenarios).
+    pub fight: bool,
 }
 
 impl Plugin for FrameStatsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameStats>()
             .add_systems(Update, (window_events, sample_frame).chain())
-            .add_systems(Last, print_on_exit);
+            // After `bevy::window::ExitSystems`: the red close button's
+            // `AppExit` is written there by `exit_on_all_closed`, in `Last`,
+            // and the winit runner exits right after that frame, as for the
+            // recorder (`sim_driver::finish_recorder_on_exit`).
+            .add_systems(Last, print_on_exit.after(bevy::window::ExitSystems));
         if let Some((goal, total)) = self.arrival {
             app.insert_resource(ArrivalProxy::new(goal, total))
                 .add_systems(FixedPostUpdate, observe_arrivals);
+        }
+        if self.fight {
+            app.init_resource::<FightWindow>()
+                .add_systems(
+                    FixedPostUpdate,
+                    observe_fight.after(SimSystems::Step).run_if(sim_stepped),
+                )
+                .add_systems(Update, sample_fight.after(sample_frame));
         }
     }
 }
@@ -312,17 +483,74 @@ fn observe_arrivals(sim: NonSend<SimHandle>, mut proxy: ResMut<ArrivalProxy>) {
     proxy.observe(view.units().map(|u| (u.pos, u.post.is_some())), sim.tick());
 }
 
-fn print_on_exit(
+/// `true` for a unit of one of the fight's players whose kind has an
+/// attack: the units the fight window counts.
+fn fights(rules: &rules::Rules, unit: &sim::Unit) -> bool {
+    usize::from(unit.owner.0) < FIGHT_PLAYERS
+        && rules
+            .unit_kind(unit.kind.0)
+            .is_some_and(|k| k.attack.is_some())
+}
+
+/// After each stepped tick: count its `Hit` events and each player's armed
+/// units (kinds with an attack) still alive.
+fn observe_fight(
+    sim: NonSend<SimHandle>,
+    mut events: MessageReader<SimEventMsg>,
+    mut fight: ResMut<FightWindow>,
+) {
+    let hits = events
+        .read()
+        .filter(|m| matches!(m.event, sim::SimEvent::Hit { .. }))
+        .count();
+    let rules = sim.rules();
+    let mut armed = [0u32; FIGHT_PLAYERS];
+    for u in sim.view().units().filter(|u| fights(rules, u)) {
+        armed[usize::from(u.owner.0)] += 1;
+    }
+    fight.observe_tick(sim.tick(), u32::try_from(hits).unwrap_or(u32::MAX), armed);
+}
+
+/// In a fight frame, record its period and count the armed units alive and
+/// those of them on screen.
+fn sample_fight(
+    time: Res<Time<Real>>,
+    sim: NonSend<SimHandle>,
+    cameras: Query<(&Camera, &GlobalTransform), With<RtsCamera>>,
+    mut fight: ResMut<FightWindow>,
+) {
+    if time.delta() == Duration::ZERO || !fight.is_fight_frame(sim.tick()) {
+        return;
+    }
+    let rules = sim.rules();
+    let view = sim.view();
+    let armed = || view.units().filter(|u| fights(rules, u));
+    let on_screen = cameras.single().map_or(0, |(camera, transform)| {
+        units_on_screen(
+            camera,
+            transform,
+            armed().map(|u| (u.id, world_from_sim(u.pos, 0.0))),
+        )
+    });
+    fight.record_frame(time.delta(), on_screen, armed().count());
+}
+
+/// Runs in `Last`, after `bevy::window::ExitSystems`: on the frame an
+/// `AppExit` was written (Cmd-Q, `--exit-after-seconds`, the red close
+/// button, a failed dev hierarchy check), print the summary lines.
+pub(crate) fn print_on_exit(
     mut exits: MessageReader<AppExit>,
-    stats: Res<FrameStats>,
+    mut stats: ResMut<FrameStats>,
     driver: Res<DriverStats>,
     arrival: Option<Res<ArrivalProxy>>,
+    fight: Option<Res<FightWindow>>,
     sim: NonSend<SimHandle>,
 ) {
     if exits.is_empty() {
         return;
     }
     exits.clear();
+    stats.printed = true;
     // Every line carries the `frame_stats: ` prefix that
     // `scripts/m2_checks.sh` (check 6) and docs/PLAYTEST.md grep for.
     println!("{STDOUT_PREFIX}{}", stats.frame_line());
@@ -339,6 +567,9 @@ fn print_on_exit(
     if let Some(arrival) = arrival {
         println!("{STDOUT_PREFIX}{}", arrival.line(sim.tick()));
         println!("{STDOUT_PREFIX}{}", arrival.within_line());
+    }
+    if let Some(fight) = fight {
+        println!("{STDOUT_PREFIX}{}", fight.line());
     }
 }
 
@@ -402,6 +633,38 @@ mod tests {
         );
     }
 
+    /// The red close button: `bevy_window::exit_on_all_closed` writes
+    /// `AppExit` in `Last`, inside `ExitSystems`, and the winit runner
+    /// exits right after that frame, so the lines must print in that same
+    /// frame. A `WindowPlugin` with no window stands in for the closed one.
+    #[test]
+    fn prints_when_the_window_closes() {
+        use crate::sim_driver::{LocalInput, SimPlugin};
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let handle = SimHandle::from_setup(sim::MatchSetup::scenario(&rules, 1), rules);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins((
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                ..default()
+            },
+            SimPlugin::new(handle, Box::new(LocalInput)),
+            FrameStatsPlugin {
+                arrival: None,
+                fight: false,
+            },
+        ));
+        app.update();
+        assert_eq!(
+            app.should_exit(),
+            Some(AppExit::Success),
+            "no window open: exit_on_all_closed exits"
+        );
+        assert!(app.world().resource::<FrameStats>().printed());
+    }
+
     #[test]
     fn arrival_proxy_counts_and_remembers_the_first_full_tick() {
         let goal = FxVec2::from_ints(100, 64);
@@ -422,5 +685,239 @@ mod tests {
         a.observe([(far, false), (goal, false)].into_iter(), 12);
         assert_eq!(a.line(12), "arrived=0/2 by tick 9");
         assert_eq!(a.within_line(), "within_3_tiles=1/2");
+    }
+
+    #[test]
+    fn fight_window_counts_only_frames_with_hits_and_both_armies() {
+        let mut w = FightWindow::default();
+        assert_eq!(
+            w.line(),
+            "fight frames=0 seconds=0.00 mean=0.00 p95=0.00 max=0.00 fps=0.0 ticks=none on_screen_max=0 on_screen_min=none units_at_first_hit=none"
+        );
+        let ms = |n: u64| Duration::from_millis(n);
+        // `(tick, hits, armed)` after each tick, then a frame at that tick
+        // of the given length with this many of the armed units alive on
+        // screen; only fight frames are recorded, as `sample_fight` does.
+        let frames: [(u32, u32, [u32; 2], u64, usize); 9] = [
+            (100, 0, [200, 200], 10, 400), // start-up: no hit yet
+            (150, 0, [200, 200], 11, 400), // walking to contact
+            (151, 3, [200, 200], 20, 398), // first hit: the window opens
+            (160, 0, [190, 195], 30, 385), // 9 ticks after a hit, all shown
+            (170, 0, [185, 190], 40, 375), // 19 ticks after: still in
+            (171, 0, [185, 190], 50, 999), // 20 ticks after: out
+            (300, 2, [49, 150], 60, 999),  // P0 down to stragglers
+            (310, 1, [52, 140], 70, 96),   // back in, zoomed on half of it
+            (400, 5, [0, 120], 80, 999),   // mop-up: never counts
+        ];
+        for (tick, hits, armed, frame_ms, on_screen) in frames {
+            w.observe_tick(tick, hits, armed);
+            if w.is_fight_frame(tick) {
+                let alive = usize::try_from(armed[0] + armed[1]).expect("small");
+                w.record_frame(ms(frame_ms), on_screen, alive);
+            }
+        }
+        assert_eq!(w.units_at_first_hit, Some([200, 200]));
+        assert_eq!(w.ticks, Some((151, 310)));
+        assert_eq!(w.samples_ms, vec![20.0, 30.0, 40.0, 70.0]);
+        // The best frame still reads 398: only the smallest share (96 of
+        // the 192 alive, not the smallest count) shows the zoomed frame.
+        assert_eq!(w.on_screen_max, 398);
+        assert_eq!(w.on_screen_min, Some((96, 192)));
+        assert_eq!(
+            w.line(),
+            "fight frames=4 seconds=0.16 mean=40.00 p95=70.00 max=70.00 fps=25.0 ticks=151..310 on_screen_max=398 on_screen_min=96/192 units_at_first_hit=200/200"
+        );
+        // A share compares across frames: 375 of 375 shows more of the
+        // battle than 398 of 400, and a frame with no armed unit alive has
+        // nothing to show.
+        let mut shares = FightWindow::default();
+        shares.record_frame(ms(5), 375, 375);
+        shares.record_frame(ms(5), 398, 400);
+        shares.record_frame(ms(5), 0, 0);
+        shares.record_frame(ms(5), 380, 380);
+        assert_eq!(shares.on_screen_min, Some((398, 400)));
+        let mut empty = FightWindow::default();
+        empty.record_frame(ms(5), 0, 0);
+        assert_eq!(empty.on_screen_min, None);
+        // A hit while one army is under the threshold opens nothing.
+        let mut lopsided = FightWindow::default();
+        lopsided.observe_tick(5, 9, [FIGHT_MIN_ARMED - 1, 400]);
+        assert!(!lopsided.is_fight_frame(5));
+        assert_eq!(lopsided.ticks, None);
+        assert_eq!(
+            lopsided.units_at_first_hit,
+            Some([FIGHT_MIN_ARMED - 1, 400])
+        );
+    }
+
+    /// The RTS camera's pose and lens at `(x, y, zoom)` looking at a
+    /// `WINDOW_SIZE` window, with the computed values a running camera has.
+    fn camera_at(x: f32, y: f32, zoom: f32) -> (Camera, GlobalTransform) {
+        let rts = RtsCamera {
+            focus: Vec3::new(
+                x - crate::ground::HALF_EXTENT,
+                0.0,
+                y - crate::ground::HALF_EXTENT,
+            ),
+            zoom,
+            zoom_target: zoom,
+        };
+        let transform = GlobalTransform::from(
+            Transform::from_translation(rts.eye()).looking_at(rts.focus, Vec3::Y),
+        );
+        let (w, h) = crate::app::WINDOW_SIZE;
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(bevy::camera::RenderTargetInfo {
+            physical_size: UVec2::new(w, h),
+            scale_factor: 1.0,
+        });
+        camera.computed.clip_from_view = Projection::Perspective(PerspectiveProjection {
+            fov: 40.0_f32.to_radians(),
+            near: 0.5,
+            far: 400.0,
+            aspect_ratio: w as f32 / h as f32,
+            ..default()
+        })
+        .get_clip_from_view();
+        (camera, transform)
+    }
+
+    #[test]
+    fn units_on_screen_counts_what_projects_between_the_hud_bars() {
+        assert_eq!(
+            world_view_rect(Vec2::new(1280.0, 800.0)),
+            Rect::new(0.0, TOP_BAR_HEIGHT_PX, 1280.0, 800.0 - BOTTOM_BAR_HEIGHT_PX)
+        );
+        let (camera, transform) = camera_at(64.0, 64.0, 40.0);
+        let at = |x: i32, y: i32| world_from_sim(FxVec2::from_ints(x, y), 0.0);
+        // The focus projects to the window centre; a tile 50 m off is out
+        // of view; a point that projects into the bottom bar is not on
+        // screen, though it is inside the window.
+        let centre = camera.world_to_viewport(&transform, at(64, 64)).unwrap();
+        assert!(
+            (centre - Vec2::new(640.0, 400.0)).length() < 1.0,
+            "{centre}"
+        );
+        let bottom_bar = (64..128)
+            .map(|y| (y, camera.world_to_viewport(&transform, at(64, y)).unwrap()))
+            .find(|(_, p)| p.y > 800.0 - BOTTOM_BAR_HEIGHT_PX && p.y < 800.0)
+            .map(|(y, _)| y)
+            .expect("a row under the bottom bar");
+        let units = [
+            (UnitId(1), at(64, 64)),
+            (UnitId(2), at(66, 62)),
+            (UnitId(3), at(64, 64 + 50)),
+            (UnitId(4), at(64, bottom_bar)),
+        ];
+        assert_eq!(units_on_screen(&camera, &transform, units), 2);
+        // No render target yet (the first frame): nothing is counted.
+        assert_eq!(units_on_screen(&Camera::default(), &transform, units), 0);
+    }
+
+    /// The `<n>/<alive>` of the `on_screen_min=` field of a `fight` line.
+    fn coverage(line: &str) -> (usize, usize) {
+        let field = line
+            .split(' ')
+            .find_map(|f| f.strip_prefix("on_screen_min="))
+            .unwrap_or_else(|| panic!("no on_screen_min= field: {line}"));
+        let (seen, alive) = field
+            .split_once('/')
+            .unwrap_or_else(|| panic!("not <n>/<alive>: {line}"));
+        (seen.parse().expect("n"), alive.parse().expect("alive"))
+    }
+
+    /// The `enemy_outpost` prologue through the real systems: the window
+    /// opens at the first `Hit`, after the charge, with both armies whole
+    /// and every armed unit of the battle on screen at the default framing;
+    /// a camera move to a close-up during the fight shows in the line,
+    /// though the most units on screen still reads the default framing's.
+    #[test]
+    fn the_outpost_prologue_opens_the_fight_window() {
+        use crate::sim_driver::{ScenarioInput, SimPlugin};
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let (setup, stream, _) =
+            sim::scenarios::by_name("enemy_outpost", &rules).expect("scenario");
+        let handle = SimHandle::from_setup(setup, rules);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .add_plugins((
+                // The window messages `frame_stats` reads, and no exit.
+                bevy::window::WindowPlugin {
+                    primary_window: None,
+                    exit_condition: bevy::window::ExitCondition::DontExit,
+                    ..default()
+                },
+                SimPlugin::new(handle, Box::new(ScenarioInput::new(stream))),
+                FrameStatsPlugin {
+                    arrival: None,
+                    fight: true,
+                },
+            ));
+        let framing = crate::app::default_framing(Some("enemy_outpost")).expect("framed");
+        let (camera, transform) = camera_at(framing.x, framing.y, framing.zoom);
+        let rts_camera = app
+            .world_mut()
+            .spawn((camera, transform, RtsCamera::default()))
+            .id();
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        let mut opened_at = None;
+        for _ in 0..400 {
+            app.update();
+            let tick = app.world().non_send::<SimHandle>().tick();
+            let w = app.world().resource::<FightWindow>();
+            if opened_at.is_none() && !w.samples_ms.is_empty() {
+                opened_at = Some(tick);
+            }
+            if opened_at.is_some_and(|t| tick >= t + 10) {
+                break;
+            }
+        }
+        let opened_at = opened_at.expect("the fight window opened");
+        let w = app.world().resource::<FightWindow>();
+        println!("{}", w.line());
+        let (first, _) = w.ticks.expect("fighting ticks");
+        assert!(
+            first > sim::scenarios::ENEMY_OUTPOST_T_CHARGE,
+            "no hit before the charge: {first}"
+        );
+        assert_eq!(opened_at, first, "the frame of the first fighting tick");
+        assert_eq!(w.units_at_first_hit, Some([200, 200]));
+        assert!(w.samples_ms.iter().all(|&ms| (ms - 50.0).abs() < 1e-6));
+        assert!(
+            w.on_screen_max >= 350,
+            "on screen at the default framing: {}",
+            w.on_screen_max
+        );
+        let framed = w.line();
+        // The director's `battle_close` beat, mid-fight: the 30 m close-up
+        // shows only part of the battle from then on.
+        let close = crate::director::BATTLE_CLOSE;
+        let (camera, transform) = camera_at(close.x, close.y, close.zoom);
+        app.world_mut()
+            .entity_mut(rts_camera)
+            .insert((camera, transform));
+        let moved_at = app.world().non_send::<SimHandle>().tick();
+        while app.world().non_send::<SimHandle>().tick() < moved_at + 10 {
+            app.update();
+        }
+        let w = app.world().resource::<FightWindow>();
+        let after = w.line();
+        println!("{after}");
+        assert!(w.on_screen_max >= 350, "the maximum cannot tell: {after}");
+        let (seen, alive) = coverage(&after);
+        assert!(seen < alive, "the close-up shows in the line: {after}");
+        let (seen, alive) = coverage(&framed);
+        assert_eq!(
+            seen, alive,
+            "every armed unit alive on screen in every frame at the default framing: {framed}"
+        );
     }
 }

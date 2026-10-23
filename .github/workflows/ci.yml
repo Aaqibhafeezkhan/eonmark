@@ -95,17 +95,20 @@ jobs:
           cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay | tail -n 1 | tee hash-macos.txt
           grep -q '^tick=1200 hash=0x[0-9a-f]\{16\}$' hash-macos.txt
 
-      - name: verify golden fixtures move_500 and combat_skirmish (release)
+      - name: verify golden fixtures move_500, combat_skirmish and enemy_outpost_walkthrough (release)
         # The same commands run in the headless job on Linux; hash-parity
         # diffs each pair of `OK final_hash=...` lines (combat_skirmish puts
         # acquisition, shooters, hits and destruction under the parity
-        # check). `verify` exits 1 on any other outcome and pipefail
-        # propagates it through grep and tee.
+        # check). enemy_outpost_walkthrough (M4b: a 200 vs 200 prologue, then
+        # the line-1 build-up and siege) is verified on both OSes against
+        # the hashes recorded in it. `verify` exits 1 on any other outcome
+        # and pipefail propagates it through grep and tee.
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-macos-fixture.txt
           test -s hash-macos-fixture.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-macos-combat.txt
           test -s hash-macos-combat.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay
 
       - uses: actions/upload-artifact@v7
         with:
@@ -143,6 +146,11 @@ jobs:
       - name: engine-free crate tests
         run: cargo test -p sim -p rules -p ai -p sim-cli --locked
 
+      - name: ignored enemy_outpost tests (M4b prologue, beats and golden)
+        # The 400-unit prologue keeps these out of the local `cargo test -p
+        # sim` budget; the sim crate is opt-level 3 in dev, so no --release.
+        run: cargo test -p sim --locked -- --ignored enemy_outpost
+
       - name: data-check
         run: cargo run -p sim-cli --locked -- data-check data
 
@@ -165,6 +173,7 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/economy_walkthrough.eonreplay | tee verify-economy-walkthrough.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/combat_skirmish.eonreplay | grep '^OK' | tee hash-linux-combat.txt
           test -s hash-linux-combat.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay | tee verify-enemy-outpost-walkthrough.txt
 
       - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
         run: |
@@ -197,6 +206,12 @@ jobs:
         run: |
           cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay | tail -n 1 | tee hash-linux.txt
           grep -q '^tick=1200 hash=0x[0-9a-f]\{16\}$' hash-linux.txt
+
+      - name: headless replay (enemy_outpost_walkthrough fixture)
+        # M4b: the game's own driver re-simulates the scripted owner proxy
+        # (400 units fighting, then the build-up and siege) and exits 0 only
+        # if its final hash matches the recorded one.
+        run: cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay | tail -n 1
 
       - uses: actions/upload-artifact@v7
         with:
@@ -236,14 +251,19 @@ jobs:
       # Bevy compiles WGSL only when it builds a pipeline, and a shader that
       # fails is logged while the game runs on and exits 0; this renders the
       # walkthrough on lavapipe and fails on any ERROR line (render_watchdog.rs
-      # adds one for a pipeline that never becomes ready). winit loads
-      # libxkbcommon-x11 and the X libraries at run time; the runner image
-      # lacks the first. The screenshot is uploaded for review.
+      # adds one for a pipeline that never becomes ready). Since M4b it also
+      # renders `unit_looks`, one of every unit look per team at 40 m, and
+      # `enemy_outpost` at tick 400 in its own framing: 400 units mid-fight
+      # with health bars, so the unlit bar pipeline compiles. winit
+      # loads libxkbcommon-x11 and the X libraries at run time; the runner
+      # image lacks the first. The screenshots are uploaded for review.
       - name: Render smoke test (Xvfb, lavapipe)
         run: |
           sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxi6 libxrandr2
           cargo build -p game --locked --profile ci
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke"
+          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/unit_looks" unit_looks 20,32,40 100
+          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/enemy_outpost" enemy_outpost '' 400
 
       - uses: actions/upload-artifact@v7
         if: always()
