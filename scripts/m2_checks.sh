@@ -11,10 +11,12 @@
 #      (35 s each): both replays verify OK, and `sim-cli hash-dump --every 1`
 #      of the two agrees tick for tick over their common prefix, which must
 #      cover the whole 600-tick script.
-#   3. `--exit-after-seconds 5`: exit 0 and the replay verifies OK with no
-#      truncation warning (clean-exit trailer present).
-#   4. a windowed run killed with `kill -9` after 8 s: `sim-cli verify` prints
-#      a truncation `warning:` and still `OK`.
+#   3. `--skip-menu --exit-after-seconds 5`: exit 0 and the replay verifies
+#      OK with no truncation warning (clean-exit trailer present).
+#   4. a `--skip-menu` windowed run killed with `kill -9` after 8 s:
+#      `sim-cli verify` prints a truncation `warning:` and still `OK`.
+#   Checks 3 and 4 pass --skip-menu since M5b: a plain launch opens on the
+#   main menu, where the sim does not step and nothing is recorded.
 #   5. `--scenario hud_click`: exit 0 and `hud_click: ok` on stdout.
 #   6. `--scenario units200_auto` (65 s): exit 0, `frame_stats:` lines on
 #      stdout, replay verifies OK, frame-time p95 under 16.7 ms, and the
@@ -34,6 +36,10 @@
 #        M2_CHECKS_CI_PROFILE=0 skip building and timing the --profile ci binary in check 1
 #        UNITS200_SECONDS=65    how long check 6 runs
 #        CARGO_TARGET_DIR       honoured (default: <repo>/target)
+#        M2_CHECKS_BIN, M2_CHECKS_SIMCLI
+#                               use these eonmark and sim-cli binaries instead of
+#                               building the dev ones (scripts/m5b_checks.sh runs
+#                               checks 3 and 4 on its own binaries this way)
 set -euo pipefail
 
 # rustup is keg-only in Homebrew; make cargo visible without a shell profile.
@@ -50,14 +56,16 @@ mkdir -p "$scratch"
 scratch="$(cd "$scratch" && pwd)"
 
 target_dir="${CARGO_TARGET_DIR:-$root/target}"
-bin="$target_dir/debug/eonmark"
-simcli="$target_dir/debug/sim-cli"
+bin="${M2_CHECKS_BIN:-$target_dir/debug/eonmark}"
+simcli="${M2_CHECKS_SIMCLI:-$target_dir/debug/sim-cli}"
 
 # A `--features dev` binary links libstd dynamically through @rpath without an
 # LC_RPATH entry; `cargo run` adds this directory to the dyld fallback path for
 # its child. The checks exec the binary directly instead (so `kill -9` hits the
 # game, not cargo), so set it here. Ignored on Linux.
 export DYLD_FALLBACK_LIBRARY_PATH="$(rustc --print target-libdir)${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+# The same for a dev build on Linux (`dynamic_linking`).
+export LD_LIBRARY_PATH="$(dirname "$bin")/deps:$(rustc --print target-libdir)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Background mode for every windowed run (docs/IMPLEMENTER_NOTES.md: automated
 # and agent-run windowed checks always use it; manual playtests do not).
@@ -155,10 +163,14 @@ echo "m2_checks: checks: $only"
 
 echo
 echo "==> build"
-echo "+ cargo build -p game --features dev --locked"
-cargo build -p game --features dev --locked 2>&1 | tail -n 3
-echo "+ cargo build -p sim-cli --locked"
-cargo build -p sim-cli --locked 2>&1 | tail -n 3
+if [ -n "${M2_CHECKS_BIN:-}" ] || [ -n "${M2_CHECKS_SIMCLI:-}" ]; then
+  echo "using the given binaries: $bin, $simcli"
+else
+  echo "+ cargo build -p game --features dev --locked"
+  cargo build -p game --features dev --locked 2>&1 | tail -n 3
+  echo "+ cargo build -p sim-cli --locked"
+  cargo build -p sim-cli --locked 2>&1 | tail -n 3
+fi
 test -x "$bin" || { echo "error: $bin missing after the build" >&2; exit 2; }
 test -x "$simcli" || { echo "error: $simcli missing after the build" >&2; exit 2; }
 
@@ -251,18 +263,18 @@ fi
 
 # --- 3. clean exit ---------------------------------------------------------
 if wants 3; then
-  step 3 "--exit-after-seconds 5: exit 0, replay verifies OK without a warning"
+  step 3 "--skip-menu --exit-after-seconds 5: exit 0, replay verifies OK without a warning"
   ok=1
   dir="$scratch/03-replays"; mkdir -p "$dir"
-  windowed 45 "$scratch/03-run.txt" --exit-after-seconds 5 --replay-dir "$dir"
+  windowed 45 "$scratch/03-run.txt" --skip-menu --exit-after-seconds 5 --replay-dir "$dir"
   [ "$last_status" -eq 0 ] || { say "exit $last_status"; ok=0; }
   replay="$(replay_from "$scratch/03-run.txt" "$dir")"
   if [ -z "$replay" ]; then say "no replay written"; ok=0; else
     say "replay $replay"
     verify "$replay" "$scratch/03-verify.txt"
     verify_ok "$scratch/03-verify.txt" || { say "verify not OK"; ok=0; }
-    # Only the truncation warning counts: verify also warns that the default
-    # skirmish has AI slots driven by ai::Passive until M5b.
+    # Only the truncation warning counts. Since M5b verify rebuilds the
+    # plain launch's Standard bot from the header and prints no other warning.
     if grep -q 'warning:.*no clean-exit trailer' "$scratch/03-verify.txt.err"; then say "verify reports no clean-exit trailer"; ok=0; fi
   fi
   if [ "$ok" -eq 1 ]; then pass 3 "clean exit: $(grep '^OK' "$scratch/03-verify.txt")"; else fail 3 "clean exit; see $scratch/03-*"; fi
@@ -270,12 +282,12 @@ fi
 
 # --- 4. kill -9 ------------------------------------------------------------
 if wants 4; then
-  step 4 "kill -9 after 8 s: replay verifies OK with a truncation warning"
+  step 4 "--skip-menu, kill -9 after 8 s: replay verifies OK with a truncation warning"
   ok=1
   dir="$scratch/04-replays"; mkdir -p "$dir"
   log="$scratch/04-run.txt"
-  echo "+ $bin --exit-after-seconds 60 --replay-dir $dir > $log &  (kill -9 after 8 s)"
-  "$bin" --exit-after-seconds 60 --replay-dir "$dir" >"$log" 2>&1 &
+  echo "+ $bin --skip-menu --exit-after-seconds 60 --replay-dir $dir > $log &  (kill -9 after 8 s)"
+  "$bin" --skip-menu --exit-after-seconds 60 --replay-dir "$dir" >"$log" 2>&1 &
   bg_pid=$!
   sleep 8
   if kill -0 "$bg_pid" 2>/dev/null; then

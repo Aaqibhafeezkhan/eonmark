@@ -9,8 +9,8 @@
 //! `Crossing`, and the seeded random generator behind `fuzz`.
 //!
 //! Every scenario runs on [`MatchSetup::scenario`] (two human slots, debug
-//! commands accepted) with [`ai::Passive`] in the AI seat, which is never
-//! consulted.
+//! commands accepted, no AI seat), built through `ai::controller_for` like
+//! every replay.
 
 use rand_core::{Rng, SeedableRng};
 use sim::scenarios::{BENCH_CROSS_SEED, EAST, Stream, WEST};
@@ -55,13 +55,29 @@ pub enum Scenario {
         /// Units to spawn.
         units: u16,
     },
+    /// `m5_first_match` (M5b): the Standard bot against the Standard bot
+    /// from the standard start on the default map, seed
+    /// [`FIRST_MATCH_SEED`], no human input, recorded to the step that
+    /// decides the match (at the latest the 54000-tick cap). The first
+    /// playable match's golden, and `play-bots --seeds 1` reproduces it:
+    /// `record --scenario m5_first_match --seed N` records any
+    /// Standard-vs-Standard seed. Outside [`sim::scenarios::NAMES`]: the
+    /// sim cannot build bots.
+    FirstMatch,
 }
+
+/// The `m5_first_match` fixture's seed.
+pub const FIRST_MATCH_SEED: u64 = 1;
+
+/// Ticks between `Hash` records in the `m5_first_match` recording.
+pub const FIRST_MATCH_HASH_EVERY: u32 = 100;
 
 impl Scenario {
     /// Names accepted by `--scenario`.
     pub fn names() -> Vec<&'static str> {
         let mut names = sim::scenarios::NAMES.to_vec();
         names.push("selftest");
+        names.push("m5_first_match");
         names
     }
 
@@ -69,6 +85,9 @@ impl Scenario {
     pub fn parse(name: &str) -> Option<Scenario> {
         if name == "selftest" {
             return Some(Scenario::Selftest);
+        }
+        if name == "m5_first_match" {
+            return Some(Scenario::FirstMatch);
         }
         sim::scenarios::NAMES
             .iter()
@@ -86,26 +105,33 @@ impl Scenario {
             }
             Scenario::Selftest => SELFTEST_TICKS,
             Scenario::Crossing { .. } => sim::scenarios::MOVE_500_TICKS,
+            Scenario::FirstMatch => rules.match_cap_ticks(),
         }
     }
 
     /// Ticks between `Hash` records in this scenario's recording:
     /// [`sim::scenarios::STALEMATE_45MIN_HASH_EVERY`] (1000) for the
-    /// 54000-tick `stalemate_45min`, the replay default (20) otherwise.
+    /// 54000-tick `stalemate_45min`, [`FIRST_MATCH_HASH_EVERY`] (100) for
+    /// `m5_first_match`, the replay default (20) otherwise.
     /// `record --hash-every` and `--hash-every-tick` override it.
     pub fn default_hash_every(self) -> u32 {
         match self {
             Scenario::Fixture("stalemate_45min") => sim::scenarios::STALEMATE_45MIN_HASH_EVERY,
+            Scenario::FirstMatch => FIRST_MATCH_HASH_EVERY,
             _ => sim::replay::DEFAULT_HASH_EVERY,
         }
     }
 
     /// Whether a recording of this scenario ends right after the step that
     /// decides the match (M5a): `capture_seat`, whose by-name length is
-    /// only an upper bound. Its fixture then ends at the deciding tick, so
-    /// its final hash is the one the game shows on the outcome overlay.
+    /// only an upper bound, and `m5_first_match` (M5b). Its fixture then
+    /// ends at the deciding tick, so its final hash is the one the game
+    /// shows on the outcome overlay.
     pub fn stops_at_outcome(self) -> bool {
-        matches!(self, Scenario::Fixture("capture_seat"))
+        matches!(
+            self,
+            Scenario::Fixture("capture_seat") | Scenario::FirstMatch
+        )
     }
 
     /// The tick before whose step a recording snapshots the sim, builds a
@@ -151,13 +177,139 @@ impl Scenario {
             Scenario::Crossing { units } => {
                 sim::scenarios::bench_cross(rules, units, seed.unwrap_or(DEFAULT_SEED))
             }
+            Scenario::FirstMatch => (
+                first_match(rules, seed.unwrap_or(FIRST_MATCH_SEED)),
+                Vec::new(),
+            ),
         }
     }
 }
 
-/// A sim for a scenario setup, with a passive AI seat.
+/// The `m5_first_match` header: the Standard bot (personality `standard`)
+/// in both seats, from the standard start, no debug commands.
+pub fn first_match(rules: &Rules, seed: u64) -> MatchSetup {
+    MatchSetup::bots(
+        rules,
+        seed,
+        (ai::BOT_STANDARD, "standard"),
+        (ai::BOT_STANDARD, "standard"),
+    )
+}
+
+/// The first sequence number of the `bench --bots` stream's commands, far
+/// above any a bot reaches (each bot numbers its own from 0).
+pub const BOTS_BENCH_SEQ: u32 = 1 << 30;
+
+/// Resources each side of `bench --bots` is granted, per resource.
+pub const BOTS_BENCH_GRANT: u32 = 2000;
+
+/// The armed kinds `bench --bots` spawns in equal parts per side.
+pub const BOTS_BENCH_KINDS: [&str; 4] = ["skirmisher", "bowman", "shieldbearer", "outrider"];
+
+/// How far north of the enemy Seat's centre each side's forward half
+/// stands, in tiles: inside the enemy's land and its `defend_radius_tiles`
+/// (16), beyond the Seat's shot (7 tiles from its 3x3 footprint).
+pub const BOTS_BENCH_FORWARD_TILES: i32 = 12;
+
+/// The `sim-cli bench --bots` match (M5b, ROADMAP acceptance 3): the
+/// Standard bot in both seats (`passive` seats for the control run) from
+/// the standard start with debug commands on, and a tick-0 stream issued
+/// by P0 with sequence numbers from [`BOTS_BENCH_SEQ`]. For each player:
+/// `DebugAdvanceAge` (Masonry, so waves may launch), a `DebugGrant` of
+/// [`BOTS_BENCH_GRANT`] of every resource, and `units / 2 - 8` armed units
+/// in equal parts of [`BOTS_BENCH_KINDS`] (`DebugSpawnJittered`), half at
+/// the player's own rally seed together with 2 Mangonels and a Supply
+/// Wain, half [`BOTS_BENCH_FORWARD_TILES`] north of the enemy Seat. With
+/// the 5 Yeomen of the standard start that is exactly `units / 2` units a
+/// side when `units / 2 - 8` divides by 4 (200 a side at `--units 400`).
+/// The first plans defend against the other side's forward half on their
+/// land (which holds launches for up to `defend_max_block_ds`), then each
+/// seat launches a wave of the army assembled, sieged and supplied at its
+/// rally; meanwhile the build order runs on the grants and production
+/// meets a full pop.
+pub fn bots_bench(rules: &Rules, units: u16, seed: u64, standard: bool) -> (MatchSetup, Stream) {
+    let seat = if standard {
+        (ai::BOT_STANDARD, "standard")
+    } else {
+        (ai::BOT_PASSIVE, "")
+    };
+    let mut setup = MatchSetup::bots(rules, seed, seat, seat);
+    setup.debug_commands = true;
+    let kind = |id: &str| {
+        let i = rules
+            .units
+            .iter()
+            .position(|u| u.id == id)
+            .expect("the bench's unit kinds are in units.ron");
+        UnitKindId(u16::try_from(i).expect("few kinds"))
+    };
+    let knobs = rules
+        .ai
+        .personality("standard")
+        .expect("the standard personality is in data/ai");
+    let def = rules
+        .map(&setup.map)
+        .expect("the setup's map is in the rules");
+    let start =
+        |p: usize| FxVec2::from_ints(i32::from(def.starts[p].x), i32::from(def.starts[p].y));
+    let armed = (units / 2).saturating_sub(8);
+    let per_kind = armed / 4;
+    let home = per_kind / 2;
+    let mut cmds = Vec::new();
+    let mut seq = BOTS_BENCH_SEQ;
+    let mut push = |cmd: Command| {
+        cmds.push(PlayerCommand::new(PlayerId(0), seq, cmd));
+        seq += 1;
+    };
+    for p in 0..2u8 {
+        let owner = PlayerId(p);
+        let enemy = usize::from(1 - p);
+        let rally = ai::standard::MapAnalysis::new(rules, &setup, owner, knobs).rally_seed;
+        let rally = FxVec2::from_ints(i32::from(rally.x), i32::from(rally.y));
+        let forward = start(enemy) + FxVec2::from_ints(0, -BOTS_BENCH_FORWARD_TILES);
+        push(Command::DebugAdvanceAge { owner });
+        for r in 0..rules.resources.resources.len() {
+            push(Command::DebugGrant {
+                owner,
+                resource: u8::try_from(r).expect("few resources"),
+                amount: BOTS_BENCH_GRANT,
+            });
+        }
+        for id in BOTS_BENCH_KINDS {
+            for (at, count) in [(rally, home), (forward, per_kind - home)] {
+                if count > 0 {
+                    push(Command::DebugSpawnJittered {
+                        owner,
+                        kind: kind(id),
+                        at,
+                        count,
+                        jitter_x100: sim::scenarios::COMBAT_BENCH_JITTER_X100,
+                    });
+                }
+            }
+        }
+        for (id, count) in [("mangonel", 2), ("supply_wain", 1)] {
+            push(Command::DebugSpawnJittered {
+                owner,
+                kind: kind(id),
+                at: rally,
+                count,
+                jitter_x100: sim::scenarios::COMBAT_BENCH_JITTER_X100,
+            });
+        }
+    }
+    (setup, vec![(0, cmds)])
+}
+
+/// A sim for a scenario setup, with the bots its header names
+/// (`ai::controller_for`; the scenarios here have none).
+///
+/// # Panics
+///
+/// If the header names a bot this build does not know.
 pub fn build(setup: &MatchSetup, rules: &Rules) -> Sim {
-    Sim::new(setup.clone(), rules.clone(), Box::new(ai::Passive))
+    let controller = ai::controller_for(setup, rules).expect("a scenario's bots are known");
+    Sim::new(setup.clone(), rules.clone(), controller)
 }
 
 /// `DebugSpawn` of `count` Yeomen for `owner` around `at`.
@@ -237,8 +389,8 @@ fn selftest(tick: u32) -> Vec<PlayerCommand> {
 /// (unknown player, no valid units, unknown unit kind, not enough techs,
 /// unknown building (`Cancel`, `Gather`, `Train`, `SetRally`, `Research`),
 /// a `Build` by a unit that does not exist, an `Attack` or a `DebugDamage`
-/// on a unit that does not exist, and everything player 1 issues after it
-/// surrenders). Returns the per-tick commands and the `(player, seq)` keys
+/// on a unit that does not exist, a `DebugAdvanceAge` for a player that
+/// does not exist, and everything player 1 issues after it surrenders). Returns the per-tick commands and the `(player, seq)` keys
 /// the sim must reject.
 /// `movement` enables Move commands.
 pub fn random_commands(
@@ -451,6 +603,17 @@ pub fn random_commands(
             ));
             rejected.push((PlayerId(0), seq[0]));
             seq[0] += 1;
+        } else if (69..73).contains(&bad) {
+            // UnknownPlayer: a DebugAdvanceAge for a player that does not
+            // exist (M5b); the issuer exists, so only the owner check
+            // rejects it.
+            cmds.push(PlayerCommand::new(
+                PlayerId(0),
+                seq[0],
+                Command::DebugAdvanceAge { owner: PlayerId(7) },
+            ));
+            rejected.push((PlayerId(0), seq[0]));
+            seq[0] += 1;
         }
         stream.push(cmds);
     }
@@ -486,6 +649,47 @@ mod tests {
         );
         assert_eq!(Scenario::Fixture("move_500").snapshot_tick(), None);
         assert_eq!(Scenario::Selftest.snapshot_tick(), None);
+    }
+
+    /// `m5_first_match` is the Standard bot against itself from the
+    /// standard start at seed 1, with no input of its own: what `play-bots
+    /// --seeds 1` plays; `--seed` overrides the seed.
+    #[test]
+    fn first_match_is_standard_against_standard_with_no_stream() {
+        let rules = rules();
+        let (setup, stream) = Scenario::FirstMatch.setup_and_stream(&rules, None, 54_000);
+        assert!(stream.is_empty());
+        assert_eq!(setup, first_match(&rules, 1));
+        assert_eq!(
+            setup,
+            MatchSetup::bots(
+                &rules,
+                1,
+                ("standard", "standard"),
+                ("standard", "standard")
+            )
+        );
+        assert!(!setup.debug_commands);
+        let (setup, _) = Scenario::FirstMatch.setup_and_stream(&rules, Some(4), 54_000);
+        assert_eq!(setup.seed, 4);
+        assert!(!sim::scenarios::NAMES.contains(&"m5_first_match"));
+    }
+
+    /// `bench --bots`: the stream comes from P0 at sequence numbers from
+    /// `1 << 30`, and the control run's header has Passive seats.
+    #[test]
+    fn bots_bench_stream_and_seats() {
+        let rules = rules();
+        let (setup, stream) = bots_bench(&rules, 400, 1, true);
+        assert!(setup.debug_commands);
+        assert!(setup.ai_seats.iter().all(|s| s.bot == "standard"));
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].0, 0);
+        assert!(stream[0].1.iter().all(|c| c.player == PlayerId(0)));
+        assert!(stream[0].1.iter().all(|c| c.seq >= BOTS_BENCH_SEQ));
+        let (control, control_stream) = bots_bench(&rules, 400, 1, false);
+        assert!(control.ai_seats.iter().all(|s| s.bot == "passive"));
+        assert_eq!(control_stream, stream);
     }
 
     #[test]

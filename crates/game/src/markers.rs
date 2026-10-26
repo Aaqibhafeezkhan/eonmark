@@ -528,7 +528,12 @@ mod tests {
         let (setup, stream, _) = sim::scenarios::by_name("capture_seat", &rules).unwrap();
         struct NoAi;
         impl sim::AiController for NoAi {
-            fn think(&mut self, _: PlayerId, _: &SimView<'_>) -> Vec<sim::Command> {
+            fn think(
+                &mut self,
+                _: PlayerId,
+                _: &SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<sim::Command> {
                 Vec::new()
             }
         }

@@ -599,7 +599,7 @@ mod tests {
     struct NoAi;
 
     impl sim::AiController for NoAi {
-        fn think(&mut self, _: PlayerId, _: &SimView<'_>) -> Vec<Command> {
+        fn think(&mut self, _: PlayerId, _: &SimView<'_>, _: &mut sim::AiMemory) -> Vec<Command> {
             Vec::new()
         }
     }

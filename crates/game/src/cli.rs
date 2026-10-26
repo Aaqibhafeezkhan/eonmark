@@ -4,8 +4,13 @@
 //! M2 flags and who wires their behaviour (see the M2 contract):
 //! `--headless-run <ticks | path.eonreplay>` (replay mode: agent A),
 //! `--scenario <name>` (A), `--max-fps <n>` (A), `--replay-dir <dir>` (A),
-//! `--hash-every-tick` (A), `--screenshot <path>` (B, dev builds only),
+//! `--hash-every-tick` (A), `--screenshot <path>` (B),
 //! `--background` (`crate::background`; also `EONMARK_BACKGROUND=1`).
+//! M5b adds the main menu's flags: `--skip-menu`, `--spectate`,
+//! `--fast-forward-to <tick>` (with `--spectate` only) and the New Game
+//! click proxy `--new-game-after-seconds <s>` (`crate::menu`), and
+//! [`Cli::seed_explicit`], so a plain launch without `--seed` plays a fresh
+//! wall-clock seed (`app::match_seed`).
 //! Parsing is complete and tested here.
 
 use std::path::{Path, PathBuf};
@@ -26,8 +31,8 @@ Options:
   --replay-dir <DIR>           Write this session's replay under DIR instead of the
                                platform data directory.
   --hash-every-tick            Record a hash checkpoint every tick instead of every 20.
-  --screenshot <PATH>          Dev builds: save a PNG of the window about one second
-                               before --exit-after-seconds fires.
+  --screenshot <PATH>          Save a PNG of the window about one second before
+                               --exit-after-seconds fires.
   --screenshot-at <TICK>:<PATH>
                                Save a PNG of the window once the sim has reached TICK
                                (repeatable; scripted scenarios' beats, M3b proxies).
@@ -36,9 +41,9 @@ Options:
                                menu id through the same path a real Cmd-Q takes
                                (AppExit::Success, replay trailer). Ignored elsewhere.
   --close-window-after-seconds <S>
-                               Dev builds: after S seconds request the primary window to
-                               close, the path the red close button takes (bevy_window
-                               despawns it, exit_on_all_closed writes AppExit::Success).
+                               After S seconds request the primary window to close, the
+                               path the red close button takes (bevy_window despawns
+                               it, exit_on_all_closed writes AppExit::Success).
   --exit-after-seconds <S>     Send AppExit::Success after S seconds (smoke tests).
   --camera <X>,<Y>,<ZOOM>      Start the camera over sim tile (X, Y) at ZOOM metres
                                (15 to 60) instead of jumping to the first units
@@ -47,7 +52,22 @@ Options:
                                windows, in the top-left corner of the primary monitor,
                                and (macOS) hand focus back to the app that had it. Also
                                on when EONMARK_BACKGROUND=1. Ignored by --headless-run.
-  --seed <U64>                 Match seed (default 1).
+  --seed <U64>                 Match seed. Without it a plain launch, --skip-menu and
+                               --spectate use a fresh seed from the wall clock (shown on
+                               the menu and in the replay's name), a scenario keeps its
+                               own, and --headless-run uses 1.
+  --skip-menu                  Start the match against the Standard bot at once instead
+                               of opening the main menu.
+  --spectate                   Watch the Standard bot play itself (both slots AI; with
+                               --seed 1 it is the m5_first_match setup, otherwise a
+                               fresh seed). You can select units and move the camera
+                               but give no orders. No menu.
+  --fast-forward-to <TICK>     With --spectate: simulate up to TICK before the window
+                               opens (refused if the match is decided by then); the
+                               replay is recorded from there and still verifies.
+  --new-game-after-seconds <S>
+                               The New Game proxy: after S seconds click the menu's real
+                               New Game button with a synthetic mouse (picking path).
   --data-dir <PATH>            Override the data directory (default: see below).
   -h, --help                   Show this text.
 
@@ -128,6 +148,9 @@ pub struct Cli {
     pub exit_after_seconds: Option<f64>,
     /// `--seed <u64>`; defaults to 1 so `--headless-run` is reproducible.
     pub seed: u64,
+    /// `true` when `--seed` was given (M5b): a scenario's own seed and a
+    /// plain launch's fresh wall-clock seed are overridden only then.
+    pub seed_explicit: bool,
     /// `--data-dir <path>`.
     pub data_dir: Option<PathBuf>,
     /// `--scenario <name>`; validated against `sim::scenarios::by_name` at
@@ -156,6 +179,14 @@ pub struct Cli {
     pub camera: Option<CameraStart>,
     /// `--screenshot-at <tick>:<path>`, in the order given.
     pub screenshot_at: Vec<(u32, PathBuf)>,
+    /// `--skip-menu` (M5b): start the vs-bot match without the main menu.
+    pub skip_menu: bool,
+    /// `--spectate` (M5b): the Standard bot in both slots, no local input.
+    pub spectate: bool,
+    /// `--fast-forward-to <tick>` (M5b, with `--spectate` only).
+    pub fast_forward_to: Option<u32>,
+    /// `--new-game-after-seconds <s>` (M5b): the menu's New Game click proxy.
+    pub new_game_after_seconds: Option<f64>,
 }
 
 impl Default for Cli {
@@ -164,6 +195,7 @@ impl Default for Cli {
             headless_run: None,
             exit_after_seconds: None,
             seed: 1,
+            seed_explicit: false,
             data_dir: None,
             scenario: None,
             max_fps: None,
@@ -175,6 +207,10 @@ impl Default for Cli {
             background: false,
             camera: None,
             screenshot_at: Vec::new(),
+            skip_menu: false,
+            spectate: false,
+            fast_forward_to: None,
+            new_game_after_seconds: None,
         }
     }
 }
@@ -213,7 +249,20 @@ impl Cli {
                     }
                     cli.exit_after_seconds = Some(secs);
                 }
-                "--seed" => cli.seed = parse_value(&arg, args.next())?,
+                "--seed" => {
+                    cli.seed = parse_value(&arg, args.next())?;
+                    cli.seed_explicit = true;
+                }
+                "--skip-menu" => cli.skip_menu = true,
+                "--spectate" => cli.spectate = true,
+                "--fast-forward-to" => cli.fast_forward_to = Some(parse_value(&arg, args.next())?),
+                "--new-game-after-seconds" => {
+                    let secs: f64 = parse_value(&arg, args.next())?;
+                    if !secs.is_finite() || secs < 0.0 {
+                        return Err(format!("{arg}: expected a non-negative number"));
+                    }
+                    cli.new_game_after_seconds = Some(secs);
+                }
                 "--data-dir" => cli.data_dir = Some(parse_path(&arg, args.next())?),
                 "--scenario" => {
                     let name = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
@@ -291,8 +340,44 @@ impl Cli {
                     "--close-window-after-seconds needs a window; drop --headless-run".into(),
                 );
             }
+            for (given, flag) in [
+                (cli.skip_menu, "--skip-menu"),
+                (cli.spectate, "--spectate"),
+                (cli.fast_forward_to.is_some(), "--fast-forward-to"),
+                (
+                    cli.new_game_after_seconds.is_some(),
+                    "--new-game-after-seconds",
+                ),
+            ] {
+                if given {
+                    return Err(format!("{flag} needs a window; drop --headless-run"));
+                }
+            }
+        }
+        if cli.spectate && cli.scenario.is_some() {
+            return Err("--spectate builds its own match; drop --scenario".into());
+        }
+        if cli.fast_forward_to.is_some() && !cli.spectate {
+            return Err(
+                "--fast-forward-to needs --spectate (only a match without human input can skip ahead and still record a replay that verifies)"
+                    .into(),
+            );
+        }
+        if cli.new_game_after_seconds.is_some() && !cli.starts_in_menu() {
+            return Err(
+                "--new-game-after-seconds clicks the main menu's New Game; drop --skip-menu, --spectate and --scenario"
+                    .into(),
+            );
         }
         Ok(Parsed::Run(cli))
+    }
+
+    /// `true` when a windowed launch opens on the main menu (M5b owner
+    /// decision 5): a plain launch. `--scenario`, `--skip-menu` and
+    /// `--spectate` start the match at once, and `--headless-run` has no
+    /// window at all.
+    pub fn starts_in_menu(&self) -> bool {
+        self.scenario.is_none() && !self.skip_menu && !self.spectate
     }
 
     /// Hash checkpoint cadence in ticks: 1 under `--hash-every-tick`, else
@@ -452,6 +537,7 @@ mod tests {
                 headless_run: Some(HeadlessRun::Ticks(200)),
                 exit_after_seconds: Some(6.0),
                 seed: 42,
+                seed_explicit: true,
                 data_dir: Some(PathBuf::from("/tmp/data")),
                 scenario: None,
                 max_fps: Some(30),
@@ -463,6 +549,10 @@ mod tests {
                 background: false,
                 camera: None,
                 screenshot_at: Vec::new(),
+                skip_menu: false,
+                spectate: false,
+                fast_forward_to: None,
+                new_game_after_seconds: None,
             })
         );
         let Parsed::Run(cli) = parsed else {
@@ -575,6 +665,90 @@ mod tests {
         assert!(HeadlessRun::parse("seven").is_err());
         assert!(HeadlessRun::parse("match.replay").is_err());
         assert!(HeadlessRun::parse("-1").is_err());
+    }
+
+    /// M5b: the menu flags parse, `--seed` is remembered as explicit,
+    /// `--fast-forward-to` needs `--spectate`, the New Game proxy needs the
+    /// menu, and none of them runs headless.
+    #[test]
+    fn m5b_flags_parse_and_fast_forward_needs_spectate() {
+        let Ok(Parsed::Run(plain)) = parse(&[]) else {
+            panic!("no flags parse");
+        };
+        assert!(!plain.seed_explicit && plain.starts_in_menu());
+        let Ok(Parsed::Run(seeded)) = parse(&["--seed", "7"]) else {
+            panic!("--seed parses");
+        };
+        assert_eq!((seeded.seed, seeded.seed_explicit), (7, true));
+        // `--seed 1` is explicit too, although 1 is the default value.
+        let Ok(Parsed::Run(one)) = parse(&["--seed", "1"]) else {
+            panic!("--seed 1 parses");
+        };
+        assert!(one.seed_explicit);
+        assert_eq!(
+            parse(&["--skip-menu"]),
+            Ok(Parsed::Run(Cli {
+                skip_menu: true,
+                ..Cli::default()
+            }))
+        );
+        assert_eq!(
+            parse(&["--spectate", "--seed", "1", "--fast-forward-to", "25612"]),
+            Ok(Parsed::Run(Cli {
+                spectate: true,
+                seed: 1,
+                seed_explicit: true,
+                fast_forward_to: Some(25612),
+                ..Cli::default()
+            }))
+        );
+        assert_eq!(
+            parse(&[
+                "--new-game-after-seconds",
+                "3",
+                "--exit-after-seconds",
+                "45"
+            ]),
+            Ok(Parsed::Run(Cli {
+                new_game_after_seconds: Some(3.0),
+                exit_after_seconds: Some(45.0),
+                ..Cli::default()
+            }))
+        );
+        for skipping in [
+            vec!["--skip-menu"],
+            vec!["--spectate"],
+            vec!["--scenario", "units200"],
+        ] {
+            let Ok(Parsed::Run(cli)) = parse(&skipping) else {
+                panic!("{skipping:?} parses");
+            };
+            assert!(!cli.starts_in_menu(), "{skipping:?} skips the menu");
+            let mut with_proxy = skipping.clone();
+            with_proxy.extend(["--new-game-after-seconds", "1"]);
+            assert!(
+                parse(&with_proxy).is_err(),
+                "{with_proxy:?}: no menu to click"
+            );
+        }
+        // Fast-forward only skips a match nobody plays.
+        assert!(parse(&["--fast-forward-to", "100"]).is_err());
+        assert!(parse(&["--skip-menu", "--fast-forward-to", "100"]).is_err());
+        assert!(parse(&["--spectate", "--fast-forward-to"]).is_err());
+        assert!(parse(&["--spectate", "--fast-forward-to", "-5"]).is_err());
+        assert!(parse(&["--spectate", "--scenario", "units200"]).is_err());
+        assert!(parse(&["--new-game-after-seconds", "-1"]).is_err());
+        assert!(parse(&["--new-game-after-seconds", "soon"]).is_err());
+        for flag in [
+            vec!["--skip-menu"],
+            vec!["--spectate"],
+            vec!["--spectate", "--fast-forward-to", "10"],
+            vec!["--new-game-after-seconds", "1"],
+        ] {
+            let mut args = vec!["--headless-run", "10"];
+            args.extend(flag.iter().copied());
+            assert!(parse(&args).is_err(), "{args:?} needs a window");
+        }
     }
 
     #[test]

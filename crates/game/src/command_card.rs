@@ -173,8 +173,10 @@ impl Plugin for CommandCardPlugin {
                 )
                     .chain()
                     // The card freezes with the world at the outcome (M5a);
-                    // the overlay blocks its clicks.
-                    .run_if(not(resource_exists::<crate::sim_driver::MatchOver>)),
+                    // the overlay blocks its clicks. A spectator has no card
+                    // (M5b).
+                    .run_if(not(resource_exists::<crate::sim_driver::MatchOver>))
+                    .run_if(crate::sim_driver::local_player_is_human),
             );
     }
 }
@@ -764,6 +766,7 @@ pub fn update_tooltip(
 }
 
 /// A primary click on a card button: run its action, or show why not.
+/// Nothing while the local slot is a bot (M5b, `--spectate`).
 #[allow(clippy::too_many_arguments)] // Bevy observer: each parameter is one resource or query
 pub fn on_card_click(
     click: On<Pointer<Click>>,
@@ -772,8 +775,11 @@ pub fn on_card_click(
     mut pending: ResMut<PendingCommands>,
     mut message: ResMut<MessageState>,
     time: Res<Time>,
+    seat: Option<Res<crate::sim_driver::LocalSeat>>,
 ) {
-    if click.event().event.button != PointerButton::Primary {
+    if click.event().event.button != PointerButton::Primary
+        || !crate::sim_driver::local_player_is_human(seat)
+    {
         return;
     }
     let Ok((button, state)) = buttons.get(click.event().entity) else {
@@ -962,7 +968,12 @@ mod tests {
     struct NoAi;
 
     impl sim::AiController for NoAi {
-        fn think(&mut self, _: sim::PlayerId, _: &SimView<'_>) -> Vec<Command> {
+        fn think(
+            &mut self,
+            _: sim::PlayerId,
+            _: &SimView<'_>,
+            _: &mut sim::AiMemory,
+        ) -> Vec<Command> {
             Vec::new()
         }
     }

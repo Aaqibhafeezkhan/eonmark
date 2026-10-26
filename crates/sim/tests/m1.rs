@@ -18,7 +18,12 @@ const EAST: FxVec2 = scenarios::EAST;
 struct NoAi;
 
 impl sim::AiController for NoAi {
-    fn think(&mut self, _player: PlayerId, _view: &SimView<'_>) -> Vec<Command> {
+    fn think(
+        &mut self,
+        _player: PlayerId,
+        _view: &SimView<'_>,
+        _memory: &mut sim::AiMemory,
+    ) -> Vec<Command> {
         Vec::new()
     }
 }
@@ -121,19 +126,32 @@ fn golden(name: &str) {
     }
 }
 
+/// Five independent 600-tick `move_500` runs: two one after the other on the
+/// test's own thread, two at the same time on two spawned threads, and one
+/// with another seed. No run reads another's result, so the two threaded runs
+/// and the other-seed run go on their own threads while the test's thread
+/// runs the sequential pair: the same runs and assertions in about two run
+/// lengths of wall time instead of four.
 #[test]
 fn same_seed_same_hash_two_threads() {
-    let seq_a = run_move_500(42, 600);
-    let seq_b = run_move_500(42, 600);
-    assert_eq!(seq_a, seq_b);
-    let (thr_a, thr_b) = std::thread::scope(|s| {
+    let (seq_a, seq_b, thr_a, thr_b, other_seed) = std::thread::scope(|s| {
         let a = s.spawn(|| run_move_500(42, 600));
         let b = s.spawn(|| run_move_500(42, 600));
-        (a.join().unwrap(), b.join().unwrap())
+        let other = s.spawn(|| run_move_500(43, 600));
+        let seq_a = run_move_500(42, 600);
+        let seq_b = run_move_500(42, 600);
+        (
+            seq_a,
+            seq_b,
+            a.join().unwrap(),
+            b.join().unwrap(),
+            other.join().unwrap(),
+        )
     });
+    assert_eq!(seq_a, seq_b);
     assert_eq!(thr_a, thr_b);
     assert_eq!(seq_a, thr_a);
-    assert_ne!(run_move_500(43, 600), seq_a, "seed must reach the hash");
+    assert_ne!(other_seed, seq_a, "seed must reach the hash");
 }
 
 #[test]

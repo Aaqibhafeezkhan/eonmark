@@ -23,61 +23,84 @@ game half, as PR #38 (unit looks, health bars, attack orders, the research
 panel, the age strip and the `enemy_outpost` scenarios; its line 2 waits
 for the dev Mac).
 
-M5a, attrition, supply, annexation and victory, is closed on PR #43 at
-`SIM_VERSION` 16 and `rules_version` 20, with ten golden fixtures: all
-three of its acceptance lines are ticked there with pasted output, observed
-on a Linux VM (line 3 under Xvfb with lavapipe, the M3b and M4b precedent),
-and it is done once that PR merges. The
-owner answered the 15 questions of its implementation plan on 2026-10-22
-by taking every default; the decisions are numbered in the ROADMAP's M5a
-Notes. What M5a built, in five slices:
+M5a, attrition, supply, annexation and victory, is merged as PR #43
+(`SIM_VERSION` 16, `rules_version` 20, ten golden fixtures; its game half
+freezes a decided match and draws the outcome overlay). Its good first
+issues are #44, #45 and #46.
 
-- Rules data (`rules_version` 18): the Watchtower's Harrying I and II as
-  side techs that count toward no age, the attrition, annexation and
-  match-end knobs, and their validators.
-- Attrition (`SIM_VERSION` 15, `rules_version` 19):
-  `crates/sim/src/attrition.rs`, step 5b' between movement and combat
-  resolution, the hashed `Unit::exposed_ticks`, the per-step supply grid of
-  Supply Wain tiles, `Command::DebugDamage`, and the `attrition_*` tests of
-  line 1 (`cargo test -p sim attrition`).
-- Annexation and the outcome (`SIM_VERSION` 16, `rules_version` 20):
-  `crates/sim/src/annexation.rs` (step 5d: the timer of a Town at 0 HP, its
-  neutral land, the flip) and `crates/sim/src/victory.rs` (step 6e:
-  Surrender, Seat captured, all Towns lost, the 45-minute territory cap),
-  the hashed `TownState::hold` and `State::outcome`, `TownContested`, the
-  annex-hold guard rule, the Yield Cap decay knob (off), the
-  `capture_seat` and `stalemate_45min` goldens and the `annexation_*`
-  tests of line 2 (`cargo test -p sim annexation`, the 54000-step
-  stalemate included and not ignored).
-- The game half (no bump): the live game freezes at the outcome after
-  finishing its replay in the deciding step and printing an `outcome:`
-  line; the outcome overlay shows Victory, Defeat or Draw with the reason,
-  the time, the final hash and the replay's name
-  (`crates/game/src/outcome.rs`); `crates/game/src/markers.rs` draws the
-  attrition indicator, the supply ring on a selected Supply Wain and the
-  annexation timer with its readout; `just m5a-checks`
-  (`scripts/m5a_checks.sh`, local only under decision 14) is line 3's
-  proxy.
-- The bench and the close (no bump): `sim-cli bench --units 400 --ticks
-  1200 --combat --harrying`, the M4a battle with attrition on, adds about
-  0.05 ms to the plain battle's 0.50 ms mean step on the Linux VM
-  (`docs/BUILD_TIMES.md`), and the measurements of the close.
+M5b, the first complete skirmish opponent and the first playable match, is
+on PR #47 at `SIM_VERSION` 17 and `rules_version` 24, with eleven golden
+fixtures. Its lines 1, 2 and 3 are ticked there with pasted output,
+observed on the 4-vCPU Linux VM and, for line 1's last clause, in PR #47's
+Actions run 40258854764 (`m5_first_match` verified on macOS and Linux to
+`OK final_hash=0x3d2552033d51b4a2 ticks=26012`, empty parity diff). Line
+1's "under 120 s on the dev Mac" is re-run by the owner on the Mac (owner
+decision 8). M5b is done once the PR merges.
+Its [owner] line 4 waits for the owner's own match; its automated proxy,
+`just m5b-checks`, passes and is pasted in `docs/PLAYTEST.md`, and goes
+into the PR description with the CI results. The owner answered the nine
+questions of its implementation plan on 2026-10-23 by taking every
+default; the decisions are numbered in the ROADMAP's M5b Notes. What M5b
+built, in five slices:
 
-The M5a good first issues are filed: #44 (the attrition table row for age
-gap 2 and a test, the ROADMAP's), #45 (a test that a Statecraft level
-researched mid-timer pushes the neutral kernel and the field equals
-`recomputed()`) and #46 (`sim-cli data-check --verbose` printing the pulse
-table and the Harrying intervals).
+- Bot plumbing (`SIM_VERSION` 17, `rules_version` 21): `MatchSetup.ai_seats`
+  in the replay header, the hashed `Player::ai_memory` that step 2 hands
+  each bot alone, `Command::DebugAdvanceAge`, `data/ai/` in `rules_hash`
+  (schema `crates/rules/src/ai.rs`), `ai::controller_for` behind every
+  re-simulation, and `sim-cli play-bots` with its deterministic CSV.
+- The economy (`rules_version` 22): the Standard bot's build-order window,
+  worker balancing, sites (the second Town, the border Watchtower),
+  defence and production (`crates/ai/src/standard/`).
+- Waves (`rules_version` 23, and 24 for the review fixes): siege-gated
+  attack waves with a Supply Wain (stage, assault, ring hold, continue,
+  recall, the all-in at minute 30), `sim-cli bench --bots`, the
+  `m5_first_match` golden (the bot in both seats; P0 takes P1's Seat at
+  tick 26012) and the play-bots acceptance runs in CI. The review fixes
+  cap a defence's hold on launches at 60 s, pace an age's saving and keep
+  the border tower away from enemy armies.
+- The game half (no bump): a plain launch opens on a minimal main menu
+  (`crates/game/src/menu/`) over a match against the Standard bot on a
+  fresh wall-clock seed; New Game starts the sim and the lazy replay
+  recorder, so a quit from the menu records nothing; `--skip-menu`,
+  `--spectate` and `--spectate --fast-forward-to <tick>`; `just m5b-checks`
+  (`scripts/m5b_checks.sh`) is line 4's proxy.
+- The close (no bump): `docs/design/ai.md`, "M5b implementation notes",
+  the closing docs and the acceptance re-runs. On the VM Standard against
+  Standard ends in a decisive Seat capture in 5/5 seeds in about 2.5 s,
+  the first wave against Passive assaults at tick 13393 with 11 armed
+  units and a Supply Wain, and the bots add 0.033 to 0.035 ms a tick at
+  400 units.
 
-Next is M5b, the first complete skirmish opponent and the first playable
-match (the Standard bot, `sim-cli play-bots`, the `m5_first_match` fixture
-and New Game). Its implementation plan is being written; it starts once the
-plan's open questions are answered.
+The M5b good first issues are filed: #48 (a `boom` build order compared
+with `play-bots`, the ROADMAP's), #49 (a `data-check` negative test for a
+build order whose `Research` host is never built) and #50
+(`sim-cli data-check --verbose` printing each build order's step count
+and the step of its first `Advance`).
+
+Next is the pre-stream art pass, before the first gameplay stream and
+before M6 (the owner's decision of 2026-10-21 under "Order of work" in the
+ROADMAP): CC0 models through `data/visuals.ron`, dressed terrain, a
+minimap and a dev-panel draw-call counter. The owner took every default of
+its implementation plan on 2026-10-26. It starts with ADR 0003 as its own
+small PR right after PR #47 merges: `docs/adr/0003-visuals-outside-rules-hash.md`
+takes `data/visuals.ron` out of `rules_hash` (the sim never reads it; UI
+strings are the precedent, and `data-check` still validates every entry),
+with one `rules_version` bump (24 to 25) and a header-only re-record of
+the eleven fixtures, no `.hash` change. The art slices follow in one PR
+rebased on it, with no further bump: the packs (KayKit Medieval Hexagon
+and KayKit Adventurers, and the Inter font) vendored with their licence
+proof, buildings, sites and terrain, the eight unit kinds, the minimap,
+the draw-call counter and the close. Its first slice records the pass, its
+acceptance list and the owner's answers as a ROADMAP section "Art pass
+(pre-stream)"; until then the plan is not in the repository. M6 follows
+the art pass.
 
 Open owner checks on the dev Mac, batched into one session under the owner's
-decision 3 in the ROADMAP's M4b Notes (an exception to rule 1 in
-`docs/IMPLEMENTER_NOTES.md`; accepted risk: Mac-only problems surface late).
-The exact commands are in `docs/PLAYTEST.md`, "Owner's Mac checklist (M4b)":
+decision 3 in the ROADMAP's M4b Notes, which M5b's decision 9 extends to
+M5b (an exception to rule 1 in `docs/IMPLEMENTER_NOTES.md`; accepted risk:
+Mac-only problems surface late). The exact commands are in
+`docs/PLAYTEST.md`, "Owner's Mac checklist (M5b)" and "Owner's Mac
+checklist (M4b)":
 
 - M3b: `cargo run --release -p game -- --scenario economy_walkthrough` at
   >= 60 fps with the draw-call count (an Xcode Metal frame capture, since
@@ -99,6 +122,12 @@ The exact commands are in `docs/PLAYTEST.md`, "Owner's Mac checklist (M4b)":
   row), and the re-measures of `bench --combat --harrying` against
   `--combat` and of `cargo test -p sim`, which now runs the 54000-step
   stalemate and was 9.4 to 10.0 s warm on the Linux VM at the close.
+- M5b: line 4 itself, the owner's own match from New Game to the overlay
+  in one sitting and `sim-cli verify` of its replay against the overlay's
+  hash; line 1 re-run on the Mac for its wall time (owner decision 8);
+  `just m5b-checks` on Metal (the menu, the New Game click and the
+  overlay have only been drawn by lavapipe); and a note on whether the
+  bot felt winnable and losable (owner decision 4).
 
 A milestone is done when every acceptance checkbox in `docs/ROADMAP.md` is
 ticked with pasted command output in a merged PR.
@@ -110,8 +139,8 @@ ticked with pasted command output in a merged PR.
 | Architecture and invariants | `docs/ARCHITECTURE.md`, `docs/DETERMINISM.md`, `docs/DATA_FORMAT.md` | Complete |
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
-| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a closed on PR #43, done when it merges (attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); `crates/ai` holds the M0 bots until M5b |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a's game half on PR #43: the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout |
+| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a merged (PR #43: attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); M5b on PR #47, done when line 1's CI clause is pasted and it merges (`SIM_VERSION` 17, `rules_version` 24: the bot seats and hashed bot memory, `data/ai/`, the Standard bot in `crates/ai`, `play-bots`, `bench --bots`, the `m5_first_match` golden) |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a merged (PR #43): the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout; M5b's game half on PR #47 (line 4 waits for the owner's match): the main menu and New Game against the Standard bot, `--skip-menu`, `--spectate` and `--fast-forward-to`, the lazy recorder |
 | CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order
@@ -151,7 +180,7 @@ ticked with pasted command output in a merged PR.
 ## Local setup
 
 ```bash
-cargo run -p game --features dev                      # window with ground plane and camera
+cargo run -p game --features dev                      # the main menu; New Game plays the Standard bot
 cargo run -p sim-cli -- selftest                      # two identical hashes
 cargo run -p game --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay  # tick=1200 hash=... line, exit 0
 just ci                                               # everything CI runs

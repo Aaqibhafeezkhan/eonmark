@@ -11,7 +11,12 @@ use std::path::{Path, PathBuf};
 struct NoAi;
 
 impl sim::AiController for NoAi {
-    fn think(&mut self, _player: PlayerId, _view: &SimView<'_>) -> Vec<Command> {
+    fn think(
+        &mut self,
+        _player: PlayerId,
+        _view: &SimView<'_>,
+        _memory: &mut sim::AiMemory,
+    ) -> Vec<Command> {
         Vec::new()
     }
 }

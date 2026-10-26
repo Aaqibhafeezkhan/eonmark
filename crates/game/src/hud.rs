@@ -46,7 +46,10 @@ use sim::{Command, UnitId, scenarios};
 use crate::orders::{issue_stop, own_selected_units};
 use crate::palette;
 use crate::selection::Selection;
-use crate::sim_driver::{LOCAL_PLAYER, MatchOver, PendingCommands, SimHandle, SimSystems};
+use crate::sim_driver::{
+    LOCAL_PLAYER, MatchOver, PendingCommands, SimHandle, SimSystems, local_player_is_human,
+    match_running,
+};
 
 /// Bottom bar height, logical px (authored in `Val::Px`: `UiScale` multiplies Px only).
 pub const BOTTOM_BAR_HEIGHT_PX: f32 = 96.0;
@@ -224,10 +227,16 @@ pub struct HudPlugin {
 /// Stop [`WorldInputSet`] once the match is decided (M5a): from the
 /// outcome on, no drag box, selection click, order or placement reaches
 /// the frozen world (`outcome.rs` blocks picking under its overlay too).
+/// M5b: also while the main menu is open (`sim_driver::match_running`)
+/// and while the local slot is a bot (`--spectate`,
+/// `sim_driver::local_player_is_human`).
 pub fn gate_world_input(app: &mut App) {
     app.configure_sets(
         Update,
-        WorldInputSet.run_if(not(resource_exists::<MatchOver>)),
+        WorldInputSet
+            .run_if(not(resource_exists::<MatchOver>))
+            .run_if(match_running)
+            .run_if(local_player_is_human),
     );
 }
 
@@ -357,14 +366,17 @@ pub fn update_pointer_over_ui(
 
 /// A primary `Pointer<Click>` on the Stop button issues `orders::issue_stop`
 /// for the local player's selected units (observer attached by
-/// [`spawn_hud`]).
+/// [`spawn_hud`]). Nothing while the local slot is a bot (M5b,
+/// `--spectate`), like the card and Advance buttons: a spectator may still
+/// select a unit to read it, but never orders one.
 fn on_stop_click(
     click: On<Pointer<Click>>,
     sim: NonSend<SimHandle>,
     selection: Res<Selection>,
     mut pending: ResMut<PendingCommands>,
+    seat: Option<Res<crate::sim_driver::LocalSeat>>,
 ) {
-    if click.event().event.button != PointerButton::Primary {
+    if click.event().event.button != PointerButton::Primary || !local_player_is_human(seat) {
         return;
     }
     let own = own_selected_units(&sim.view(), &selection);
@@ -395,7 +407,7 @@ fn hud_click_tally_pending(mut check: ResMut<HudClickCheck>, pending: Res<Pendin
 }
 
 /// Centre of a laid-out UI node in logical window pixels.
-fn node_centre_logical(node: &ComputedNode, transform: &UiGlobalTransform) -> Vec2 {
+pub(crate) fn node_centre_logical(node: &ComputedNode, transform: &UiGlobalTransform) -> Vec2 {
     transform.translation * node.inverse_scale_factor
 }
 
@@ -412,7 +424,7 @@ fn node_centre_logical(node: &ComputedNode, transform: &UiGlobalTransform) -> Ve
 /// the world-input systems and before `Last`, so the cache never sees a
 /// difference and nothing is warped.
 #[derive(Resource, Debug, Default)]
-pub struct RealCursor(Option<Option<Vec2>>);
+pub struct RealCursor(pub(crate) Option<Option<Vec2>>);
 
 /// `PostUpdate`: undo the `hud_click` check's per-frame cursor override
 /// (see [`RealCursor`]).
@@ -429,12 +441,14 @@ pub fn restore_real_cursor(
 
 /// A synthetic mouse: the picking `PointerInput` stream plus the raw
 /// `ButtonInput<MouseButton>` and window cursor the `bevy_ui` focus system
-/// and the world-input systems read.
-struct SyntheticMouse<'a, 'w> {
-    target: NormalizedRenderTarget,
-    pointer_inputs: &'a mut MessageWriter<'w, PointerInput>,
-    buttons: &'a mut ButtonInput<MouseButton>,
-    window: &'a mut Window,
+/// and the world-input systems read. Shared by the `hud_click` check and
+/// the main menu's New Game proxy (`menu::main_menu`, M5b); both save the
+/// real cursor in [`RealCursor`] first.
+pub(crate) struct SyntheticMouse<'a, 'w> {
+    pub(crate) target: NormalizedRenderTarget,
+    pub(crate) pointer_inputs: &'a mut MessageWriter<'w, PointerInput>,
+    pub(crate) buttons: &'a mut ButtonInput<MouseButton>,
+    pub(crate) window: &'a mut Window,
 }
 
 impl SyntheticMouse<'_, '_> {
@@ -449,22 +463,38 @@ impl SyntheticMouse<'_, '_> {
         ));
     }
 
+    /// Move the pointer from `from` to `to` (logical px), window cursor
+    /// included.
+    pub(crate) fn move_from(&mut self, from: Vec2, to: Vec2) {
+        self.window.set_cursor_position(Some(to));
+        self.write(to, PointerAction::Move { delta: to - from });
+    }
+
+    /// Press `button` at `at`.
+    pub(crate) fn press_at(&mut self, at: Vec2, button: PointerButton) {
+        self.buttons.press(mouse_button(button));
+        self.write(at, PointerAction::Press(button));
+    }
+
+    /// Release `button` at `at`.
+    pub(crate) fn release_at(&mut self, at: Vec2, button: PointerButton) {
+        self.buttons.release(mouse_button(button));
+        self.write(at, PointerAction::Release(button));
+    }
+
     fn move_to(&mut self, check: &mut HudClickCheck, position: Vec2) {
-        let delta = position - check.pointer_at;
+        let from = check.pointer_at;
         check.pointer_at = position;
         check.pointer_placed = true;
-        self.window.set_cursor_position(Some(position));
-        self.write(position, PointerAction::Move { delta });
+        self.move_from(from, position);
     }
 
     fn press(&mut self, check: &HudClickCheck, button: PointerButton) {
-        self.buttons.press(mouse_button(button));
-        self.write(check.pointer_at, PointerAction::Press(button));
+        self.press_at(check.pointer_at, button);
     }
 
     fn release(&mut self, check: &HudClickCheck, button: PointerButton) {
-        self.buttons.release(mouse_button(button));
-        self.write(check.pointer_at, PointerAction::Release(button));
+        self.release_at(check.pointer_at, button);
     }
 }
 
@@ -769,6 +799,122 @@ mod tests {
             [&Command::Stop {
                 units: vec![UnitId(1)]
             }]
+        );
+    }
+
+    /// M5b: under `--spectate` the local slot is a bot, so world input, the
+    /// card's clicks, the Advance button and the Stop button (with one of
+    /// P0's Yeomen selected, which a click may still do) do nothing; against
+    /// the bot (the same app with a `vs_bot` match) all four act.
+    #[test]
+    fn a_spectator_has_no_world_input_card_or_advance() {
+        use crate::age_hud::{AdvanceButton, on_advance_click};
+        use crate::command_card::{CardAction, CardButton, CardState, on_card_click};
+        use crate::economy_hud::MessageState;
+        use crate::orders::OrderMode;
+        use crate::sim_driver::{LocalInput, SimPlugin};
+        #[derive(Resource, Default)]
+        struct WorldInputRuns(u32);
+        let rules =
+            rules::Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .expect("rules load");
+        let run = |setup: sim::MatchSetup| {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .add_plugins(SimPlugin::new(
+                    SimHandle::from_setup(setup, rules.clone()),
+                    Box::new(LocalInput),
+                ))
+                .init_resource::<OrderMode>()
+                .init_resource::<MessageState>()
+                .init_resource::<Selection>()
+                .init_resource::<WorldInputRuns>()
+                .add_systems(
+                    Update,
+                    (|mut runs: ResMut<WorldInputRuns>| runs.0 += 1).in_set(WorldInputSet),
+                );
+            gate_world_input(&mut app);
+            let enabled = CardState {
+                enabled: true,
+                tooltip: String::new(),
+            };
+            let card = app
+                .world_mut()
+                .spawn((CardButton(CardAction::AttackMove), enabled.clone()))
+                .observe(on_card_click)
+                .id();
+            let advance = app
+                .world_mut()
+                .spawn((AdvanceButton, enabled))
+                .observe(on_advance_click)
+                .id();
+            let stop = app
+                .world_mut()
+                .spawn(StopButton)
+                .observe(on_stop_click)
+                .id();
+            // P0's first Yeoman (the standard start's unit 1).
+            app.world_mut().resource_mut::<Selection>().set([UnitId(1)]);
+            app.update();
+            for button in [card, advance, stop] {
+                app.world_mut().trigger(Pointer::new(
+                    PointerId::Mouse,
+                    Location {
+                        target: NormalizedRenderTarget::None {
+                            width: 1,
+                            height: 1,
+                        },
+                        position: Vec2::ZERO,
+                    },
+                    Click {
+                        button: PointerButton::Primary,
+                        hit: bevy::picking::backend::HitData::new(
+                            Entity::PLACEHOLDER,
+                            0.0,
+                            None,
+                            None,
+                        ),
+                        duration: std::time::Duration::ZERO,
+                        count: 1,
+                    },
+                    button,
+                ));
+            }
+            let pending: Vec<Command> = app
+                .world()
+                .resource::<PendingCommands>()
+                .peek()
+                .iter()
+                .map(|c| c.cmd.clone())
+                .collect();
+            (
+                app.world().resource::<WorldInputRuns>().0,
+                *app.world().resource::<OrderMode>(),
+                pending,
+            )
+        };
+        let spectate = sim::MatchSetup::bots(
+            &rules,
+            1,
+            (ai::BOT_STANDARD, "standard"),
+            (ai::BOT_STANDARD, "standard"),
+        );
+        assert_eq!(run(spectate), (0, OrderMode::Normal, Vec::new()));
+        let vs_bot = sim::MatchSetup::vs_bot(&rules, 1, ai::BOT_STANDARD, "standard");
+        assert_eq!(
+            run(vs_bot),
+            (
+                1,
+                OrderMode::AttackMove,
+                vec![
+                    Command::AdvanceAge {
+                        player: LOCAL_PLAYER
+                    },
+                    Command::Stop {
+                        units: vec![UnitId(1)]
+                    }
+                ]
+            )
         );
     }
 

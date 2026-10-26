@@ -174,6 +174,11 @@ pub enum ReplayError {
         /// Bytes between that record and the trailer.
         undecoded: usize,
     },
+    /// The controller factory of [`verify_with`] or [`hash_dump_with`]
+    /// refused the header's AI seats (an unknown bot or personality id, or
+    /// seats that do not match the AI slots; M5b). Reported after the
+    /// version and rules checks, before anything is simulated.
+    Controller(String),
 }
 
 impl core::fmt::Display for ReplayError {
@@ -224,6 +229,7 @@ impl core::fmt::Display for ReplayError {
                 "{}: corrupt record stream: {undecoded} undecodable bytes at offset {offset} before the clean-exit trailer",
                 path.display()
             ),
+            ReplayError::Controller(message) => write!(f, "{message}"),
         }
     }
 }
@@ -502,19 +508,43 @@ impl core::fmt::Display for VerifyOutcome {
     }
 }
 
+/// What [`verify_with`] and [`hash_dump_with`] call, once the header's
+/// version and rules have passed, to build the controller for the header's
+/// AI seats (`ai::controller_for` in sim-cli and the game). An `Err` is
+/// [`ReplayError::Controller`].
+pub type ControllerFactory<'a> =
+    dyn FnOnce(&MatchSetup, &Rules) -> Result<Box<dyn AiController>, String> + 'a;
+
 /// Re-simulate `path` against the rules under `data_dir` (see the module
 /// docs). `ai` drives every slot with `is_ai == true` exactly as during the
 /// recording; scenario recordings have no AI slots and pass a no-op bot.
+/// [`verify_with`] builds the controller from the header instead.
 pub fn verify(
     path: &Path,
     data_dir: &Path,
     ai: Box<dyn AiController>,
 ) -> Result<VerifyOutcome, ReplayError> {
+    verify_with(
+        path,
+        data_dir,
+        Box::new(move |_: &MatchSetup, _: &Rules| Ok(ai)),
+    )
+}
+
+/// [`verify`] with the controller built by `factory` from the header and
+/// the loaded rules (M5b), after the version and rules checks: a header
+/// naming bots re-simulates with those bots. The four outcome lines are
+/// unchanged; a factory error is [`ReplayError::Controller`].
+pub fn verify_with(
+    path: &Path,
+    data_dir: &Path,
+    factory: Box<ControllerFactory<'_>>,
+) -> Result<VerifyOutcome, ReplayError> {
     let ReplayFile { setup, records, .. } = match open_for_check(path)? {
         Ok(file) => file,
         Err(outcome) => return Ok(outcome),
     };
-    let mut sim = match prepare(setup, data_dir, ai)? {
+    let mut sim = match prepare(setup, data_dir, factory)? {
         Ok(sim) => sim,
         Err(outcome) => return Ok(outcome),
     };
@@ -561,13 +591,31 @@ pub fn hash_dump(
     data_dir: &Path,
     ai: Box<dyn AiController>,
     every: u32,
+    emit: impl FnMut(u32, u64, &SubHashes),
+) -> Result<VerifyOutcome, ReplayError> {
+    hash_dump_with(
+        path,
+        data_dir,
+        Box::new(move |_: &MatchSetup, _: &Rules| Ok(ai)),
+        every,
+        emit,
+    )
+}
+
+/// [`hash_dump`] with the controller built by `factory` from the header
+/// and the loaded rules, like [`verify_with`] (M5b).
+pub fn hash_dump_with(
+    path: &Path,
+    data_dir: &Path,
+    factory: Box<ControllerFactory<'_>>,
+    every: u32,
     mut emit: impl FnMut(u32, u64, &SubHashes),
 ) -> Result<VerifyOutcome, ReplayError> {
     let ReplayFile { setup, records, .. } = match open_for_check(path)? {
         Ok(file) => file,
         Err(outcome) => return Ok(outcome),
     };
-    let mut sim = match prepare(setup, data_dir, ai)? {
+    let mut sim = match prepare(setup, data_dir, factory)? {
         Ok(sim) => sim,
         Err(outcome) => return Ok(outcome),
     };
@@ -634,13 +682,14 @@ fn open_for_check(path: &Path) -> Result<Result<ReplayFile, VerifyOutcome>, Repl
     }
 }
 
-/// The checks shared by [`verify`] and [`hash_dump`]: `sim_version` before
-/// anything is loaded, then the rules and their hash. `Ok(Err(outcome))` is
-/// a mismatch; `Ok(Ok(sim))` is a fresh sim at tick 0.
+/// The checks shared by [`verify_with`] and [`hash_dump_with`]:
+/// `sim_version` before anything is loaded, then the rules and their hash,
+/// then the controller from `factory`. `Ok(Err(outcome))` is a mismatch;
+/// `Ok(Ok(sim))` is a fresh sim at tick 0.
 fn prepare(
     setup: MatchSetup,
     data_dir: &Path,
-    ai: Box<dyn AiController>,
+    factory: Box<ControllerFactory<'_>>,
 ) -> Result<Result<Sim, VerifyOutcome>, ReplayError> {
     if setup.sim_version != SIM_VERSION {
         return Ok(Err(VerifyOutcome::SimVersionMismatch {
@@ -655,6 +704,7 @@ fn prepare(
             loaded: rules.rules_hash(),
         }));
     }
+    let ai = factory(&setup, &rules).map_err(ReplayError::Controller)?;
     Ok(Ok(Sim::new(setup, rules, ai)))
 }
 
@@ -752,13 +802,7 @@ mod tests {
     use crate::fx::FxVec2;
     use crate::ids::{PlayerId, UnitId, UnitKindId};
 
-    struct NoAi;
-
-    impl AiController for NoAi {
-        fn think(&mut self, _p: PlayerId, _v: &crate::ai_hook::SimView<'_>) -> Vec<Command> {
-            Vec::new()
-        }
-    }
+    use crate::ai_hook::NoAi;
 
     fn data_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -1249,5 +1293,170 @@ mod tests {
         // Sub-hashes differ between ticks (tick lives in `meta`).
         assert_ne!(lines[0].2.meta, lines[1].2.meta);
         assert_eq!(lines[0].2.first_difference(&lines[0].2), None);
+    }
+
+    /// The M5b header field: `ai_seats` (each AI slot's bot and
+    /// personality) survives the writer and the reader, after `start`.
+    #[test]
+    fn header_round_trips_ai_seats() {
+        let rules = Rules::load(data_dir()).unwrap();
+        for setup in [
+            MatchSetup::bots(&rules, 7, ("standard", "standard"), ("passive", "")),
+            MatchSetup::vs_bot(&rules, 8, "standard", "standard"),
+            MatchSetup::skirmish(&rules, 9),
+            MatchSetup::scenario(&rules, 10),
+        ] {
+            let path = temp_path(&format!("ai_seats_{}", setup.seed));
+            let mut w = ReplayWriter::create(&path, &setup).unwrap();
+            w.hash(0, 0, &SubHashes::default()).unwrap();
+            w.finish().unwrap();
+            let file = ReplayReader::open(&path).unwrap();
+            assert_eq!(file.setup, setup);
+        }
+        let bots = MatchSetup::bots(&rules, 7, ("standard", "standard"), ("passive", ""));
+        assert_eq!(
+            bots.ai_seats,
+            vec![
+                crate::state::AiSeat {
+                    player: PlayerId(0),
+                    bot: "standard".into(),
+                    personality: "standard".into(),
+                },
+                crate::state::AiSeat {
+                    player: PlayerId(1),
+                    bot: "passive".into(),
+                    personality: String::new(),
+                },
+            ]
+        );
+        assert!(bots.players.iter().all(|p| p.is_ai));
+        assert!(!bots.debug_commands);
+        assert_eq!(MatchSetup::skirmish(&rules, 1).ai_seats[0].bot, "passive");
+        assert!(MatchSetup::scenario(&rules, 1).ai_seats.is_empty());
+    }
+
+    /// A bot that surrenders P1 at tick 3, so a re-simulation without it
+    /// diverges (`meta`).
+    struct SurrenderAt3;
+
+    impl AiController for SurrenderAt3 {
+        fn think(
+            &mut self,
+            _p: PlayerId,
+            view: &crate::ai_hook::SimView<'_>,
+            _memory: &mut crate::ai_hook::AiMemory,
+        ) -> Vec<Command> {
+            if view.tick == 3 {
+                vec![Command::Surrender]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// `verify_with` checks the version, then the rules, and only then
+    /// asks its factory for a controller, which it hands the header and the
+    /// loaded rules: a mismatch never calls the factory, a factory error is
+    /// `ReplayError::Controller` (no outcome line), and the controller it
+    /// builds drives the AI slots of the re-simulation.
+    #[test]
+    fn verify_with_builds_the_controller_after_the_version_and_rules_checks() {
+        use std::cell::Cell;
+        let rules = Rules::load(data_dir()).unwrap();
+        let setup = MatchSetup::vs_bot(&rules, 3, "surrender", "");
+        let path = temp_path("verify_with");
+        let mut sim = Sim::new(setup.clone(), rules.clone(), Box::new(SurrenderAt3));
+        let mut w = ReplayWriter::create(&path, &setup).unwrap();
+        for _ in 0..20 {
+            sim.step(&[]);
+        }
+        w.hash(sim.tick(), sim.hash(), &sim.sub_hashes()).unwrap();
+        w.finish().unwrap();
+        assert!(sim.view().player(PlayerId(1)).unwrap().surrendered);
+
+        // The factory sees the header and the loaded rules.
+        let called = Cell::new(false);
+        let outcome = verify_with(
+            &path,
+            &data_dir(),
+            Box::new(|h: &MatchSetup, r: &Rules| {
+                called.set(true);
+                assert_eq!(h.ai_seats[0].bot, "surrender");
+                assert_eq!(r.rules_hash(), h.rules_hash);
+                Ok(Box::new(SurrenderAt3) as Box<dyn AiController>)
+            }),
+        )
+        .unwrap();
+        assert!(called.get());
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Ok {
+                final_hash: sim.hash(),
+                ticks: 20
+            }
+        );
+        // Another controller re-simulates another match.
+        let outcome = verify_with(
+            &path,
+            &data_dir(),
+            Box::new(|_: &MatchSetup, _: &Rules| Ok(Box::new(NoAi) as Box<dyn AiController>)),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Diverged {
+                tick: 20,
+                subsystem: "meta"
+            }
+        );
+        // A factory error is an error, not an outcome.
+        let err = verify_with(
+            &path,
+            &data_dir(),
+            Box::new(|_: &MatchSetup, _: &Rules| Err("unknown bot \"surrender\"".to_string())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReplayError::Controller(_)), "{err}");
+        assert_eq!(err.to_string(), "unknown bot \"surrender\"");
+
+        // Version, then rules: neither mismatch calls the factory.
+        let never = |_: &MatchSetup, _: &Rules| -> Result<Box<dyn AiController>, String> {
+            panic!("the factory runs after the version and rules checks")
+        };
+        for (name, bump_version) in [("verify_with_version", true), ("verify_with_rules", false)] {
+            let mut bad = setup.clone();
+            if bump_version {
+                bad.sim_version += 1;
+            } else {
+                bad.rules_hash ^= 1;
+            }
+            let p = temp_path(name);
+            let mut w = ReplayWriter::create(&p, &bad).unwrap();
+            w.hash(0, 0, &SubHashes::default()).unwrap();
+            w.finish().unwrap();
+            let outcome = verify_with(&p, &data_dir(), Box::new(never)).unwrap();
+            let dumped = hash_dump_with(&p, &data_dir(), Box::new(never), 1, |_, _, _| {
+                panic!("nothing is simulated")
+            })
+            .unwrap();
+            assert_eq!(outcome, dumped);
+            if bump_version {
+                assert_eq!(
+                    outcome,
+                    VerifyOutcome::SimVersionMismatch {
+                        replay: SIM_VERSION + 1,
+                        binary: SIM_VERSION
+                    }
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    VerifyOutcome::RulesChanged {
+                        replay: bad.rules_hash,
+                        loaded: rules.rules_hash()
+                    }
+                );
+            }
+        }
     }
 }

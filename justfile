@@ -104,6 +104,12 @@ m5a-checks OUT="":
     cargo build -p sim-cli --locked --release
     scripts/m5a_checks.sh target/ci/eonmark target/release/sim-cli "{{OUT}}"
 
+# M5b acceptance 4 proxy, local only (owner decision 8): verify the m5_first_match golden; run `--spectate --seed 1 --fast-forward-to <T-400>` in background mode with a screenshot of the overlay at the deciding tick T, check its `outcome:` line against the golden's hash and `sim-cli verify` of its own replay; screenshot the main menu and check it records nothing; click New Game through the `--new-game-after-seconds` proxy and verify that replay; run `scripts/m2_checks.sh` checks 3 and 4 (`--skip-menu`); and check that no game process is left; see scripts/m5b_checks.sh. On Linux without a display it runs under xvfb-run on lavapipe.
+m5b-checks OUT="":
+    cargo build -p game --locked --profile ci
+    cargo build -p sim-cli --locked --release
+    scripts/m5b_checks.sh target/ci/eonmark target/release/sim-cli "{{OUT}}"
+
 # Determinism self-test: scripted ticks twice on two threads, hashes must match.
 selftest:
     cargo run -p sim-cli --locked -- selftest
@@ -112,9 +118,9 @@ selftest:
 data-check:
     cargo run -p sim-cli --locked -- data-check data
 
-# Scripted bot matches (available from M5b).
+# Seeded bot-vs-bot matches (M5b): `just bots --seeds 1..5 --a standard --b standard --jobs 5` prints one CSV row per game; see docs/design/ai.md.
 bots *ARGS:
-    @echo "bots: available from M5b (sim-cli play-bots)"
+    cargo run -p sim-cli --locked --release -- play-bots {{ARGS}}
 
 # Sim benchmarks: `just bench` runs the 500-mover crossing, `just bench --astar --budget 4000` one saturated A* tick,
 # `just bench --territory --sources 16 --edits 100` incremental territory recompute (M3a acceptance: mean < 2 ms),

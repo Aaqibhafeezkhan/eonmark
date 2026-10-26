@@ -26,7 +26,7 @@ cd eonmark
 cargo run -p game --features dev
 ```
 
-The first build compiles Bevy and takes several minutes. [docs/BUILD_TIMES.md](docs/BUILD_TIMES.md) has measured numbers. The `dev` feature turns on dynamic linking and the inspector panels (the egui World Inspector is hidden until F12). Never ship a build with it. Most iteration happens in `crates/sim` with `cargo test -p sim`, which does not compile Bevy at all.
+The game opens on its main menu (since M5b); New Game starts a skirmish against the Standard bot, and `-- --skip-menu` skips the menu. The first build compiles Bevy and takes several minutes. [docs/BUILD_TIMES.md](docs/BUILD_TIMES.md) has measured numbers. The `dev` feature turns on dynamic linking and the inspector panels (the egui World Inspector is hidden until F12). Never ship a build with it. Most iteration happens in `crates/sim` with `cargo test -p sim`, which does not compile Bevy at all.
 
 ## Before you push: `just ci`
 
@@ -86,7 +86,7 @@ just rerecord
 cargo test -p sim
 ```
 
-Commit the RON edit, the version bump and the re-recorded fixtures together, with a one-line reason in the commit message (see "Golden replay fixtures" below). `just rerecord` ends by failing if a fixture differs from the merge base with main while the working-tree `rules_version` is not larger than the base's; CI runs the same rule (`scripts/check_fixture_policy.sh`) on the commits of every pull request. If the sim does not read the edited value yet, every `.hash` stays the same and only the replay headers change; if it does, the hashes change too, and the bump is what makes that legal. A changed hash without a bump is a bug, not a fixture update. The field reference and a worked example are in [data/rules/README.md](data/rules/README.md). Balance PRs attach a `play-bots` table once that command exists (M5b).
+Commit the RON edit, the version bump and the re-recorded fixtures together, with a one-line reason in the commit message (see "Golden replay fixtures" below). `just rerecord` ends by failing if a fixture differs from the merge base with main while the working-tree `rules_version` is not larger than the base's; CI runs the same rule (`scripts/check_fixture_policy.sh`) on the commits of every pull request. If the sim does not read the edited value yet, every `.hash` stays the same and only the replay headers change; if it does, the hashes change too, and the bump is what makes that legal. A changed hash without a bump is a bug, not a fixture update. The field reference and a worked example are in [data/rules/README.md](data/rules/README.md). Balance PRs attach a `play-bots` table (M5b; see "A build order or personality" below).
 
 This exact walkthrough was run on 2026-10-14 (M3a, `rules_version` 12, all six M3a slices and both training review fixes) in a clean copy of the repository with its own build directory. The only edits were the rate and the version; every test that depends on the rate reads it from `buildings.ron`:
 
@@ -117,7 +117,51 @@ $ git status --short
 
 Only `economy_second_town` changes its final hash: it is the only fixture with a worked Croft. A test that hard-codes a number the data controls fails this walkthrough; read the value from `Rules` instead.
 
-Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, and since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, so with the repository at `rules_version` 20 and the bump to 21 of step 2, step 3 now prints a line of the form `OK rules_version=21 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=20`).
+Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, so with the repository at `rules_version` 24 and the bump to 25 of step 2, step 3 now prints a line of the form `OK rules_version=25 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=24`). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
+
+### A build order or personality (`data/ai/`)
+
+The bot's data takes the same path, with two more steps that show what the change did to the bot. A new build order is a file `data/ai/build_orders/<id>.ron` whose `id` is the file stem, used by a row of `data/ai/personalities.ron` that names it (copy the `standard` row and change its `id`, `name` and `build_order`); the field reference is [data/ai/README.md](data/ai/README.md).
+
+```bash
+# 1. Edit or add the build order and the personality row.
+# 2. Bump rules_version in data/rules/rules.ron with its one-line reason.
+# 3. Validate. A step the bot could never reach (a Research whose host no
+#    earlier step builds, an Advance without its techs) fails here.
+cargo run -p sim-cli -- data-check data
+# 4. Re-record: every fixture's header changes; a .hash changes only where a
+#    seated bot decides differently (today m5_first_match, the Standard bot).
+just rerecord
+# 5. Run the bot's tests and the sim's.
+cargo test -p ai && cargo test -p sim
+# 6. Compare the bot with play-bots, here a personality "boom" against the
+#    Standard bot, and check the first wave against Passive.
+cargo run -p sim-cli --release -- play-bots --seeds 1..5 --a standard --b standard \
+  --personality-a boom --max-ticks 54000 --jobs 5
+cargo run -p sim-cli --release -- play-bots --seeds 1..5 --a standard --b passive \
+  --personality-a boom --max-ticks 36000 > wave.csv && scripts/check_first_wave.sh wave.csv
+```
+
+Commit the RON files, the bump and the re-recorded fixtures together, and paste the `play-bots` CSV and summary lines into the pull request. A change in Rust under `crates/ai` that can alter a decision is not data-only: it also bumps `SIM_VERSION` (rule 4 below; M5b owner decision 2). The good first issue #48 (a `boom` build order) follows exactly this path.
+
+This path was run on 2026-10-26 (`rules_version` 24) against a scratch copy of `data/`, with the release `sim-cli`'s `--data` flag standing in for the edited checkout. The only edits were the first step of `standard.ron` (`Workers(count: 7, split: {"grain": 3, "lumber": 4})` to `count: 8` with 5 Lumber) and the version:
+
+```text
+$ sim-cli verify --data <copy> crates/sim/tests/fixtures/m5_first_match.eonreplay   # the edit, before any re-record
+RULES CHANGED since recording (replay 0xb231ab753cb4197e, loaded 0xa23a5bd80473a249)
+$ sim-cli data-check <copy>                                                        # after 24 -> 25
+OK rules_version=25 rules_hash=0x1a725b28f5c3e543 resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en
+$ sim-cli record --data <copy> --scenario m5_first_match --out m5_first_match.eonreplay
+recorded ... ticks=27636 records=277 final_hash=0x3de3fdc31c07b2ad outcome=victory player=0 decisive=true reason=seat_captured outcome_tick=27636
+$ sim-cli record --data <copy> --scenario move_500 --out move_500.eonreplay
+recorded ... ticks=1200 records=63 final_hash=0x02e11c8e91350d52
+$ sim-cli play-bots --data <copy> --seeds 1..5 --a standard --b passive --max-ticks 36000 --jobs 5 > wave.csv
+play-bots: games=5 jobs=5 wall_s=0.69 a=5 b=0 draw=0 none=0 panic=0 decisive=5 tiebreak=0
+$ scripts/check_first_wave.sh wave.csv
+check_first_wave: 5/5 rows pass (side a)
+```
+
+`m5_first_match` moved (`0x3d2552033d51b4a2` at tick 26012 to `0x3de3fdc31c07b2ad` at tick 27636), as it must when the Standard bot's build order changes; `move_500` and `capture_seat` kept their hashes (`0x02e11c8e91350d52`, `0xbd9f9df3f98fcc23`), since no bot plays in them.
 
 ## Golden replay fixtures
 
@@ -126,7 +170,7 @@ Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, 
 1. A fixture regenerates only in a commit that also bumps `rules_version` in `data/rules/rules.ron` and states the reason in one line of the commit message (`Bump rules_version to 2: Yeoman speed 1.8 -> 2.0 tiles/s`). One commit, both changes.
 2. A changed hash without that bump is a bug. Do not update the `.hash` file; bisect with `sim-cli hash-dump <replay> --every 1` as described in [docs/DETERMINISM.md](docs/DETERMINISM.md).
 3. `RULES CHANGED since recording` from `verify` means RON was edited without a bump. Either revert the edit or bump and regenerate in the same commit.
-4. An intended behaviour change in Rust (a new movement rule, a fixed sim bug) bumps `SIM_VERSION` in `crates/sim/src/state.rs` as well, and the same commit regenerates every fixture.
+4. An intended behaviour change in Rust (a new movement rule, a fixed sim bug, and from M5b a change in `crates/ai` that can alter a bot decision) bumps `SIM_VERSION` in `crates/sim/src/state.rs` as well, and the same commit regenerates every fixture.
 
 To regenerate, run `just rerecord` (every fixture) or `just rerecord <name> ...` (`scripts/rerecord_fixtures.sh`). It automates the manual steps for each fixture: `cargo run -p sim-cli --release -- record --scenario <name> --ticks <n> --out crates/sim/tests/fixtures/<name>.eonreplay`, then `verify` the new file and write its `OK final_hash=` value into `<name>.hash`. The fixture README in that directory lists each scenario and its tick count. Reviewers reject a PR that changes a fixture without the version bump, and CI reports the mismatch as a failing golden test.
 

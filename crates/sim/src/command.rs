@@ -183,6 +183,17 @@ pub enum Command {
         /// Damage dealt.
         amount: u32,
     },
+    /// Move `owner` into the next age at once (M5b), skipping the age's
+    /// cost and its `techs_required`, as `AdvanceAge` would otherwise:
+    /// `AgeAdvanced` is emitted and `owner`'s Towns are re-derived.
+    /// Rejected with `RejectReason::UnknownPlayer` for a missing owner and
+    /// `RejectReason::FinalAge` in the last age. Lets the bot bench and
+    /// tests reach an age without depending on a build order. Gated like
+    /// `DebugSpawn`; draws nothing.
+    DebugAdvanceAge {
+        /// The advancing player.
+        owner: PlayerId,
+    },
 }
 
 /// A command stamped with its issuing player and per-player sequence number.

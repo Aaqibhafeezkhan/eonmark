@@ -5,7 +5,9 @@ with a sibling `<name>.hash` holding the final state hash as `0x<16 hex>` and a
 newline. `crates/sim/tests/m1.rs::golden(name)` (and its copies in `m3a.rs`
 for `economy_second_town`, `m3b.rs` for `economy_walkthrough`, `m4a.rs`
 for `combat_skirmish`, `m4b.rs` for `enemy_outpost_walkthrough` and
-`m5a.rs` for `capture_seat` and `stalemate_45min`) verifies the replay and
+`m5a.rs` for `capture_seat` and `stalemate_45min`, and
+`crates/ai/tests/m5b.rs::golden_m5_first_match`, which rebuilds the bots
+from the header with `ai::controller_for`) verifies the replay and
 compares the final hash;
 `sim-cli verify` does the same from the command line.
 
@@ -21,10 +23,57 @@ compares the final hash;
 | `enemy_outpost_walkthrough` | 5039 | the M4b owner proxy, from the standard start (seed 13). During tick 0 P0 `DebugSpawnJittered`s a 200-unit vanguard on P1's side of the river (`UnitId(11..=210)`, 50 Skirmishers, Shieldbearers, Bowmen and Outriders, no orders) and is granted 1.5x the walkthrough's bill; P1 gets Arms I to III, a complete Watchtower at (58, 64) (`BuildingId(3)`) and a mirrored army (`211..=410`), which attack-moves into the vanguard during tick 100 and wipes it during tick 711 (P0's pop 255 / 25 back to 5 / 25). P0's real commands, at beat ticks derived from the rules (`enemy_outpost_beats`): during tick 2 Yeomen 1 and 2 place a Scriptorium (27, 58) and a Muster Hall (28, 68) (`BuildingId(4)`, `5`, complete at 635 and 845) and Yeoman 3 pre-walks; Letters I queued during 724 (done 1225); the Muster Hall rallies to (47, 63) and queues two Skirmishers, two Bowmen and a Shieldbearer during 964 (`411..=415`); Trade I queued during 1266 at the Letters price (540 ticks, done 1807); during 1848 P0 enters the Masonry Age and Yeoman 3 places an Engine Yard (40, 62) (`BuildingId(6)`, complete at 2865); two Mangonels queued during 2970 (`416`, `417`, out at 3771 and 4571); during 4692 the Mangonels attack the Watchtower, which they outrange, and the mixed army attack-moves beside it; the tower is destroyed during 4839. Nothing is rejected | `cargo test -p sim -- --ignored enemy_outpost` and the game's `--headless-run` in CI's headless job, `sim-cli verify --release` in CI on both operating systems |
 | `capture_seat` | 1628 | the M5a capture golden, from the standard start (seed 31): during tick 0 P1 researches Harrying I (`DebugResearch`); P0 removes P1's five Yeomen and takes P1's Seat (`BuildingId(2)`) to 300 HP with `DebugDamage`, spawns four Mangonels (`UnitId(11..=14)`) that `Attack` the Seat from out of its range and take it to 0 during tick 146, eight Skirmishers (`15..=22`) and a Supply Wain (`23`) inside P1's border, and a Bowman (`24`) outside the Wain's cover, which bleeds; during tick 300 the Skirmishers walk onto eight tiles of the Seat's ring and the Wain follows. The annexation timer starts in step 427 and the Seat flips in step 1627, which decides `Victory { P0, decisive: true }`, reason `SeatCaptured`; `sim-cli record` stops there (`Scenario::stops_at_outcome`), so the fixture ends at tick 1628 and its hash is the state the game's outcome overlay shows. Nothing is rejected | `cargo test -p sim`, `sim-cli verify --release` in CI on both operating systems (hash parity) |
 | `stalemate_45min` | 54000 | the M5a 45-minute golden, empty start (seed 45), no unit: during tick 0 P0 places a complete Town at (23, 63) and a Watchtower at (43, 64), P1 a Town at (102, 63), so P0 owns 1248 tiles and P1 1245; the match cap (`match_cap_ds`, 54000 ticks) decides `Victory { P0, decisive: false }`, reason `Territory`, in the last step. Recorded with a hash every 1000 ticks (`Scenario::default_hash_every`) | `cargo test -p sim -- --ignored golden_stalemate_45min` locally, `sim-cli verify --release` in CI on both operating systems (hash parity); `annexation_54000_tick_scripted_stalemate_is_a_tiebreak_victory_for_more_territory` runs the same stream in `cargo test -p sim` |
+| `m5_first_match` | 26012 | the M5b first-match golden (ROADMAP M5b acceptance 1): the Standard bot (personality `standard`) in both seats from the standard start (seed 1), no human input and no debug command; a `sim-cli` scenario (`Scenario::FirstMatch`), not in `sim::scenarios::NAMES`, since the sim cannot build bots, so the header's `ai_seats` name the bots and every re-simulation rebuilds them. P0 reaches Masonry at tick 7933 and P1 at 7948; their first waves (P1's launched at 12616, P0's at 12631) clash on the way and both end with two units left before their assault; P0 launches four waves and P1 two; P0's third wave leaves P1's Seat (`BuildingId(2)`) at 656 HP, and its fourth (22 armed units, launched at 23431) finds it at 0 and holds its ring: the annexation timer starts in step 24349 and is reset three times, its last start is in step 24811 and the Seat flips in step 26011, which decides `Victory { P0, decisive: true }`, reason `SeatCaptured`; `sim-cli record` stops there (`Scenario::stops_at_outcome`), so the fixture ends at tick 26012. Recorded with a hash every 100 ticks (`Scenario::default_hash_every`). `play-bots --seeds 1..5 --a standard --b standard` prints this final hash for seed 1 | `cargo test -p ai -- --ignored golden_m5_first_match` locally, `sim-cli verify --release` in CI on both operating systems (hash parity) and the game's `--headless-run` in CI's headless job |
 
 The `snapshot_restore` recording snapshots the sim before tick 300, restores
 the bytes into a fresh sim and continues recording on that sim; `verify`
 re-simulates without the swap, so an `OK` proves the restore was exact.
+
+Recorded 2026-10-23 at `rules_version` 24, `SIM_VERSION` 17 with
+`just rerecord` (the M5b waves slice's review fixes: `data/ai/` gained the
+`defend_guard_pop_ratio` knob, and the Standard bot's defence, build-order
+saving and site choice changed in `crates/ai`; no fixture but
+`m5_first_match` has a Standard seat). Each of the ten earlier files
+differs from its `rules_version` 23 recording in the header's
+`rules_version` and `rules_hash` only (9 bytes; every other byte is
+equal), and no `.hash` file changed but `m5_first_match`'s
+(`0x5a690149db4330e6` to `0x3d2552033d51b4a2`), which is new in the M5b
+pull request, so it is re-recorded with the bots' changes and needs no
+bump of its own (plan decision 5: `SIM_VERSION` versions bot code once
+M5b is merged).
+
+Recorded 2026-10-23 at `rules_version` 23, `SIM_VERSION` 17 with
+`just rerecord` (M5b waves slice: only `data/ai/` changed, the Standard
+build order, and no other fixture has a Standard seat). Each of the ten
+earlier files differs from its `rules_version` 22 recording in the
+header's `rules_version` and `rules_hash` only (10 bytes; every other byte
+is equal), and no `.hash` file changed. `m5_first_match`
+(`0x5a690149db4330e6`, `just rerecord m5_first_match`) is the first
+recording of a new scenario, which needs no bump by itself.
+
+Recorded 2026-10-23 at `rules_version` 22, `SIM_VERSION` 17 with
+`just rerecord` (M5b economy slice: only `data/ai/` changed, the Standard
+build order and `resource_radius_tiles`, and no fixture has a Standard
+seat). Each file differs from its `rules_version` 21 recording in the
+header's `rules_version` and `rules_hash` only (10 bytes before, 11 after;
+every other byte is equal), and no `.hash` file changed.
+
+Recorded 2026-10-23 at `rules_version` 21, `SIM_VERSION` 17 with
+`just rerecord` (M5b bot plumbing: the header gained `ai_seats` as its last
+field and every `Player` the hashed `ai_memory`, in the `meta` sub-hash;
+`data/ai` joined `rules_hash`). No fixture has a bot that writes a memory,
+so nothing behaves differently: a per-tick `sim-cli hash-dump --every 1`
+of each fixture as recorded at `SIM_VERSION` 16, run by that binary with its
+own `data/`, against the re-recorded fixture run by the `SIM_VERSION` 17
+binary with the current `data/`, differs in the whole hash and the `meta`
+column on every tick and in no other column. Every `.hash` file changes for
+that reason only: `capture_seat` `0xbd9f9df3f98fcc23`, `combat_skirmish`
+`0x9c42bb7bfd4dcef3`, `economy_second_town` `0x4b3429bcfd9ec100`,
+`economy_walkthrough` `0x88bb89e34ec941bd`, `enemy_outpost_walkthrough`
+`0xd0684c93f3398915`, `group_spiral` `0xf468c100c2b042e1`, `move_500`
+`0x02e11c8e91350d52`, `move_500_short` `0x46eaeacec41e1b86`,
+`snapshot_restore` `0x9625510823fec01f`, `stalemate_45min`
+`0x261fad6cc4323139`.
 
 Recorded 2026-10-23 at `rules_version` 20, `SIM_VERSION` 16 with
 `just rerecord` (M5a annexation and outcome: `TownState` gained the hashed

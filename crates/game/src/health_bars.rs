@@ -1150,7 +1150,12 @@ mod tests {
     fn max_hp_table_matches_unit_hp() {
         struct NoAi;
         impl sim::AiController for NoAi {
-            fn think(&mut self, _: PlayerId, _: &SimView<'_>) -> Vec<Command> {
+            fn think(
+                &mut self,
+                _: PlayerId,
+                _: &SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<Command> {
                 Vec::new()
             }
         }
@@ -1191,7 +1196,12 @@ mod tests {
     fn arms_raises_the_bar_max() {
         struct NoAi;
         impl sim::AiController for NoAi {
-            fn think(&mut self, _: PlayerId, _: &SimView<'_>) -> Vec<Command> {
+            fn think(
+                &mut self,
+                _: PlayerId,
+                _: &SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<Command> {
                 Vec::new()
             }
         }

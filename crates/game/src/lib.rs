@@ -36,6 +36,8 @@
 //!   contested Town and the annexation readout (M5a).
 //! - [`outcome`]: the victory, defeat or draw overlay with the final hash
 //!   over the frozen world once the sim decides the match (M5a).
+//! - [`menu`]: `AppState` (`Menu`, `Skirmish`) and the main menu a plain
+//!   launch opens on, with New Game and Quit (M5b).
 //! - [`director`]: camera and selection beats for
 //!   `--scenario enemy_outpost_walkthrough` (M4b); never issues a command.
 //! - `macos_menu`: muda menu with the custom Cmd-Q item (macOS only).
@@ -62,6 +64,7 @@ pub mod hud;
 #[cfg(target_os = "macos")]
 pub mod macos_menu;
 pub mod markers;
+pub mod menu;
 pub mod monitor_loss;
 pub mod orders;
 pub mod outcome;

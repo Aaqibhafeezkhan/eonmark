@@ -3,10 +3,11 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  // 20: M5a annexation and outcome (SIM 16): every fixture re-recorded for
-  // the new hashed TownState::hold and State::outcome; no RON content
-  // changed besides the version.
-  rules_version: 20,
+  // 24: M5b waves slice review: data/ai only (personalities.ron gains
+  // defend_guard_pop_ratio, the size of the home guard once a defence is
+  // past defend_max_block_ds); every fixture is re-recorded for the new
+  // rules_hash in its header and no existing .hash moves.
+  rules_version: 24,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",

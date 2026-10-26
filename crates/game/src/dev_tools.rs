@@ -1,6 +1,8 @@
 //! Developer-only overlays, compiled only with `--features dev`:
 //! Bevy's FPS overlay, the egui world inspector (hidden until F12) and a
-//! small sim panel.
+//! small sim panel. Since M5b the panel has one line per bot seat,
+//! `bot P1 standard: <ai::describe>` (the build-order window, the Military
+//! latch, the wave, the next wave tick and the defend latch).
 
 use std::time::Duration;
 
@@ -15,7 +17,9 @@ use crate::camera::RtsCamera;
 use crate::health_bars::{HealthBar, HealthBars};
 use crate::present::UnitVisuals;
 use crate::selection::Selection;
-use crate::sim_driver::{ActiveInput, DriverStats, PendingCommands, ReplayRecorder, SimHandle};
+use crate::sim_driver::{
+    ActiveInput, DriverStats, PendingCommands, PendingRecording, ReplayRecorder, SimHandle,
+};
 
 /// Adds every dev overlay. Never shipped.
 pub struct DevToolsPlugin;
@@ -58,6 +62,7 @@ fn sim_panel(
     pending: Res<PendingCommands>,
     input: Res<ActiveInput>,
     recorder: Res<ReplayRecorder>,
+    to_record: Res<PendingRecording>,
     selection: Res<Selection>,
     visuals: Res<UnitVisuals>,
     cameras: Query<&RtsCamera>,
@@ -68,6 +73,8 @@ fn sim_panel(
     egui::Window::new("Sim")
         .default_pos([12.0, 48.0])
         .resizable(false)
+        // The bot lines wrap instead of stretching the panel across the map.
+        .max_width(460.0)
         .show(ctx, |ui| {
             egui::Grid::new("sim-grid").num_columns(2).show(ui, |ui| {
                 ui.label("tick");
@@ -125,6 +132,10 @@ fn sim_panel(
                 // across the window and hide the units (it is on stdout as
                 // `replay: <path>`, and here on hover).
                 match recorder.0.as_ref() {
+                    // M5b: the recorder starts with the first stepped tick.
+                    None if to_record.0.is_some() => {
+                        ui.monospace("from the first tick");
+                    }
                     None => {
                         ui.monospace("off");
                     }
@@ -141,6 +152,19 @@ fn sim_panel(
                 ui.label("flushes");
                 ui.monospace(stats.flushes_sent.to_string());
                 ui.end_row();
+                // M5b: one line per bot seat (`ai::describe`); `view` shows
+                // each bot's memory outside its `think`.
+                let view = sim.view();
+                for seat in &sim.setup().ai_seats {
+                    ui.label(format!("bot P{} {}", seat.player.0, seat.bot));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(ai::describe(&view, seat.player)).monospace(),
+                        )
+                        .wrap(),
+                    );
+                    ui.end_row();
+                }
                 let (meshes, materials) = visuals.counts();
                 ui.label("meshes / materials");
                 ui.monospace(format!("{meshes} / {materials}"));

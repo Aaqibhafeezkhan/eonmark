@@ -18,6 +18,7 @@
 //! | `rules/factions.ron` | [`Factions`] |
 //! | `maps/*.ron` | [`map::MapDef`] |
 //! | `visuals.ron` | [`Visuals`] (how each unit kind is drawn; validated here, read by the game) |
+//! | `ai/personalities.ron`, `ai/build_orders/*.ron` | [`ai::AiRules`] (the bot's knobs and build orders, M5b; validated here, read by `crates/ai`) |
 //!
 //! Every error names the file and, when the data parsed, the field.
 //!
@@ -29,6 +30,7 @@
 #![warn(missing_docs)]
 
 pub mod ages;
+pub mod ai;
 pub mod attack;
 pub mod buildings;
 pub mod costs;
@@ -46,6 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use ages::{Age, Ages, Unlocks};
+pub use ai::{AiRules, BuildOrder, MixEntry, Personality, Placement, RecallWave, Step, WaveSize};
 pub use attack::{Attack, Prefer};
 pub use buildings::{BuildingKind, Buildings, GatherSpec, Slots};
 pub use factions::{Faction, Factions};
@@ -316,6 +319,12 @@ pub struct Rules {
     /// presenter, never by the sim.
     #[serde(skip_deserializing)]
     pub visuals: Visuals,
+    /// Everything under `ai/` (M5b): the bot personalities and build
+    /// orders. Attached by [`Rules::load`] and validated against the rest
+    /// of the rules; read by `crates/ai`, never by the sim, and in
+    /// `rules_hash` like every attached file.
+    #[serde(skip_deserializing)]
+    pub ai: AiRules,
 }
 
 /// The files `Rules::load` read, so cross-file errors name the right one.
@@ -364,7 +373,8 @@ impl Rules {
     /// `rules.ron`, `resources.ron`, `units.ron`, `buildings.ron`,
     /// `techs.ron`, `ages.ron`, `factions.ron`; then one pass checks what
     /// spans files, resolving the `ages.ron` references before anything
-    /// else; then `visuals.ron` and the maps load.
+    /// else; then `visuals.ron` and the maps load, and last the bot data
+    /// under `ai/` (M5b), checked against everything before it.
     pub fn load(dir: impl AsRef<Path>) -> Result<Rules, Error> {
         let dir = dir.as_ref();
         let file = |name: &str| dir.join("rules").join(name);
@@ -431,6 +441,7 @@ impl Rules {
             ));
         }
         rules.check_start_footprints(&maps_dir)?;
+        rules.ai = ai::load(dir, &rules)?;
         Ok(rules)
     }
 
@@ -3285,6 +3296,14 @@ mod tests {
             msg.contains("rules/ages.ron: ages[2].techs_required: ") && msg.contains("unlock 8"),
             "{msg}"
         );
+        // The shipped build order researches 6 counting techs before its
+        // Charter Advance, so a 9-tech gate makes that Advance unreachable
+        // (M5b's build-order check); this copy ends the order before it.
+        let charter = (
+            "ai/build_orders/standard.ron",
+            "    Advance(age: \"charter\"),                    // 6 counting techs before it\n    Research(tech: \"arms_3\"),\n",
+            "",
+        );
         let r = loads_after_edits(
             "h-gate-9-counting",
             &[
@@ -3294,6 +3313,7 @@ mod tests {
                     "      counts_toward_age: false,",
                     "      counts_toward_age: true,",
                 ),
+                charter,
             ],
         );
         assert_eq!(r.ages[2].techs_required, 9);

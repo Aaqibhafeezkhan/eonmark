@@ -1,0 +1,29 @@
+// Personality knobs (M5b: one row). _ds deciseconds, _tiles tiles, _permille
+// per mille. Schema: crates/rules/src/ai.rs (deny_unknown_fields).
+(
+  personalities: [
+    (
+      id: "standard", name: "Standard", build_order: "standard",
+      think_every_ds: 5, lookahead: 3, max_commands_per_think: 16,
+      site_checks_per_think: 4, rebalance_per_think: 2, blocked_retry_ds: 300,
+      building_gap_tiles: 1, near_town_min_tiles: 4, near_town_max_tiles: 12,
+      expansion_min_tiles: 14, resource_radius_tiles: 20, toward_enemy_penalty: 2,
+      border_scan_tiles: 40, tower_spacing_tiles: 8,
+      army_mix: [(kind: "skirmisher", weight: 3), (kind: "bowman", weight: 2),
+                 (kind: "shieldbearer", weight: 1), (kind: "mangonel", weight: 2)],
+      supply_kind: "supply_wain", max_queue_per_building: 1,
+      rally_tiles_from_seat: 12, assemble_radius_tiles: 8, goal_tolerance_tiles: 3,
+      wave_requires_age: Some("masonry"), first_wave_not_before_ds: 0,
+      wave_sizes: [(from_ds: 0, armed: 8), (from_ds: 9000, armed: 12),
+                   (from_ds: 12000, armed: 16), (from_ds: 15000, armed: 24)],
+      max_wave_units: 40, wave_interval_ds: 1800, min_siege: 1, wains_per_wave: 1,
+      stage_margin_tiles: 2, stage_radius_tiles: 6, stage_ready_permille: 750,
+      stage_max_ds: 600, siege_focus_tiles: 12, wain_standoff_tiles: 3, wain_leash_tiles: 6,
+      ring_units: 4, clear_defenders_units: 4, continue_min_units: 4,
+      recall_below_units: 3, wave_max_ds: 3600, all_in_after_ds: 18000,
+      defend_radius_tiles: 16, defend_regoal_tiles: 4, defend_release_ds: 150,
+      defend_max_block_ds: 600, defend_guard_pop_ratio: 2,
+      recall_wave: WhileStaging, recall_wave_town_hp_permille: 500,
+    ),
+  ],
+)

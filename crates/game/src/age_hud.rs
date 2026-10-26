@@ -253,15 +253,19 @@ pub fn update_age_hud(
 
 /// A primary click on the Advance button: `AdvanceAge` for the local
 /// player, or, when greyed, its tooltip (the rejection's message first) on
-/// the message line, as a greyed card button does.
+/// the message line, as a greyed card button does. Nothing while the local
+/// slot is a bot (M5b, `--spectate`).
 pub fn on_advance_click(
     click: On<Pointer<Click>>,
     buttons: Query<&CardState, With<AdvanceButton>>,
     mut pending: ResMut<PendingCommands>,
     mut message: ResMut<MessageState>,
     time: Res<Time>,
+    seat: Option<Res<crate::sim_driver::LocalSeat>>,
 ) {
-    if click.event().event.button != PointerButton::Primary {
+    if click.event().event.button != PointerButton::Primary
+        || !crate::sim_driver::local_player_is_human(seat)
+    {
         return;
     }
     let Ok(state) = buttons.get(click.event().entity) else {

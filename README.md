@@ -35,7 +35,7 @@ cd eonmark
 cargo run -p game --features dev
 ```
 
-The first build compiles Bevy and takes several minutes (2 min 34 s cold on an M5 Max). Measured numbers for the development Mac and for CI are in [docs/BUILD_TIMES.md](docs/BUILD_TIMES.md). Later builds are much faster because `dev` turns on dynamic linking. Never ship a build with `dev`.
+The game opens on its main menu; New Game starts a skirmish against the Standard bot on `plains_1v1` (`-- --skip-menu` starts it at once, `-- --spectate` watches the bot play itself). The first build compiles Bevy and takes several minutes (2 min 34 s cold on an M5 Max). Measured numbers for the development Mac and for CI are in [docs/BUILD_TIMES.md](docs/BUILD_TIMES.md). Later builds are much faster because `dev` turns on dynamic linking. Never ship a build with `dev`.
 
 To run the CI gates locally, install `just` (`brew install just`) and run `just ci`; see [CONTRIBUTING.md](CONTRIBUTING.md).
 

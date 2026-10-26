@@ -66,6 +66,11 @@ opt-level = 3
 [profile.dev.package.sim]
 opt-level = 3
 
+# The bot runs inside every step of every bot test (M5b), and CI tests in
+# the dev profile.
+[profile.dev.package.ai]
+opt-level = 3
+
 # Single profile used for every Bevy compile in the per-PR CI job so one
 # target dir is cached (clippy, nextest --cargo-profile ci, doc, headless-run).
 [profile.ci]
@@ -84,4 +89,8 @@ overflow-checks = true
 
 # Cost math in rules (read by sim, sim-cli and the game) must panic too.
 [profile.release.package.rules]
+overflow-checks = true
+
+# The bot (M5b) runs inside the sim's step: its integer math panics too.
+[profile.release.package.ai]
 overflow-checks = true

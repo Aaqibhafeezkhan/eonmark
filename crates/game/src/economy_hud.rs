@@ -107,6 +107,12 @@ pub const HUD_KEYS: &[(&str, &[&str])] = &[
     ("outcome.time", &["time", "count"]),
     ("outcome.hash", &["hash"]),
     ("outcome.replay", &["name"]),
+    // M5b: the main menu (`menu/main_menu.rs`).
+    ("menu.title", &[]),
+    ("menu.opponent", &["name"]),
+    ("menu.seed", &["seed"]),
+    ("menu.new_game", &[]),
+    ("menu.quit", &[]),
 ];
 
 /// How long the message line shows a message, in seconds.
@@ -1012,12 +1018,25 @@ mod tests {
             }
         }
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut literals = 0;
-        for entry in std::fs::read_dir(&src).expect("src") {
-            let path = entry.expect("entry").path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
+        // The sources, sub-modules (`menu/`, M5b) included.
+        let mut files = Vec::new();
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
             }
+        }
+        assert!(
+            files.iter().any(|p| p.ends_with("menu/main_menu.rs")),
+            "the scan reaches menu/"
+        );
+        let mut literals = 0;
+        for path in files {
             let text = std::fs::read_to_string(&path).expect("read");
             // The game's code, not its tests.
             let code = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
@@ -1061,7 +1080,12 @@ mod tests {
     struct NoAi;
 
     impl sim::AiController for NoAi {
-        fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
+        fn think(
+            &mut self,
+            _: sim::PlayerId,
+            _: &sim::SimView<'_>,
+            _: &mut sim::AiMemory,
+        ) -> Vec<sim::Command> {
             Vec::new()
         }
     }

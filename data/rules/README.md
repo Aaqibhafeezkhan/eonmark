@@ -9,8 +9,9 @@ and lives one level up, in `../visuals.ron`). All are loaded by
 `rules::Rules::load` in that order (`rules.ron`, `resources.ron`,
 `units.ron`, `buildings.ron`, `techs.ron`, `ages.ron`, `factions.ron`, each
 checked on its own; then the checks that span files, which resolve the
-`ages.ron` references first; then `../visuals.ron` and `../maps/`) and
-validated before the simulation starts; their content is part of
+`ages.ron` references first; then `../visuals.ron`, `../maps/` and, from
+M5b, the bot data in `../ai/`, see [`../ai/README.md`](../ai/README.md))
+and validated before the simulation starts; their content is part of
 `rules_hash`, so editing them without bumping `rules_version` makes
 `sim-cli verify` report `RULES CHANGED since recording` on older replays.
 Changing a number here needs no Rust; see the worked example at the end for
@@ -46,7 +47,7 @@ when you can; the validator does not require it.
 
 | Field | Meaning | Value | Used from |
 |-------|---------|-------|-----------|
-| `rules_version` | Bump whenever golden replays are regenerated; the comment above it gives the reason for the current number | 20 | M0 |
+| `rules_version` | Bump whenever golden replays are regenerated, and for any edit to a RON file under `data/rules/` or `data/ai/` except the UI strings in `data/rules/strings/` (those files are in `rules_hash`; the strings are not, see `docs/DATA_FORMAT.md`); the comment above it gives the reason for the current number | 22 | M0 |
 | `tick_rate_hz` | Simulation ticks per second | 20 | M0 |
 | `cmd_delay_ticks` | A command issued at tick N applies at N + this | 2 | M0 |
 | `default_map` | Map for `MatchSetup::skirmish`; must exist under `data/maps/` | `"plains_1v1"` | M0 |
@@ -170,7 +171,18 @@ reads the rest: `annexation_ds`, the annexation knobs and selectors,
 `annexation_town_hp_permille`, `match_cap_ds` and the Yield Cap decay
 (`docs/design/towns.md` and `docs/design/economy.md`, "M5a implementation
 notes"). `stays_on_annexation` in `buildings.ron` is read from the same
-slice.
+slice. M5b's first slice (`rules_version` 21) changed no value here: the
+bump re-recorded every fixture for the new replay header field `ai_seats`
+and the hashed bot memory (`SIM_VERSION` 17), and `rules_hash` now also
+covers `../ai/`. M5b's economy slice (`rules_version` 22) changed only
+`../ai/` (the Standard build order and `resource_radius_tiles`); the
+re-recorded fixtures differ in their headers only. Its waves slice
+(`rules_version` 23) again changed only `../ai/` (the Standard build
+order), with the same header-only re-record, and added the
+`m5_first_match` golden; its review fixes (`rules_version` 24) added the
+`defend_guard_pop_ratio` knob to `../ai/personalities.ron`, again with a
+header-only re-record (only `m5_first_match`, new in that pull request,
+moved with the bot's code).
 
 ## resources.ron
 
@@ -547,7 +559,7 @@ fails. The data-only path is the same for every RON file and touches no
 Rust:
 
 1. Edit the value, as above.
-2. Bump `rules_version` in `rules.ron` (20 to 21), update the one-line
+2. Bump `rules_version` in `rules.ron` (24 to 25), update the one-line
    reason in the comment above it and put the same reason in the commit
    message.
 3. Check the data, re-record the golden fixtures and run the sim tests:
@@ -559,8 +571,8 @@ cargo test -p sim
 ```
 
 `data-check` prints
-`OK rules_version=21 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 maps=plains_1v1 strings=en`
-(the repository is at 20, so before the edit it prints `rules_version=20`;
+`OK rules_version=25 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en`
+(the repository is at 24, so before the edit it prints `rules_version=24`;
 the hash is new because a file changed).
 `just rerecord` runs `scripts/rerecord_fixtures.sh`: it re-records every
 fixture under `crates/sim/tests/fixtures/` in release, writes each `.hash`

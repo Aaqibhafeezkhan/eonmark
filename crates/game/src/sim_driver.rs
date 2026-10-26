@@ -27,18 +27,33 @@
 //! or scenario input) without stepping: the live game freezes at the
 //! outcome. A replay never freezes; it plays to its recorded end.
 //!
+//! M5b: `step_sim` runs only while [`match_running`] (no `AppState`
+//! resource, as in headless runs and most tests, or `AppState::Skirmish`),
+//! so the sim does not step while the main menu is open; the fixed clock
+//! still spends its time with the system skipped, so the first frame after
+//! New Game steps one tick, not a burst. The recorder is lazy: the plugin
+//! keeps the replay's path in [`PendingRecording`] and `step_sim` spawns
+//! the [`Recorder`] (and prints `replay: <path>`) right before the first
+//! tick it steps, so quitting from the menu writes no file and a match
+//! fast-forwarded with `--spectate --fast-forward-to N`
+//! ([`SimHandle::fast_forward`]) records from tick N, which still verifies
+//! because a spectated match has no human input. [`LocalSeat`] and the
+//! [`local_player_is_human`] run condition turn world input off when the
+//! local slot is a bot (`--spectate`), and [`LocalInput`] drops any local
+//! command for an AI slot as defence in depth.
+//!
 //! The headless replay runner (`headless.rs`) reuses [`drive_tick`],
 //! [`ReplayInput`] and [`ReplayFinished`] without the fixed clock or the
 //! recorder; `frame_stats.rs` reads [`DriverStats::flushes_sent`] to
 //! attribute frame-time spikes to the recorder flush.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
@@ -51,6 +66,8 @@ use sim::{
     AiController, Command, MatchResult, MatchSetup, Outcome, OutcomeReason, PlayerCommand,
     PlayerId, Sim, SimView, SubHashes, sort_commands,
 };
+
+use crate::menu::AppState;
 
 /// Hard cap on simulation ticks stepped in one rendered frame.
 pub const MAX_TICKS_PER_FRAME: u32 = 8;
@@ -76,37 +93,47 @@ pub struct SimHandle {
     sim: Sim,
 }
 
-/// A controller for slots no scenario has: scenario setups are two human
-/// slots, so it is never consulted.
-struct NoSlots;
-
-impl AiController for NoSlots {
-    fn think(&mut self, _player: PlayerId, _view: &SimView<'_>) -> Vec<Command> {
-        Vec::new()
-    }
-}
-
 impl SimHandle {
-    /// A skirmish from loaded rules and a seed with the passive bot in slot 1.
+    /// A skirmish from loaded rules and a seed with the passive bot in slot
+    /// 1 (`MatchSetup::skirmish`; `--headless-run <ticks>`).
     pub fn skirmish(rules: Rules, seed: u64) -> Self {
         let setup = MatchSetup::skirmish(&rules, seed);
-        Self {
-            sim: Sim::new(setup, rules, Box::new(ai::Passive)),
-        }
+        Self::from_setup(setup, rules)
     }
 
-    /// A match from an explicit setup (a scenario's or a replay header's).
-    /// Human-only setups get a never-consulted controller; a setup with an
-    /// AI slot gets the passive bot, which is what M0-M2 skirmishes use.
-    pub fn from_setup(setup: MatchSetup, rules: Rules) -> Self {
-        let ai: Box<dyn AiController> = if setup.players.iter().any(|p| p.is_ai) {
-            Box::new(ai::Passive)
-        } else {
-            Box::new(NoSlots)
-        };
-        Self {
+    /// A match against a bot (M5b): the local player in slot 0, `bot` with
+    /// `personality` in slot 1 (`MatchSetup::vs_bot`). A plain launch plays
+    /// the Standard bot.
+    ///
+    /// # Panics
+    ///
+    /// If the bot or the personality is unknown (see
+    /// [`SimHandle::try_from_setup`]).
+    pub fn vs_bot(rules: Rules, seed: u64, bot: &str, personality: &str) -> Self {
+        let setup = MatchSetup::vs_bot(&rules, seed, bot, personality);
+        Self::from_setup(setup, rules)
+    }
+
+    /// A match from an explicit setup (a scenario's or a replay header's)
+    /// with the bots its `ai_seats` name, built by `ai::controller_for`
+    /// exactly as `sim-cli verify` builds them (M5b); the error names an
+    /// unknown bot or personality, or seats that do not match the AI slots.
+    pub fn try_from_setup(setup: MatchSetup, rules: Rules) -> Result<Self, String> {
+        let ai: Box<dyn AiController> =
+            ai::controller_for(&setup, &rules).map_err(|e| e.to_string())?;
+        Ok(Self {
             sim: Sim::new(setup, rules, ai),
-        }
+        })
+    }
+
+    /// [`SimHandle::try_from_setup`] for setups known to be valid (the
+    /// scenarios, tests).
+    ///
+    /// # Panics
+    ///
+    /// With `try_from_setup`'s error.
+    pub fn from_setup(setup: MatchSetup, rules: Rules) -> Self {
+        Self::try_from_setup(setup, rules).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Advance one tick with the commands issued during the current tick.
@@ -117,6 +144,34 @@ impl SimHandle {
     /// Advance one tick with no human commands (headless `--headless-run <ticks>`).
     pub fn step_once(&mut self) {
         self.sim.step(&[]);
+    }
+
+    /// `--spectate --fast-forward-to <target>` (M5b): step with no human
+    /// commands until `sim.tick() == target`, draining the events after
+    /// every step so the buffer never grows, before the window opens.
+    /// Returns the wall time it took. Refused when the match is decided
+    /// on the way (the deciding step must run live, in `step_sim`, for the
+    /// overlay, the `outcome:` line and the recorder's finish), with
+    /// "outcome at tick T before --fast-forward-to N". A target at or
+    /// below the current tick steps nothing.
+    ///
+    /// # Errors
+    ///
+    /// The outcome came first, or was there already.
+    pub fn fast_forward(&mut self, target: u32) -> Result<Duration, String> {
+        let start = Instant::now();
+        let refuse = |at: u32| format!("outcome at tick {at} before --fast-forward-to {target}");
+        if let Some(result) = self.result() {
+            return Err(refuse(result.tick));
+        }
+        while self.tick() < target {
+            self.step_once();
+            let _ = self.drain_events();
+            if let Some(result) = self.result() {
+                return Err(refuse(result.tick));
+            }
+        }
+        Ok(start.elapsed())
     }
 
     /// Completed ticks.
@@ -207,13 +262,43 @@ pub struct DriverStats {
 /// the driver stamps nothing). Drained once per tick by [`LocalInput`] or
 /// [`ScenarioInput`]. The scripted AI never appears here: it runs inside
 /// `Sim::step`.
+///
+/// Since M5b it also knows the match's AI slots ([`PendingCommands::for_setup`]):
+/// [`LocalInput`] drops every queued command for one of them, so a click
+/// while spectating can never reach the sim as a bot's command.
 #[derive(Resource, Default, Debug)]
 pub struct PendingCommands {
     queue: Vec<PlayerCommand>,
     next_seq: BTreeMap<PlayerId, u32>,
+    ai_players: BTreeSet<PlayerId>,
+    dropped_for_ai: u64,
 }
 
 impl PendingCommands {
+    /// An empty queue for `setup`'s match, which knows its AI slots
+    /// (`PlayerSlot::is_ai`); `SimPlugin` inserts this one.
+    pub fn for_setup(setup: &MatchSetup) -> Self {
+        Self {
+            ai_players: setup
+                .players
+                .iter()
+                .filter(|p| p.is_ai)
+                .map(|p| p.id)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// `true` when `player` is an AI slot of this match.
+    pub fn is_ai(&self, player: PlayerId) -> bool {
+        self.ai_players.contains(&player)
+    }
+
+    /// Local commands dropped because they named an AI slot. Cumulative.
+    pub fn dropped_for_ai(&self) -> u64 {
+        self.dropped_for_ai
+    }
+
     /// Queue `cmd` for `player`; returns the sequence number it was stamped with.
     pub fn push(&mut self, player: PlayerId, cmd: Command) -> u32 {
         let seq = self.next_seq.entry(player).or_insert(0);
@@ -305,7 +390,11 @@ pub trait InputSource: Send + Sync + 'static {
     }
 }
 
-/// The player's own commands: drains [`PendingCommands`] every tick.
+/// The player's own commands: drains [`PendingCommands`] every tick. A
+/// command for an AI slot (M5b: anything the UI might push while
+/// spectating, where the local slot is a bot) is dropped here and never
+/// reaches the sim or the replay; it is counted in
+/// [`PendingCommands::dropped_for_ai`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalInput;
 
@@ -318,7 +407,15 @@ impl InputSource for LocalInput {
         if local.is_empty() {
             return Some(Vec::new());
         }
-        Some(local.drain_sorted())
+        let mut cmds = local.drain_sorted();
+        let before = cmds.len();
+        cmds.retain(|c| !local.is_ai(c.player));
+        let dropped = before - cmds.len();
+        if dropped > 0 {
+            local.dropped_for_ai += dropped as u64;
+            warn!("dropped {dropped} local command(s) for an AI slot");
+        }
+        Some(cmds)
     }
 
     fn name(&self) -> &'static str {
@@ -772,9 +869,53 @@ impl Recorder {
 }
 
 /// The session's recorder, or `None` when this session does not record
-/// (headless replay runs).
+/// (headless replay runs), has not stepped yet (M5b: see
+/// [`PendingRecording`]) or was finished.
 #[derive(Resource, Default)]
 pub struct ReplayRecorder(pub Option<Recorder>);
+
+/// Where this session will record, until `step_sim` spawns the
+/// [`Recorder`] right before the first tick it steps (M5b, the lazy
+/// recorder): a session that never steps (quit from the main menu) writes
+/// no replay. `None` once spawned, or when the session does not record.
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+pub struct PendingRecording(pub Option<PathBuf>);
+
+/// Whether the local player's slot ([`LOCAL_PLAYER`]) is a human one in
+/// this match (M5b): `false` under `--spectate`, where both slots are bots.
+/// Inserted by `SimPlugin` from the setup; read by [`local_player_is_human`].
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSeat {
+    /// `setup().players[LOCAL_PLAYER]` exists and is not AI.
+    pub human: bool,
+}
+
+impl LocalSeat {
+    /// The local seat of `setup`.
+    pub fn of(setup: &MatchSetup) -> Self {
+        Self {
+            human: setup
+                .players
+                .iter()
+                .any(|p| p.id == LOCAL_PLAYER && !p.is_ai),
+        }
+    }
+}
+
+/// Run condition (M5b): the local player's slot is human. World input
+/// (`hud::WorldInputSet`), the command card and the card, Advance and Stop
+/// clicks are off while it is not (`--spectate`). `true` with no
+/// [`LocalSeat`] (tests that build the HUD without a `SimPlugin`).
+pub fn local_player_is_human(seat: Option<Res<LocalSeat>>) -> bool {
+    seat.is_none_or(|s| s.human)
+}
+
+/// Run condition (M5b): the match runs, so `step_sim` steps. `true` with no
+/// [`AppState`] at all (headless runs and tests without states) and in
+/// `AppState::Skirmish`; `false` while the main menu is open.
+pub fn match_running(state: Option<Res<State<AppState>>>) -> bool {
+    state.is_none_or(|s| *s.get() == AppState::Skirmish)
+}
 
 /// `ProjectDirs::from("com", "tonianev", "Eonmark").data_dir()/replays`, or
 /// `None` when the platform has no data directory.
@@ -880,7 +1021,8 @@ pub struct SimPlugin {
     handle: Mutex<Option<SimHandle>>,
     input: Mutex<Option<Box<dyn InputSource>>>,
     /// Record this session to this path (every windowed session records;
-    /// headless replay runs pass `None`).
+    /// headless replay runs pass `None`), from the first stepped tick on
+    /// (M5b, [`PendingRecording`]).
     pub record_to: Option<PathBuf>,
     /// Hash checkpoint cadence.
     pub hash_every: u32,
@@ -897,7 +1039,8 @@ impl SimPlugin {
         }
     }
 
-    /// Record to `path` (`None` disables recording).
+    /// Record to `path` (`None` disables recording). The file is created
+    /// right before the first tick `step_sim` steps, not at build.
     pub fn recording(mut self, path: Option<PathBuf>) -> Self {
         self.record_to = path;
         self
@@ -926,38 +1069,31 @@ impl Plugin for SimPlugin {
             .expect("SimPlugin::build runs once");
         let hz = f64::from(handle.tick_rate_hz());
 
-        let recorder = match &self.record_to {
-            Some(path) => match Recorder::spawn(path, handle.setup()) {
-                Ok(rec) => {
-                    info!("recording replay to {}", rec.path().display());
-                    println!("replay: {}", rec.path().display());
-                    Some(rec)
-                }
-                Err(e) => {
-                    eprintln!("eonmark: cannot record replay to {}: {e}", path.display());
-                    None
-                }
-            },
-            None => None,
-        };
-
         info!("input source: {}", input.describe());
+        // The recorder starts with the first stepped tick (`step_sim`).
+        let pending = PendingCommands::for_setup(handle.setup());
+        let seat = LocalSeat::of(handle.setup());
         app.world_mut().insert_non_send(handle);
         app.insert_resource(ActiveInput(input))
             .insert_resource(Time::<Fixed>::from_hz(hz))
             .insert_resource(HashCadence {
                 every: self.hash_every.max(1),
             })
-            .insert_resource(ReplayRecorder(recorder))
+            .insert_resource(ReplayRecorder(None))
+            .insert_resource(PendingRecording(self.record_to.clone()))
+            .insert_resource(pending)
+            .insert_resource(seat)
             .init_resource::<DriverStats>()
-            .init_resource::<PendingCommands>()
             .init_resource::<FrameBudget>()
             .init_resource::<SimStepped>()
             .add_message::<ReplayFinished>()
             .add_message::<SimEventMsg>()
             .add_systems(Startup, configure_virtual_time)
             .add_systems(PreUpdate, reset_frame_budget)
-            .add_systems(FixedUpdate, step_sim.in_set(SimSystems::Step))
+            .add_systems(
+                FixedUpdate,
+                step_sim.in_set(SimSystems::Step).run_if(match_running),
+            )
             // After `bevy_window::ExitSystems`: the red close button's
             // `AppExit` is written by `exit_on_all_closed` in `Last`, and the
             // winit runner exits right after this frame, so the recorder must
@@ -1053,12 +1189,44 @@ pub fn drive_tick(
     TickOutcome::Stepped { tick: sim.tick() }
 }
 
+/// Spawn the session's recorder from `pending` (M5b, the lazy recorder),
+/// once: print `replay: <path>` on success, an error otherwise (the session
+/// then plays on unrecorded). Called by `step_sim` right before the first
+/// tick it steps.
+fn start_recorder(sim: &SimHandle, pending: &mut PendingRecording, recorder: &mut ReplayRecorder) {
+    let Some(path) = pending.0.take() else {
+        return;
+    };
+    match Recorder::spawn(&path, sim.setup()) {
+        Ok(rec) => {
+            info!(
+                "recording replay to {} from tick {}",
+                rec.path().display(),
+                sim.tick()
+            );
+            println!("replay: {}", rec.path().display());
+            recorder.0 = Some(rec);
+        }
+        Err(e) => eprintln!("eonmark: cannot record replay to {}: {e}", path.display()),
+    }
+}
+
+/// `true` when [`drive_tick`] would ask `input` for commands now rather
+/// than report the end of a replay or a decided live match.
+fn will_ask(sim: &SimHandle, input: &dyn InputSource) -> bool {
+    match input.end_of_input() {
+        Some(end) => sim.tick() < end.final_tick,
+        None => sim.outcome().is_none(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Bevy system: each parameter is one resource or query
 fn step_sim(
     mut sim: NonSendMut<SimHandle>,
     mut input: ResMut<ActiveInput>,
     mut pending: ResMut<PendingCommands>,
     mut recorder: ResMut<ReplayRecorder>,
+    mut to_record: ResMut<PendingRecording>,
     cadence: Res<HashCadence>,
     mut stats: ResMut<DriverStats>,
     mut budget: ResMut<FrameBudget>,
@@ -1079,6 +1247,9 @@ fn step_sim(
         return;
     }
     budget.used += 1;
+    if to_record.0.is_some() && will_ask(&sim, input.0.as_ref()) {
+        start_recorder(&sim, &mut to_record, &mut recorder);
+    }
     let outcome = drive_tick(
         &mut sim,
         input.0.as_mut(),
@@ -2160,5 +2331,376 @@ mod tests {
                 .ends_with("-1.eonreplay")
         );
         assert!(replay_dir(None).ends_with("replays"));
+    }
+
+    /// The header's own bots, as `sim-cli verify` builds them (M5b).
+    fn header_bots() -> Box<sim::replay::ControllerFactory<'static>> {
+        Box::new(|setup: &MatchSetup, rules: &Rules| {
+            ai::controller_for(setup, rules).map_err(|e| e.to_string())
+        })
+    }
+
+    /// A `MinimalPlugins` app driving `handle` from `input` and recording
+    /// to `path`, one tick per update after the first (which primes the
+    /// clock).
+    fn recording_app(handle: SimHandle, input: Box<dyn InputSource>, path: &Path) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .add_plugins(SimPlugin::new(handle, input).recording(Some(path.to_path_buf())));
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        app
+    }
+
+    /// ROADMAP M5b acceptance 4 without a window: a match against the
+    /// Standard bot (`SimHandle::vs_bot`, what New Game starts) driven by
+    /// the real `SimPlugin` and recorder, where the human surrenders during
+    /// tick 600. The bot wins, `MatchOver` carries the hash at the deciding
+    /// tick, and the recorded replay verifies to it with the bot rebuilt
+    /// from the header (`verify_with` + `ai::controller_for`), while a
+    /// Passive rebuild diverges: the replay holds only the human's command
+    /// and the bot's decisions are regenerated.
+    #[test]
+    fn a_match_vs_the_standard_bot_records_a_replay_that_verifies_to_the_outcome_hash() {
+        let rules = rules();
+        let path = temp("vs_standard.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let handle = SimHandle::vs_bot(rules, 5, ai::BOT_STANDARD, "standard");
+        let delay = handle.setup().cmd_delay;
+        let mut app = recording_app(handle, Box::new(LocalInput), &path);
+        let tick = |app: &App| app.world().non_send::<SimHandle>().tick();
+        while tick(&app) < 600 {
+            app.update();
+        }
+        assert_eq!(tick(&app), 600);
+        assert!(
+            app.world().non_send::<SimHandle>().view().units().count() > 10,
+            "both sides are playing"
+        );
+        app.world_mut()
+            .resource_mut::<PendingCommands>()
+            .push_local(Command::Surrender);
+        for _ in 0..20 {
+            if app.world().contains_resource::<MatchOver>() {
+                break;
+            }
+            app.update();
+        }
+        let over = app.world().resource::<MatchOver>().clone();
+        assert_eq!(
+            over.result.outcome,
+            Outcome::Victory {
+                player: PlayerId(1),
+                decisive: true
+            }
+        );
+        assert_eq!(over.result.reason, OutcomeReason::Surrender);
+        assert_eq!(over.result.tick, 600 + delay + 1);
+        assert_eq!(over.replay.as_deref(), Some(path.as_path()));
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        assert_eq!(
+            sim::replay::verify_with(&path, &data, header_bots()).unwrap(),
+            sim::replay::VerifyOutcome::Ok {
+                final_hash: over.hash,
+                ticks: over.result.tick
+            }
+        );
+        let passive = sim::replay::verify(&path, &data, Box::new(ai::Passive)).unwrap();
+        assert!(
+            matches!(passive, sim::replay::VerifyOutcome::Diverged { .. }),
+            "the bot's decisions are not in the replay: {passive}"
+        );
+        let file = ReplayReader::open(&path).unwrap();
+        let human: Vec<&PlayerCommand> = file
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Tick(b) => Some(&b.cmds),
+                Record::Hash(_) => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(human.len(), 1, "only the surrender: {human:?}");
+        assert_eq!(human[0].player, LOCAL_PLAYER);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--spectate --fast-forward-to N` without a window: the replay the
+    /// lazy recorder starts at tick N holds nothing before N, and still
+    /// verifies from tick 0 with the bots rebuilt from the header, because
+    /// a spectated match has no human input (M5b owner decision 8).
+    #[test]
+    fn a_replay_recorded_after_a_fast_forward_verifies_from_tick_0() {
+        let rules = rules();
+        let path = temp("fast_forward.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let setup = MatchSetup::bots(
+            &rules,
+            1,
+            (ai::BOT_STANDARD, "standard"),
+            (ai::BOT_STANDARD, "standard"),
+        );
+        let mut handle = SimHandle::from_setup(setup, rules);
+        handle.fast_forward(300).unwrap();
+        assert_eq!(handle.tick(), 300);
+        let mut app = recording_app(handle, Box::new(LocalInput), &path);
+        assert!(
+            !path.exists(),
+            "nothing is recorded before the first stepped tick"
+        );
+        while app.world().non_send::<SimHandle>().tick() < 360 {
+            app.update();
+        }
+        // The exit frame steps once more, then finishes the recorder in
+        // `Last` at that tick.
+        app.world_mut().write_message(AppExit::Success);
+        app.update();
+        let (tick, hash) = {
+            let sim = app.world().non_send::<SimHandle>();
+            (sim.tick(), sim.hash())
+        };
+        assert!((360..=361).contains(&tick), "{tick}");
+        let file = ReplayReader::open(&path).unwrap();
+        assert!(!file.truncated);
+        let first = file.records.iter().map(|r| match r {
+            Record::Tick(b) => b.tick,
+            Record::Hash(h) => h.tick,
+        });
+        assert!(
+            first.min().is_some_and(|t| t > 300),
+            "recorded from tick 300"
+        );
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        assert_eq!(
+            sim::replay::verify_with(&path, &data, header_bots()).unwrap(),
+            sim::replay::VerifyOutcome::Ok {
+                final_hash: hash,
+                ticks: tick
+            }
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `SimHandle::fast_forward` steps to its target with the events
+    /// drained after every step, and is refused once the match is decided
+    /// on the way, or already: the overlay needs a live deciding step.
+    #[test]
+    fn fast_forward_drains_events_and_refuses_a_target_past_the_outcome() {
+        /// P0 issues an order for a unit that does not exist during tick 5
+        /// (a `CommandRejected` event), and P1 surrenders during
+        /// `surrender_at`.
+        struct Script {
+            surrender_at: u32,
+        }
+        impl AiController for Script {
+            fn think(
+                &mut self,
+                player: PlayerId,
+                view: &SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<Command> {
+                match (player.0, view.tick) {
+                    (0, 5) => vec![Command::Stop {
+                        units: vec![UnitId(999)],
+                    }],
+                    (1, t) if t == self.surrender_at => vec![Command::Surrender],
+                    _ => Vec::new(),
+                }
+            }
+        }
+        let rules = rules();
+        let setup = MatchSetup::bots(&rules, 1, ("passive", ""), ("passive", ""));
+        let scripted = || SimHandle {
+            sim: Sim::new(
+                setup.clone(),
+                rules.clone(),
+                Box::new(Script { surrender_at: 40 }),
+            ),
+        };
+        // Control: the same 30 ticks without draining leave the rejection.
+        let mut control = scripted();
+        for _ in 0..30 {
+            control.step_once();
+        }
+        assert!(
+            control
+                .drain_events()
+                .iter()
+                .any(|e| matches!(e, sim::SimEvent::CommandRejected { .. })),
+            "the script raises an event"
+        );
+        let mut handle = scripted();
+        handle.fast_forward(30).unwrap();
+        assert_eq!(handle.tick(), 30);
+        assert_eq!(handle.hash(), control.hash());
+        assert!(handle.drain_events().is_empty(), "drained on the way");
+        handle.fast_forward(10).unwrap();
+        assert_eq!(handle.tick(), 30, "a target behind steps nothing");
+        let refused = handle.fast_forward(100).unwrap_err();
+        let decided = handle.result().expect("decided on the way").tick;
+        assert!(decided < 100, "{decided}");
+        assert_eq!(
+            refused,
+            format!("outcome at tick {decided} before --fast-forward-to 100")
+        );
+        assert_eq!(handle.tick(), decided, "stopped at the deciding step");
+        assert!(handle.drain_events().is_empty());
+        assert_eq!(
+            handle.fast_forward(200).unwrap_err(),
+            format!("outcome at tick {decided} before --fast-forward-to 200"),
+            "already decided"
+        );
+        assert_eq!(handle.tick(), decided);
+    }
+
+    /// Local input for an AI slot never reaches the sim (M5b): under
+    /// `--spectate` the local slot is a bot, so whatever the UI queues is
+    /// dropped by `LocalInput` (and by `ScenarioInput`'s merge of it),
+    /// nothing is recorded and the match plays as if nobody touched it;
+    /// against a bot, the human's own commands pass.
+    #[test]
+    fn local_commands_for_an_ai_slot_are_dropped() {
+        let rules = rules();
+        let spectate = MatchSetup::bots(
+            &rules,
+            1,
+            (ai::BOT_STANDARD, "standard"),
+            (ai::BOT_STANDARD, "standard"),
+        );
+        assert!(!LocalSeat::of(&spectate).human);
+        let mut pending = PendingCommands::for_setup(&spectate);
+        assert!(pending.is_ai(LOCAL_PLAYER) && pending.is_ai(PlayerId(1)));
+        pending.push_local(Command::Stop {
+            units: vec![UnitId(1)],
+        });
+        pending.push_local(Command::Surrender);
+        assert_eq!(LocalInput.commands_for(0, &mut pending), Some(Vec::new()));
+        assert!(pending.is_empty());
+        assert_eq!(pending.dropped_for_ai(), 2);
+        pending.push_local(Command::Surrender);
+        let mut merged = ScenarioInput::new(Vec::new());
+        assert_eq!(merged.commands_for(1, &mut pending), Some(Vec::new()));
+        assert_eq!(pending.dropped_for_ai(), 3);
+
+        // Through the driver with a recorder: 40 ticks of surrenders and
+        // stops queued every tick change nothing.
+        let path = temp("spectate_drop.eonreplay");
+        let _ = std::fs::remove_file(&path);
+        let mut sim = SimHandle::from_setup(spectate.clone(), rules.clone());
+        let mut control = SimHandle::from_setup(spectate.clone(), rules.clone());
+        let mut pending = PendingCommands::for_setup(&spectate);
+        let mut rec = Recorder::spawn(&path, &spectate).unwrap();
+        let mut stats = DriverStats::default();
+        for _ in 0..40 {
+            pending.push_local(Command::Surrender);
+            pending.push_local(Command::Stop {
+                units: vec![UnitId(1)],
+            });
+            let out = drive_tick(
+                &mut sim,
+                &mut LocalInput,
+                &mut pending,
+                Some(&rec),
+                HashCadence::default(),
+                &mut stats,
+            );
+            assert!(matches!(out, TickOutcome::Stepped { .. }));
+            control.step_once();
+        }
+        rec.finish(Duration::from_secs(5)).unwrap();
+        assert_eq!(stats.commands_recorded, 0);
+        assert_eq!(pending.dropped_for_ai(), 80);
+        assert!(sim.outcome().is_none(), "the surrenders never applied");
+        assert_eq!(sim.hash(), control.hash());
+        let recorded = ReplayReader::open(&path)
+            .unwrap()
+            .records
+            .iter()
+            .filter(|r| matches!(r, Record::Tick(b) if !b.cmds.is_empty()))
+            .count();
+        assert_eq!(recorded, 0);
+        let _ = std::fs::remove_file(&path);
+
+        // Against the bot the local slot is human: its commands pass.
+        let vs = MatchSetup::vs_bot(&rules, 1, ai::BOT_STANDARD, "standard");
+        assert!(LocalSeat::of(&vs).human);
+        let mut pending = PendingCommands::for_setup(&vs);
+        assert!(!pending.is_ai(LOCAL_PLAYER) && pending.is_ai(PlayerId(1)));
+        pending.push_local(Command::Surrender);
+        assert_eq!(LocalInput.commands_for(0, &mut pending).unwrap().len(), 1);
+        assert_eq!(pending.dropped_for_ai(), 0);
+        assert!(LocalSeat::of(&MatchSetup::scenario(&rules, 1)).human);
+    }
+
+    /// The drop above, wired by the real `SimPlugin` (M5b): the plugin's
+    /// `PendingCommands` knows the match's AI slots, so under `--spectate`
+    /// a local command queued by any UI path (the Stop button and the
+    /// world input are gated, but a click can still select P0's units)
+    /// is dropped before the sim and the recorder see it, and the match
+    /// plays as if nobody touched it. Against the bot the same queue
+    /// reaches the sim and the replay.
+    #[test]
+    fn sim_plugin_drops_local_commands_for_an_ai_slot() {
+        let rules = rules();
+        let run = |setup: MatchSetup, name: &str| {
+            let path = temp(name);
+            let _ = std::fs::remove_file(&path);
+            let handle = SimHandle::from_setup(setup, rules.clone());
+            let delay = handle.setup().cmd_delay;
+            let mut app = recording_app(handle, Box::new(LocalInput), &path);
+            {
+                let pending = app.world().resource::<PendingCommands>();
+                assert!(pending.is_ai(PlayerId(1)), "P1 is a bot in both matches");
+            }
+            let mut pending = app.world_mut().resource_mut::<PendingCommands>();
+            pending.push_local(Command::Stop {
+                units: vec![UnitId(1)],
+            });
+            pending.push_local(Command::Surrender);
+            // Queued at tick 0, a command applies in the step of tick
+            // `delay`; a surrender decides the match there.
+            let tick = |app: &App| app.world().non_send::<SimHandle>().tick();
+            for _ in 0..40 {
+                if tick(&app) > delay {
+                    break;
+                }
+                app.update();
+            }
+            assert_eq!(tick(&app), delay + 1);
+            let pending = app.world().resource::<PendingCommands>();
+            let seen = (
+                pending.is_ai(LOCAL_PLAYER),
+                pending.dropped_for_ai(),
+                pending.is_empty(),
+                app.world().resource::<DriverStats>().commands_recorded,
+                app.world().non_send::<SimHandle>().outcome().is_some(),
+            );
+            app.world_mut().write_message(AppExit::Success);
+            app.update();
+            let _ = std::fs::remove_file(&path);
+            seen
+        };
+        let spectate = MatchSetup::bots(
+            &rules,
+            1,
+            (ai::BOT_STANDARD, "standard"),
+            (ai::BOT_STANDARD, "standard"),
+        );
+        assert_eq!(
+            run(spectate, "plugin_drop_spectate.eonreplay"),
+            (true, 2, true, 0, false),
+            "spectating: both commands dropped, none recorded, no surrender"
+        );
+        let vs = MatchSetup::vs_bot(&rules, 1, ai::BOT_STANDARD, "standard");
+        assert_eq!(
+            run(vs, "plugin_drop_vs_bot.eonreplay"),
+            (false, 0, true, 2, true),
+            "against the bot: both recorded, the surrender decides the match"
+        );
     }
 }

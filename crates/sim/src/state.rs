@@ -62,7 +62,7 @@
 //!      flip, then the match cap (territory) decide it, once.
 //! 7. `tick += 1`.
 
-use crate::ai_hook::{AiController, SimView};
+use crate::ai_hook::{AiController, AiMemory, SimView};
 use crate::annexation;
 use crate::attrition;
 use crate::combat;
@@ -201,7 +201,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (Surrender, Seat captured, all Towns lost and the 45-minute territory
 /// cap, with a Draw for an exact tie). The Yield Cap decay knob
 /// (`yield_cap_decay_*`, off in the shipped data).
-pub const SIM_VERSION: u32 = 16;
+///
+/// 17: M5b bots: `MatchSetup.ai_seats` (header, last field); hashed
+/// `Player::ai_memory` (`meta`); `AiController::think` receives its own
+/// memory and every other bot's is hidden; `Command::DebugAdvanceAge`.
+/// From 17 on, a `crates/ai` change that can alter a bot decision bumps
+/// this number (and, through the fixture policy, `rules_version`).
+pub const SIM_VERSION: u32 = 17;
 
 /// Who drives a player slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,15 +254,33 @@ pub struct MatchSetup {
     /// Accept [`Command::DebugSpawn`]. `false` for real matches; `true` for
     /// fixtures, benches, tests and scenarios ([`MatchSetup::scenario`]).
     pub debug_commands: bool,
-    /// What each player starts with. Last field: the header only grows at
-    /// the end, and the replay reader checks `sim_version` before decoding.
+    /// What each player starts with.
     pub start: StartKind,
+    /// Which bot drives each AI slot (M5b): exactly the `is_ai` slots, once
+    /// each, in id order ([`Sim::new`] asserts it). Last field: the header
+    /// only grows at the end, and the replay reader checks `sim_version`
+    /// before decoding.
+    pub ai_seats: Vec<AiSeat>,
+}
+
+/// The bot behind one AI slot (M5b), named in the replay header so every
+/// re-simulation rebuilds the same controller (`ai::controller_for`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSeat {
+    /// The AI slot.
+    pub player: PlayerId,
+    /// The bot: `passive` or `standard` (M6 adds `easy` and `hard`); the
+    /// difficulty id of docs/design/ai.md.
+    pub bot: String,
+    /// A `data/ai/personalities.ron` id; empty for `passive`.
+    pub personality: String,
 }
 
 impl MatchSetup {
     /// A two-player skirmish on the rules' default map from the standard
-    /// start: slot 0 is human, slot 1 is driven by the AI controller. Debug
-    /// commands are rejected.
+    /// start: slot 0 is human, slot 1 is driven by the AI controller, which
+    /// the header names `passive` (M5b; see [`MatchSetup::vs_bot`] for a
+    /// real opponent). Debug commands are rejected.
     pub fn skirmish(rules: &Rules, seed: u64) -> Self {
         Self {
             sim_version: SIM_VERSION,
@@ -279,7 +303,52 @@ impl MatchSetup {
             ],
             debug_commands: false,
             start: StartKind::Standard,
+            ai_seats: vec![AiSeat {
+                player: PlayerId(1),
+                bot: "passive".to_string(),
+                personality: String::new(),
+            }],
         }
+    }
+
+    /// A skirmish against a bot (M5b): slot 0 human, slot 1 driven by
+    /// `bot` with `personality` (empty for `passive`), the standard start,
+    /// no debug commands.
+    pub fn vs_bot(rules: &Rules, seed: u64, bot: &str, personality: &str) -> Self {
+        let mut s = MatchSetup::skirmish(rules, seed);
+        s.ai_seats = vec![AiSeat {
+            player: PlayerId(1),
+            bot: bot.to_string(),
+            personality: personality.to_string(),
+        }];
+        s
+    }
+
+    /// A bot-versus-bot match (M5b): both slots AI, slot 0 driven by
+    /// `a = (bot, personality)` and slot 1 by `b`, the standard start, no
+    /// debug commands. `sim-cli play-bots` and the game's `--spectate`.
+    pub fn bots(rules: &Rules, seed: u64, a: (&str, &str), b: (&str, &str)) -> Self {
+        let mut s = MatchSetup::skirmish(rules, seed);
+        s.players = vec![
+            PlayerSlot {
+                id: PlayerId(0),
+                is_ai: true,
+            },
+            PlayerSlot {
+                id: PlayerId(1),
+                is_ai: true,
+            },
+        ];
+        s.ai_seats = [a, b]
+            .iter()
+            .enumerate()
+            .map(|(i, (bot, personality))| AiSeat {
+                player: PlayerId(u8::try_from(i).expect("two slots")),
+                bot: (*bot).to_string(),
+                personality: (*personality).to_string(),
+            })
+            .collect();
+        s
     }
 
     /// A scripted scenario on the default map: two human slots (no AI), an
@@ -300,6 +369,7 @@ impl MatchSetup {
         ];
         s.debug_commands = true;
         s.start = StartKind::Empty;
+        s.ai_seats = Vec::new();
         s
     }
 }
@@ -315,6 +385,10 @@ pub struct Player {
     pub surrendered: bool,
     /// Next sequence number the sim stamps on this player's AI commands.
     pub next_ai_seq: u32,
+    /// The bot's memory between plans (M5b), hashed in `meta`. Empty for a
+    /// human slot. Step 2 hands it to the bot alone: while the bots think,
+    /// every player's memory reads empty in the view.
+    pub ai_memory: AiMemory,
 }
 
 /// A unit's current movement order.
@@ -1013,9 +1087,11 @@ pub struct Sim {
 impl Sim {
     /// Create a match. `ai` controls every slot with `is_ai == true`.
     /// Panics when `setup.map` is not in `rules` (the setup was built from
-    /// different rules), or when the slots are not `PlayerId(0)`,
+    /// different rules), when the slots are not `PlayerId(0)`,
     /// `PlayerId(1)`, ... in order (stockpiles and territory layers are
-    /// indexed by id).
+    /// indexed by id), or when `setup.ai_seats` does not name exactly the
+    /// `is_ai` slots, once each, in id order (M5b; `ai::controller_for`
+    /// reports the same mismatch as an error before a sim is built).
     pub fn new(setup: MatchSetup, rules: Rules, ai: Box<dyn AiController>) -> Self {
         for (i, slot) in setup.players.iter().enumerate() {
             assert_eq!(
@@ -1024,6 +1100,17 @@ impl Sim {
                 "player slots must be PlayerId(0), PlayerId(1), ... in order"
             );
         }
+        let ai_slots: Vec<PlayerId> = setup
+            .players
+            .iter()
+            .filter(|s| s.is_ai)
+            .map(|s| s.id)
+            .collect();
+        let seats: Vec<PlayerId> = setup.ai_seats.iter().map(|s| s.player).collect();
+        assert_eq!(
+            seats, ai_slots,
+            "ai_seats must name exactly the AI slots, once each, in id order"
+        );
         let players: Vec<Player> = setup
             .players
             .iter()
@@ -1032,6 +1119,7 @@ impl Sim {
                 is_ai: s.is_ai,
                 surrendered: false,
                 next_ai_seq: 0,
+                ai_memory: AiMemory::default(),
             })
             .collect();
         let def = rules
@@ -1099,17 +1187,36 @@ impl Sim {
         }
 
         // 2. Let the AI think over a read-only view, then queue its commands.
+        //    Every AI player's memory is taken out of the state first, so
+        //    no bot reads another's through `view.players()`; each thinking
+        //    bot gets its own, in id order, and every memory goes back. A
+        //    surrendered bot neither thinks nor has its memory changed.
+        let mut memories: Vec<(PlayerId, bool, AiMemory)> = self
+            .state
+            .players
+            .iter_mut()
+            .filter(|p| p.is_ai)
+            .map(|p| (p.id, !p.surrendered, std::mem::take(&mut p.ai_memory)))
+            .collect();
         let mut ai_batches: Vec<(PlayerId, Vec<Command>)> = Vec::new();
         {
             let view = SimView::new(&self.state, &self.rules, &self.setup);
-            for player in &self.state.players {
-                if player.is_ai && !player.surrendered {
-                    let out = self.ai.think(player.id, &view);
+            for (pid, thinks, memory) in &mut memories {
+                if *thinks {
+                    let out = self.ai.think(*pid, &view, memory);
                     if !out.is_empty() {
-                        ai_batches.push((player.id, out));
+                        ai_batches.push((*pid, out));
                     }
                 }
             }
+        }
+        for (pid, _, memory) in memories {
+            self.state
+                .players
+                .iter_mut()
+                .find(|p| p.id == pid)
+                .expect("ai player exists")
+                .ai_memory = memory;
         }
         for (pid, batch) in ai_batches {
             let player = self
@@ -1596,6 +1703,29 @@ impl Sim {
                     &mut self.events,
                 );
             }
+            Command::DebugAdvanceAge { owner } => {
+                if !self.setup.debug_commands {
+                    self.reject(&pc, RejectReason::DebugCommandsDisabled);
+                    return;
+                }
+                if !self.state.players.iter().any(|p| p.id == *owner) {
+                    self.reject(&pc, RejectReason::UnknownPlayer);
+                    return;
+                }
+                let age = usize::from(self.state.tech.player(*owner).age);
+                if age + 1 >= self.rules.ages.len() {
+                    self.reject(&pc, RejectReason::FinalAge);
+                    return;
+                }
+                let free = vec![0; self.rules.resources.resources.len()];
+                tech::advance(
+                    &mut self.state,
+                    &self.rules,
+                    *owner,
+                    &free,
+                    &mut self.events,
+                );
+            }
         }
     }
 
@@ -1832,13 +1962,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    struct NoAi;
-
-    impl AiController for NoAi {
-        fn think(&mut self, _player: PlayerId, _view: &SimView<'_>) -> Vec<Command> {
-            Vec::new()
-        }
-    }
+    use crate::ai_hook::NoAi;
 
     /// Step 4's `None` branch, which pathing reaches only defensively (it
     /// corrects every goal into the unit's component, so on a real map a
@@ -1988,5 +2112,280 @@ mod tests {
                 .any(|e| matches!(e, SimEvent::PathUnreachable { .. })),
             "no storm"
         );
+    }
+
+    fn data_rules() -> Rules {
+        Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap()
+    }
+
+    /// What one `think` saw: the thinking player, the tick, the memory it
+    /// was handed, and every player's memory as the view shows it.
+    type Seen = (PlayerId, u32, Vec<u8>, Vec<Vec<u8>>);
+
+    /// A bot that writes `[player + 1, tick]` into its memory on every
+    /// think and logs what it saw, and surrenders `surrender.0` at tick
+    /// `surrender.1`.
+    struct Peek {
+        log: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+        surrender: Option<(PlayerId, u32)>,
+    }
+
+    impl AiController for Peek {
+        fn think(
+            &mut self,
+            player: PlayerId,
+            view: &SimView<'_>,
+            memory: &mut AiMemory,
+        ) -> Vec<Command> {
+            let shown = view
+                .players()
+                .iter()
+                .map(|p| {
+                    assert_eq!(view.ai_memory(p.id), p.ai_memory.bytes());
+                    p.ai_memory.bytes().to_vec()
+                })
+                .collect();
+            self.log
+                .lock()
+                .unwrap()
+                .push((player, view.tick, memory.bytes().to_vec(), shown));
+            memory.set(vec![player.0 + 1, u8::try_from(view.tick % 256).unwrap()]);
+            match self.surrender {
+                Some((p, t)) if p == player && t == view.tick => vec![Command::Surrender],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    fn peek_sim(
+        surrender: Option<(PlayerId, u32)>,
+    ) -> (Sim, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+        let rules = data_rules();
+        let setup = MatchSetup::bots(&rules, 5, ("peek", ""), ("peek", ""));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bot = Peek {
+            log: log.clone(),
+            surrender,
+        };
+        (Sim::new(setup, rules, Box::new(bot)), log)
+    }
+
+    /// M5b: each bot is handed its own memory (what it wrote the tick
+    /// before), in id order, while every player's memory reads empty in
+    /// the view; after the step both memories are back in the state.
+    #[test]
+    fn bots_never_see_another_bots_memory() {
+        let (mut sim, log) = peek_sim(None);
+        for _ in 0..4 {
+            sim.step(&[]);
+        }
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 8, "two bots think every tick");
+        for (i, (player, tick, handed, shown)) in log.iter().enumerate() {
+            assert_eq!(*player, PlayerId(u8::try_from(i % 2).unwrap()), "id order");
+            assert_eq!(*tick, u32::try_from(i / 2).unwrap());
+            let own_last = if *tick == 0 {
+                Vec::new()
+            } else {
+                vec![player.0 + 1, u8::try_from(tick - 1).unwrap()]
+            };
+            assert_eq!(*handed, own_last, "the bot gets its own memory");
+            assert!(
+                shown.iter().all(Vec::is_empty),
+                "no memory is visible in the view: {shown:?}"
+            );
+        }
+        let view = sim.view();
+        assert_eq!(view.ai_memory(PlayerId(0)), &[1, 3]);
+        assert_eq!(view.ai_memory(PlayerId(1)), &[2, 3]);
+        assert_eq!(view.ai_memory(PlayerId(9)), &[] as &[u8]);
+    }
+
+    /// M5b: `Player::ai_memory` is hashed in `meta` (and only there), and a
+    /// snapshot carries it: a fresh sim restored from it, with a controller
+    /// that writes nothing, shows the same bytes and hash.
+    #[test]
+    fn ai_memory_is_hashed_in_meta_and_carried_by_snapshots() {
+        let (mut a, _) = peek_sim(None);
+        let rules = data_rules();
+        let mut b = Sim::new(
+            MatchSetup::bots(&rules, 5, ("peek", ""), ("peek", "")),
+            rules.clone(),
+            Box::new(NoAi),
+        );
+        assert_eq!(a.hash(), b.hash());
+        a.step(&[]);
+        b.step(&[]);
+        let (sa, sb) = (a.sub_hashes(), b.sub_hashes());
+        assert_eq!(sa.first_difference(&sb), Some("meta"));
+        assert_ne!(a.hash(), b.hash());
+        let only_meta = SubHashes {
+            meta: sb.meta,
+            ..sa
+        };
+        assert_eq!(only_meta, sb, "every other sub-hash is equal");
+
+        let snap = a.snapshot();
+        let mut c = Sim::new(
+            MatchSetup::bots(&rules, 5, ("peek", ""), ("peek", "")),
+            rules,
+            Box::new(NoAi),
+        );
+        c.restore(&snap).unwrap();
+        assert_eq!(c.hash(), a.hash());
+        assert_eq!(c.view().ai_memory(PlayerId(0)), &[1, 0]);
+        assert_eq!(c.view().ai_memory(PlayerId(1)), &[2, 0]);
+        // NoAi leaves the restored memories as they are.
+        c.step(&[]);
+        assert_eq!(c.view().ai_memory(PlayerId(1)), &[2, 0]);
+    }
+
+    /// M5b: a bot that has surrendered no longer thinks, and its memory is
+    /// left exactly as it last wrote it (still hashed, still readable).
+    #[test]
+    fn surrendered_bot_keeps_its_memory_and_stops_thinking() {
+        let (mut sim, log) = peek_sim(Some((PlayerId(1), 2)));
+        let delay = sim.setup().cmd_delay;
+        for _ in 0..20 {
+            sim.step(&[]);
+        }
+        let surrendered_at = 2 + delay;
+        assert!(sim.view().player(PlayerId(1)).unwrap().surrendered);
+        let log = log.lock().unwrap();
+        let p1: Vec<u32> = log
+            .iter()
+            .filter(|e| e.0 == PlayerId(1))
+            .map(|e| e.1)
+            .collect();
+        assert_eq!(p1, (0..=surrendered_at).collect::<Vec<_>>());
+        assert_eq!(log.iter().filter(|e| e.0 == PlayerId(0)).count(), 20);
+        let last = u8::try_from(surrendered_at).unwrap();
+        assert_eq!(sim.view().ai_memory(PlayerId(1)), &[2, last]);
+        assert!(
+            log.iter()
+                .filter(|e| e.1 > surrendered_at)
+                .all(|e| e.3.iter().all(Vec::is_empty)),
+            "the surrendered bot's memory is hidden from the other bot too"
+        );
+    }
+
+    /// M5b: `ai_seats` must name exactly the AI slots.
+    #[test]
+    #[should_panic(expected = "ai_seats must name exactly the AI slots")]
+    fn ai_seats_must_match_the_ai_slots() {
+        let rules = data_rules();
+        let mut setup = MatchSetup::skirmish(&rules, 1);
+        setup.ai_seats[0].player = PlayerId(0);
+        let _ = Sim::new(setup, rules, Box::new(NoAi));
+    }
+
+    /// M5b: `DebugAdvanceAge { owner }` is rejected in a match without
+    /// debug commands, then moves any existing owner one age on with no
+    /// cost and no techs, and is rejected with `UnknownPlayer` and, in the
+    /// last age, `FinalAge`.
+    #[test]
+    fn debug_advance_age_is_gated_and_skips_cost_and_techs() {
+        let rules = data_rules();
+        let rejections = |sim: &mut Sim| -> Vec<(u32, RejectReason)> {
+            sim.drain_events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    SimEvent::CommandRejected { seq, reason, .. } => Some((seq, reason)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let stamp = |seq, cmd| PlayerCommand::new(PlayerId(0), seq, cmd);
+        let adv = |owner: u8| Command::DebugAdvanceAge {
+            owner: PlayerId(owner),
+        };
+
+        let mut gated = Sim::new(
+            MatchSetup::skirmish(&rules, 1),
+            rules.clone(),
+            Box::new(NoAi),
+        );
+        let delay = gated.setup().cmd_delay;
+        gated.step(&[stamp(0, adv(0))]);
+        for _ in 0..delay {
+            gated.step(&[]);
+        }
+        assert_eq!(
+            rejections(&mut gated),
+            [(0, RejectReason::DebugCommandsDisabled)]
+        );
+        assert_eq!(gated.view().age(PlayerId(0)), 0);
+
+        let mut setup = MatchSetup::scenario(&rules, 1);
+        setup.start = StartKind::Standard;
+        let mut sim = Sim::new(setup, rules.clone(), Box::new(NoAi));
+        let stock = sim.view().economy(PlayerId(0)).stock.clone();
+        let rng = sim.sub_hashes().rng;
+        sim.step(&[
+            stamp(
+                0,
+                Command::AdvanceAge {
+                    player: PlayerId(0),
+                },
+            ),
+            stamp(1, adv(0)),
+            stamp(2, adv(1)),
+            stamp(3, adv(7)),
+        ]);
+        for _ in 0..delay {
+            sim.step(&[]);
+        }
+        let events = sim.drain_events();
+        let advanced: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, SimEvent::AgeAdvanced { .. }))
+            .collect();
+        assert_eq!(
+            advanced,
+            [
+                &SimEvent::AgeAdvanced {
+                    player: PlayerId(0),
+                    age: 1
+                },
+                &SimEvent::AgeAdvanced {
+                    player: PlayerId(1),
+                    age: 1
+                }
+            ]
+        );
+        let rejected: Vec<(u32, RejectReason)> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                SimEvent::CommandRejected { seq, reason, .. } => Some((seq, reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rejected,
+            [
+                (0, RejectReason::NotEnoughTechs),
+                (3, RejectReason::UnknownPlayer)
+            ]
+        );
+        assert_eq!(sim.view().economy(PlayerId(0)).stock, stock, "no cost");
+        assert!(sim.view().researched(PlayerId(0)).is_empty(), "no techs");
+        assert_eq!(sim.sub_hashes().rng, rng, "draws nothing");
+
+        let last = u8::try_from(rules.ages.len() - 1).unwrap();
+        let mut seq = 4;
+        while sim.view().age(PlayerId(0)) < last {
+            sim.step(&[stamp(seq, adv(0))]);
+            seq += 1;
+            for _ in 0..delay {
+                sim.step(&[]);
+            }
+        }
+        rejections(&mut sim);
+        sim.step(&[stamp(seq, adv(0))]);
+        for _ in 0..delay {
+            sim.step(&[]);
+        }
+        assert_eq!(rejections(&mut sim), [(seq, RejectReason::FinalAge)]);
+        assert_eq!(sim.view().age(PlayerId(0)), last);
     }
 }

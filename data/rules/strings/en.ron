@@ -2,7 +2,7 @@
 // file, it is not part of rules_hash, and editing it needs no rules_version
 // bump. Schema: crates/rules/src/strings.rs (deny_unknown_fields).
 // Placeholders: {resource} {unit} {building} {cost} {used} {cap} {count}
-// {rate} {name} {key} {time} {hash}; any other brace fails
+// {rate} {name} {key} {time} {hash} {seed}; any other brace fails
 // `sim-cli data-check`.
 (
   // Message line, one entry per sim RejectReason in snake case.
@@ -102,5 +102,12 @@
     "outcome.time": "{time}, tick {count}",
     "outcome.hash": "Final hash {hash}",
     "outcome.replay": "Replay {name}",
+    // M5b: the main menu on a plain launch (`menu/main_menu.rs`); {name}
+    // is the map's name.
+    "menu.title": "Eonmark",
+    "menu.opponent": "Skirmish against the Standard bot on {name}",
+    "menu.seed": "Seed {seed}",
+    "menu.new_game": "New Game",
+    "menu.quit": "Quit",
   },
 )

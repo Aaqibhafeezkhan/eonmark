@@ -5,21 +5,31 @@
 //! Which input source runs (M2 decision 2): `--scenario <name>` builds the
 //! sim from `MatchSetup::scenario` (debug commands on) and feeds a
 //! `ScenarioInput` (scripted stream + the player's commands); otherwise a
-//! skirmish with `LocalInput`. Every windowed session records a replay
-//! (decision 3) to `--replay-dir` or the platform data directory.
+//! match with `LocalInput`: since M5b against the Standard bot
+//! (`MatchSetup::vs_bot`), or, under `--spectate`, the Standard bot
+//! against itself (`MatchSetup::bots`, `m5_first_match`'s setup), on a
+//! fresh wall-clock seed unless `--seed` is given ([`match_seed`]). Every
+//! windowed session records a replay (decision 3) to `--replay-dir` or the
+//! platform data directory, from its first stepped tick (M5b).
+//!
+//! M5b states (`crate::menu`): a plain launch opens on the main menu
+//! (`AppState::Menu`); `--scenario`, `--skip-menu` and `--spectate` start in
+//! `AppState::Skirmish`. `--spectate --fast-forward-to <tick>` simulates up
+//! to that tick in [`build_match`], before the window opens.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow, WindowCloseRequested, WindowResolution};
 use rules::Rules;
-use sim::scenarios;
+use sim::{MatchSetup, scenarios};
 
 use crate::cli::{CameraStart, Cli};
 use crate::frame_stats::FrameStatsPlugin;
 use crate::hud::HudPlugin;
+use crate::menu::{MenuPlugin, initial_state};
 use crate::monitor_loss::MonitorLossPlugin;
 use crate::orders::OrdersPlugin;
 use crate::present::PresentPlugin;
@@ -44,10 +54,85 @@ pub fn load_rules(cli: &Cli) -> Option<Rules> {
     }
 }
 
-/// The sim and the input source a windowed session starts with.
+/// The personality of the Standard bot a plain launch and `--spectate`
+/// play (`data/ai/personalities.ron`).
+pub const STANDARD_PERSONALITY: &str = "standard";
+
+/// A fresh match seed from the wall clock (M5b owner decision 6): the low
+/// 32 bits of the nanoseconds since the Unix epoch ([`seed_from_unix_nanos`]).
+/// The game crate may read the clock; the sim only ever sees the seed,
+/// which the replay header records.
+pub fn fresh_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    seed_from_unix_nanos(nanos)
+}
+
+/// The seed [`fresh_seed`] takes from `nanos` since the Unix epoch: the low
+/// 32 bits, so it stays short on the menu and in the replay's name.
+pub fn seed_from_unix_nanos(nanos: u128) -> u64 {
+    u64::try_from(nanos & u128::from(u32::MAX)).unwrap_or(0)
+}
+
+/// The seed of a plain launch or `--spectate`: `--seed` when given,
+/// otherwise [`fresh_seed`].
+pub fn match_seed(cli: &Cli) -> u64 {
+    match_seed_with(cli, fresh_seed)
+}
+
+/// [`match_seed`] with the clock reading passed in: `--seed` when given,
+/// otherwise `fresh()` (tests pass a fixed reading).
+pub fn match_seed_with(cli: &Cli, fresh: impl FnOnce() -> u64) -> u64 {
+    if cli.seed_explicit { cli.seed } else { fresh() }
+}
+
+/// The setup `--spectate` watches: the Standard bot in both slots
+/// (`MatchSetup::bots`), the setup of the `m5_first_match` fixture when the
+/// seed is 1.
+pub fn spectate_setup(rules: &Rules, seed: u64) -> MatchSetup {
+    MatchSetup::bots(
+        rules,
+        seed,
+        (ai::BOT_STANDARD, STANDARD_PERSONALITY),
+        (ai::BOT_STANDARD, STANDARD_PERSONALITY),
+    )
+}
+
+/// The sim and the input source a windowed session starts with: a match
+/// against the Standard bot (a plain launch, `--skip-menu`), the Standard
+/// bot against itself (`--spectate`, fast-forwarded to
+/// `--fast-forward-to` here, printing `fast_forward: tick=<n> wall_s=<s>`),
+/// or a scenario with its scripted stream.
+///
+/// # Errors
+///
+/// An unknown scenario, or a fast-forward the outcome came before.
 pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputSource>), String> {
+    if cli.spectate {
+        let setup = spectate_setup(&rules, match_seed(cli));
+        let mut handle = SimHandle::try_from_setup(setup, rules)?;
+        if let Some(target) = cli.fast_forward_to {
+            let wall = handle.fast_forward(target)?;
+            println!(
+                "fast_forward: tick={} wall_s={:.2}",
+                handle.tick(),
+                wall.as_secs_f64()
+            );
+        }
+        return Ok((handle, Box::new(LocalInput)));
+    }
     match &cli.scenario {
-        None => Ok((SimHandle::skirmish(rules, cli.seed), Box::new(LocalInput))),
+        // M5b: a plain launch plays the Standard bot (`MatchSetup::vs_bot`).
+        None => Ok((
+            SimHandle::vs_bot(
+                rules,
+                match_seed(cli),
+                ai::BOT_STANDARD,
+                STANDARD_PERSONALITY,
+            ),
+            Box::new(LocalInput),
+        )),
         Some(name) => {
             let Some((mut setup, stream, _ticks)) = scenarios::by_name(name, &rules) else {
                 return Err(format!(
@@ -55,9 +140,8 @@ pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputS
                     scenarios::NAMES.join(", ")
                 ));
             };
-            // `--seed` overrides the scenario's own seed only when given
-            // explicitly (the default 1 would otherwise clobber it).
-            if cli.seed != Cli::default().seed {
+            // `--seed` overrides the scenario's own seed only when given.
+            if cli.seed_explicit {
                 setup.seed = cli.seed;
             }
             Ok((
@@ -231,6 +315,11 @@ pub fn run(cli: &Cli) -> AppExit {
     }
     app.insert_resource(ClearColor(palette::SKY));
     app.insert_resource(crate::economy_hud::UiStrings(strings));
+    // M5b: the main menu on a plain launch, the match at once otherwise.
+    app.insert_state(initial_state(cli));
+    app.add_plugins(MenuPlugin {
+        new_game_after: cli.new_game_after_seconds.map(Duration::from_secs_f64),
+    });
     if let Some(start) = cli
         .camera
         .or_else(|| default_framing(cli.scenario.as_deref()))
@@ -584,7 +673,12 @@ mod tests {
         use crate::camera::{ZOOM_MAX, ZOOM_MIN};
         struct NoAi;
         impl sim::AiController for NoAi {
-            fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
+            fn think(
+                &mut self,
+                _: sim::PlayerId,
+                _: &sim::SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<sim::Command> {
                 Vec::new()
             }
         }
@@ -645,7 +739,12 @@ mod tests {
     fn capture_seat_is_framed_on_the_seats_ring() {
         struct NoAi;
         impl sim::AiController for NoAi {
-            fn think(&mut self, _: sim::PlayerId, _: &sim::SimView<'_>) -> Vec<sim::Command> {
+            fn think(
+                &mut self,
+                _: sim::PlayerId,
+                _: &sim::SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<sim::Command> {
                 Vec::new()
             }
         }
@@ -680,6 +779,144 @@ mod tests {
         for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
             on_screen(centre + Vec3::new(dx, 0.0, dz) * radius, "timer circle");
         }
+    }
+
+    fn launch(args: &[&str]) -> Cli {
+        match Cli::parse(args.iter().map(|s| (*s).to_owned())) {
+            Ok(crate::cli::Parsed::Run(cli)) => cli,
+            other => panic!("{args:?}: {other:?}"),
+        }
+    }
+
+    /// M5b acceptance 4's New Game: a plain launch opens on the main menu
+    /// with a match already built for it, the local player (slot 0, human)
+    /// against the Standard bot (slot 1, personality `standard`) on
+    /// `plains_1v1` from the standard start, driven by local input, on a
+    /// fresh seed unless `--seed` is given.
+    #[test]
+    fn a_plain_launch_builds_a_match_against_the_standard_bot_on_plains_1v1() {
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let cli = launch(&[]);
+        assert_eq!(initial_state(&cli), crate::menu::AppState::Menu);
+        let (handle, input) = build_match(&cli, rules.clone()).unwrap();
+        let setup = handle.setup();
+        assert_eq!(setup.map, "plains_1v1");
+        assert_eq!(
+            setup.players,
+            vec![
+                sim::PlayerSlot {
+                    id: sim::PlayerId(0),
+                    is_ai: false
+                },
+                sim::PlayerSlot {
+                    id: sim::PlayerId(1),
+                    is_ai: true
+                },
+            ]
+        );
+        assert_eq!(
+            setup.ai_seats,
+            vec![sim::AiSeat {
+                player: sim::PlayerId(1),
+                bot: "standard".into(),
+                personality: "standard".into(),
+            }]
+        );
+        assert_eq!(setup.start, sim::StartKind::Standard);
+        assert!(!setup.debug_commands);
+        assert_eq!(input.name(), "local");
+        assert_eq!(
+            *setup,
+            MatchSetup::vs_bot(&rules, setup.seed, "standard", "standard"),
+            "exactly the vs_bot setup"
+        );
+        // `--seed` overrides the fresh seed; `--skip-menu` builds the same
+        // match without the menu.
+        let (seeded, _) = build_match(&launch(&["--seed", "7"]), rules.clone()).unwrap();
+        assert_eq!(seeded.seed(), 7);
+        let skip = launch(&["--skip-menu", "--seed", "7"]);
+        assert_eq!(initial_state(&skip), crate::menu::AppState::Skirmish);
+        let (skipped, _) = build_match(&skip, rules.clone()).unwrap();
+        assert_eq!(skipped.setup(), seeded.setup());
+        // The fresh seed is the low 32 bits of the wall clock's nanoseconds.
+        assert_eq!(seed_from_unix_nanos(0), 0);
+        assert_eq!(seed_from_unix_nanos(0x1_2345_6789), 0x2345_6789);
+        assert_eq!(
+            seed_from_unix_nanos(1_792_000_000_123_456_789),
+            1_792_000_000_123_456_789 & 0xffff_ffff
+        );
+        assert!(fresh_seed() <= u64::from(u32::MAX));
+        // Owner decision 6: without `--seed` a plain launch and `--spectate`
+        // take the clock's seed, and `--seed` (even `--seed 1`, the
+        // default's value) overrides it.
+        let clock = || 0xabcd_u64;
+        assert_eq!(match_seed_with(&cli, clock), 0xabcd);
+        assert_eq!(match_seed_with(&launch(&["--spectate"]), clock), 0xabcd);
+        assert_eq!(match_seed_with(&launch(&["--skip-menu"]), clock), 0xabcd);
+        assert_eq!(match_seed_with(&launch(&["--seed", "1"]), clock), 1);
+        assert_eq!(match_seed_with(&launch(&["--seed", "7"]), clock), 7);
+        // Through `build_match` and the real clock: two launches a whole
+        // `SimHandle` build apart read different nanoseconds, so a launch
+        // that fell back to `--seed`'s default would repeat it.
+        for args in [&[][..], &["--spectate"]] {
+            let (first, _) = build_match(&launch(args), rules.clone()).unwrap();
+            let (second, _) = build_match(&launch(args), rules.clone()).unwrap();
+            assert_ne!(
+                first.seed(),
+                second.seed(),
+                "{args:?} draws a fresh seed per launch, not --seed's default {}",
+                Cli::default().seed
+            );
+        }
+    }
+
+    /// `--scenario`, `--skip-menu` and `--spectate` start in `Skirmish`.
+    /// `--spectate --seed 1` is the `m5_first_match` fixture's setup (its
+    /// header, the informational git sha aside) with local input, and a
+    /// scenario keeps its own seed unless `--seed` is given, even `--seed 1`.
+    #[test]
+    fn scenarios_skip_menu_and_spectate_start_in_skirmish() {
+        use crate::menu::AppState;
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        for args in [
+            &["--scenario", "capture_seat"][..],
+            &["--skip-menu"],
+            &["--spectate"],
+        ] {
+            assert_eq!(initial_state(&launch(args)), AppState::Skirmish, "{args:?}");
+        }
+        let (spectated, input) =
+            build_match(&launch(&["--spectate", "--seed", "1"]), rules.clone()).unwrap();
+        assert_eq!(input.name(), "local");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sim/tests/fixtures/m5_first_match.eonreplay");
+        let mut header = sim::replay::ReplayReader::open(&fixture).unwrap().setup;
+        header.git_sha.clone_from(&spectated.setup().git_sha);
+        assert_eq!(*spectated.setup(), header, "m5_first_match's setup");
+        assert_eq!(*spectated.setup(), spectate_setup(&rules, 1));
+        assert!(spectated.setup().players.iter().all(|p| p.is_ai));
+        // A fast-forward runs before the window opens.
+        let (forwarded, _) = build_match(
+            &launch(&["--spectate", "--seed", "1", "--fast-forward-to", "40"]),
+            rules.clone(),
+        )
+        .unwrap();
+        assert_eq!(forwarded.tick(), 40);
+        // A scenario's own seed stays unless --seed is explicit.
+        let (own, _) =
+            build_match(&launch(&["--scenario", "capture_seat"]), rules.clone()).unwrap();
+        let (one, _) = build_match(
+            &launch(&["--scenario", "capture_seat", "--seed", "1"]),
+            rules.clone(),
+        )
+        .unwrap();
+        assert_ne!(own.seed(), 1, "capture_seat has its own seed");
+        assert_eq!(one.seed(), 1);
+        assert!(build_match(&launch(&["--scenario", "nope"]), rules).is_err());
     }
 
     #[test]

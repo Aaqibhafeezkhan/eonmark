@@ -135,7 +135,15 @@ fn run_replay(cli: &Cli, path: &Path) -> AppExit {
     if let Some(warning) = input.truncation_warning() {
         eprintln!("{warning}");
     }
-    let handle = SimHandle::from_setup(setup, rules);
+    // The header's own bots (M5b), as `sim-cli verify` builds them; an
+    // unknown bot or personality is an error like any unreadable header.
+    let handle = match SimHandle::try_from_setup(setup, rules) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return AppExit::from_code(2);
+        }
+    };
 
     let mut app = App::new();
     app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::ZERO)));

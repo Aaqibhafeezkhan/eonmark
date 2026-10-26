@@ -2,12 +2,14 @@
 //!
 //! Runs on any OS without a GPU. M0 implemented `selftest`, `data-check` and
 //! the scripted `hash-dump`; M1 adds `verify`, `bench`, `fuzz`, `record` and
-//! the replay form of `hash-dump`; `play-bots` arrives in M5b.
+//! the replay form of `hash-dump`; M5b adds `play-bots` and builds every
+//! replay's bots from its header (`ai::controller_for`).
 //!
 //! Wall-clock timing (`std::time::Instant`) is allowed here and banned in
 //! `sim`, `rules` and `ai`: this crate measures the sim, it is not part of it.
 #![forbid(unsafe_code)]
 
+mod play_bots;
 mod scenarios;
 
 use clap::{Parser, Subcommand};
@@ -79,7 +81,8 @@ enum Cmd {
     /// saturated A* budget, or territory recompute.
     Bench {
         /// Units to spawn and move (--combat: both sides together, four kinds
-        /// a side, rounded down to a multiple of 8).
+        /// a side, rounded down to a multiple of 8; --bots: both sides
+        /// together, the standard start's Yeomen included).
         #[arg(long, default_value_t = 500)]
         units: u16,
         /// Ticks to simulate.
@@ -100,6 +103,12 @@ enum Cmd {
         /// attack-moves a Supply Wain with its army.
         #[arg(long, requires = "combat")]
         harrying: bool,
+        /// Benchmark the Standard bot (M5b): --units split into two Standard
+        /// seats at Masonry with grants, half at the rally and half on the
+        /// enemy's land; reports the time inside the bots' `think` per tick
+        /// against a Passive control run.
+        #[arg(long, conflicts_with_all = ["astar", "territory", "combat"])]
+        bots: bool,
         /// Border sources placed before the timed edits (--territory).
         #[arg(long, default_value_t = 16)]
         sources: u32,
@@ -139,17 +148,19 @@ enum Cmd {
         #[arg(long)]
         scenario: String,
         /// Ticks to simulate (default: the scenario's fixture length;
-        /// `capture_seat` stops at the step that decides the match).
+        /// `capture_seat` and `m5_first_match` stop at the step that
+        /// decides the match).
         #[arg(long)]
         ticks: Option<u32>,
         /// Output file.
         #[arg(long)]
         out: PathBuf,
-        /// Write a hash record every tick instead of every 20.
+        /// Write a hash record every tick instead of at the scenario's
+        /// cadence.
         #[arg(long, conflicts_with = "hash_every")]
         hash_every_tick: bool,
         /// Write a hash record every N ticks (default: the scenario's own,
-        /// 1000 for `stalemate_45min`, else 20).
+        /// 1000 for `stalemate_45min`, 100 for `m5_first_match`, else 20).
         #[arg(long)]
         hash_every: Option<u32>,
         /// Match seed (default: the scenario's own seed; fixtures must keep it).
@@ -160,8 +171,10 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         slow_ms: u64,
     },
-    /// Run seeded bot-vs-bot matches in parallel (M5b).
-    PlayBots,
+    /// Run seeded bot-vs-bot matches in parallel and print one CSV row per
+    /// game (M5b): exit 1 when a game ends without a winner (unless
+    /// --allow-undecided) or panics, 2 on usage, rules or bot-id errors.
+    PlayBots(play_bots::PlayBotsArgs),
 }
 
 fn main() -> ExitCode {
@@ -189,6 +202,13 @@ fn main() -> ExitCode {
             seed,
             ..
         } => bench_combat(&cli.data, units, ticks, seed, harrying),
+        Cmd::Bench {
+            bots: true,
+            units,
+            ticks,
+            seed,
+            ..
+        } => bench_bots(&cli.data, units, ticks, seed),
         Cmd::Bench {
             territory: true,
             sources,
@@ -233,18 +253,13 @@ fn main() -> ExitCode {
             seed,
             slow_ms,
         ),
-        Cmd::PlayBots => not_yet("play-bots", "M5b"),
+        Cmd::PlayBots(args) => play_bots::run(&cli.data, &args),
     }
 }
 
 /// Exit status for a failure that is neither a verify outcome nor success:
 /// unreadable files, unloadable rules, unknown scenario names.
 const EXIT_ERROR: u8 = 2;
-
-fn not_yet(name: &str, milestone: &str) -> ExitCode {
-    eprintln!("{name}: not implemented until {milestone}");
-    ExitCode::from(EXIT_ERROR)
-}
 
 fn load_rules(data: &Path) -> Result<Rules, ExitCode> {
     Rules::load(data).map_err(|e| {
@@ -300,7 +315,7 @@ fn data_check(dir: &Path) -> ExitCode {
     match Rules::load(dir).and_then(|r| Ok((r, rules::strings::Strings::load(dir, "en")?))) {
         Ok((r, _strings)) => {
             println!(
-                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} ages={} techs={} side_techs={} factions={} maps={} strings=en",
+                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} ages={} techs={} side_techs={} factions={} personalities={} build_orders={} maps={} strings=en",
                 r.rules_version,
                 r.rules_hash(),
                 r.resources.resources.len(),
@@ -310,6 +325,8 @@ fn data_check(dir: &Path) -> ExitCode {
                 r.counting_techs(),
                 r.techs.len() - r.counting_techs(),
                 r.factions.len(),
+                r.ai.personalities.len(),
+                r.ai.build_orders.len(),
                 r.maps.keys().cloned().collect::<Vec<_>>().join(",")
             );
             ExitCode::SUCCESS
@@ -341,40 +358,36 @@ fn hash_dump(data: &Path, ticks: u32, seed: u64) -> ExitCode {
 // M1: verify, hash-dump <replay>, record, bench, fuzz
 // ---------------------------------------------------------------------------
 
-/// The controller that drives AI slots during a re-simulation, plus the
-/// warnings a re-simulation prints on stderr before its result. M1 replays
-/// are scenario recordings with two human slots; a header with an AI slot is
-/// driven by `ai::Passive` with a warning until the header names a bot (M5b).
-/// A file without the clean-exit trailer (a recording killed mid-match) is
-/// re-simulated up to its last complete record with a warning; the OK line
-/// itself is unchanged so CI's `^OK` grep and hash-parity diff still apply.
-fn replay_controller(replay: &Path) -> Box<dyn sim::AiController> {
+/// The warning a re-simulation prints on stderr before its result: a file
+/// without the clean-exit trailer (a recording killed mid-match) is
+/// re-simulated up to its last complete record; the OK line itself is
+/// unchanged so CI's `^OK` grep and hash-parity diff still apply.
+fn warn_if_truncated(replay: &Path) {
     if let Ok(ReplayFile {
-        setup,
-        truncated,
+        truncated: true,
         undecoded_bytes,
         records,
+        ..
     }) = ReplayReader::open(replay)
     {
-        if setup.players.iter().any(|p| p.is_ai) {
-            eprintln!(
-                "warning: {} has AI slots; they are driven by ai::Passive (bot ids in the header arrive in M5b)",
-                replay.display()
-            );
-        }
-        if truncated {
-            eprintln!(
-                "warning: {} has no clean-exit trailer (recording was cut); checking {} complete records, {undecoded_bytes} trailing bytes dropped",
-                replay.display(),
-                records.len()
-            );
-        }
+        eprintln!(
+            "warning: {} has no clean-exit trailer (recording was cut); checking {} complete records, {undecoded_bytes} trailing bytes dropped",
+            replay.display(),
+            records.len()
+        );
     }
-    Box::new(ai::Passive)
+}
+
+/// The controller factory of every re-simulation: the header's own bots
+/// (M5b), built after the version and rules checks. An unknown bot or
+/// personality is `ReplayError::Controller` (exit 2).
+fn header_bots(setup: &MatchSetup, rules: &Rules) -> Result<Box<dyn sim::AiController>, String> {
+    ai::controller_for(setup, rules).map_err(|e| e.to_string())
 }
 
 fn verify(data: &Path, replay: &Path) -> ExitCode {
-    match sim::verify(replay, data, replay_controller(replay)) {
+    warn_if_truncated(replay);
+    match sim::verify_with(replay, data, Box::new(header_bots)) {
         Ok(outcome) => {
             println!("{outcome}");
             ExitCode::from(outcome.exit_code())
@@ -398,14 +411,20 @@ fn hash_dump_line(tick: u32, hash: u64, sub: &SubHashes) -> String {
 
 fn hash_dump_replay(data: &Path, replay: &Path, every: u32) -> ExitCode {
     use std::io::Write;
-    let ai = replay_controller(replay);
+    warn_if_truncated(replay);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    let result = sim::replay::hash_dump(replay, data, ai, every, |tick, hash, sub| {
-        // `hash-dump ... | head` closes the pipe early; that is not an error.
-        if writeln!(out, "{}", hash_dump_line(tick, hash, sub)).is_err() {
-            std::process::exit(0);
-        }
-    });
+    let result = sim::replay::hash_dump_with(
+        replay,
+        data,
+        Box::new(header_bots),
+        every,
+        |tick, hash, sub| {
+            // `hash-dump ... | head` closes the pipe early; that is not an error.
+            if writeln!(out, "{}", hash_dump_line(tick, hash, sub)).is_err() {
+                std::process::exit(0);
+            }
+        },
+    );
     if out.flush().is_err() {
         return ExitCode::SUCCESS;
     }
@@ -1213,6 +1232,218 @@ fn bench_combat(data: &Path, units: u16, ticks: u32, seed: u64, harrying: bool) 
     ExitCode::SUCCESS
 }
 
+/// One `think` call the `bench --bots` controller timed.
+#[derive(Debug, Clone, Copy)]
+struct ThinkCall {
+    /// The tick planned for.
+    tick: u32,
+    /// Whether the call was a plan (the bot's cadence), not an early
+    /// return.
+    plan: bool,
+    /// Nanoseconds inside the bot.
+    ns: u64,
+    /// Commands returned.
+    commands: usize,
+}
+
+/// A controller that times every `think` of the controller it wraps (the
+/// header's bots) and records each call (wall-clock timing is allowed in
+/// sim-cli only).
+struct ThinkTimer {
+    inner: Box<dyn sim::AiController>,
+    every: u32,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<ThinkCall>>>,
+}
+
+impl sim::AiController for ThinkTimer {
+    fn think(
+        &mut self,
+        p: PlayerId,
+        view: &SimView<'_>,
+        memory: &mut sim::AiMemory,
+    ) -> Vec<sim::Command> {
+        let start = Instant::now();
+        let out = self.inner.think(p, view, memory);
+        let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let plan = view.tick % self.every == ai::standard::phase(p, self.every, view.setup());
+        self.calls
+            .lock()
+            .expect("the bench's call log")
+            .push(ThinkCall {
+                tick: view.tick,
+                plan,
+                ns,
+                commands: out.len(),
+            });
+        out
+    }
+}
+
+/// `bench --bots` exits 1 when the bots planned fewer times than this.
+const BOTS_MIN_PLANS: usize = 200;
+/// ... or launched fewer waves than this (both seats together) ...
+const BOTS_MIN_WAVES: u32 = 2;
+/// ... or neither seat defended (a defence released or running).
+const BOTS_MIN_DEFENDS: u32 = 1;
+
+/// What `bench --bots` measured.
+struct BotsBench {
+    /// Milliseconds inside the bots' `think` per tick (both seats).
+    ai_ms: Vec<f64>,
+    /// Plans (on-cadence calls) made.
+    plans: usize,
+    /// The slowest single plan, in milliseconds.
+    plan_ms_max: f64,
+    /// Commands the bots returned.
+    commands: usize,
+    /// Milliseconds per whole step (sim and bots).
+    step_ms: Vec<f64>,
+    /// Milliseconds per whole step of the control run (Passive seats).
+    control_step_ms: Vec<f64>,
+    /// Waves launched, both seats.
+    waves_launched: u32,
+    /// Defences released, both seats.
+    defends: u32,
+    /// Seats defending at the end.
+    engaged: u32,
+    /// Commands rejected, both seats.
+    rejected: u32,
+    /// The most outstanding path requests after any step.
+    path_queue_max: usize,
+    /// Hash after the last tick of the bot run.
+    final_hash: u64,
+}
+
+/// Run [`scenarios::bots_bench`] for `ticks` ticks with the Standard bots,
+/// timing every `think` and every step, then the same stream with Passive
+/// seats for the control step time.
+fn run_bots_bench(rules: &Rules, units: u16, ticks: u32, seed: u64) -> BotsBench {
+    let (setup, stream) = scenarios::bots_bench(rules, units, seed, true);
+    let every = rules
+        .ai
+        .personality("standard")
+        .expect("the standard personality")
+        .think_every_ticks(rules)
+        .max(1);
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let controller = Box::new(ThinkTimer {
+        inner: ai::controller_for(&setup, rules).expect("the bench's bots are known"),
+        every,
+        calls: calls.clone(),
+    });
+    let mut sim = Sim::new(setup, rules.clone(), controller);
+    let mut b = BotsBench {
+        ai_ms: Vec::new(),
+        plans: 0,
+        plan_ms_max: 0.0,
+        commands: 0,
+        step_ms: Vec::with_capacity(ticks as usize),
+        control_step_ms: Vec::with_capacity(ticks as usize),
+        waves_launched: 0,
+        defends: 0,
+        engaged: 0,
+        rejected: 0,
+        path_queue_max: 0,
+        final_hash: 0,
+    };
+    for t in 0..ticks {
+        let cmds = sim::scenarios::commands_at(&stream, t);
+        let start = Instant::now();
+        sim.step(cmds);
+        b.step_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        for e in sim.drain_events() {
+            if let SimEvent::CommandRejected { .. } = e {
+                b.rejected += 1;
+            }
+        }
+        b.path_queue_max = b.path_queue_max.max(sim.view().pathing().outstanding());
+    }
+    let calls = calls.lock().expect("the bench's call log");
+    let mut per_tick = vec![0u64; ticks as usize];
+    for c in calls.iter() {
+        if let Some(slot) = per_tick.get_mut(c.tick as usize) {
+            *slot = slot.saturating_add(c.ns);
+        }
+        b.commands += c.commands;
+        if c.plan {
+            b.plans += 1;
+            b.plan_ms_max = b.plan_ms_max.max(c.ns as f64 / 1e6);
+        }
+    }
+    b.ai_ms = per_tick.iter().map(|ns| *ns as f64 / 1e6).collect();
+    let view = sim.view();
+    for p in [PlayerId(0), PlayerId(1)] {
+        let s = ai::standard::stats(view.ai_memory(p));
+        b.waves_launched += u32::from(s.waves_launched);
+        b.defends += u32::from(s.defends);
+        b.engaged += u32::from(s.defending);
+    }
+    b.final_hash = sim.hash();
+    let (setup, stream) = scenarios::bots_bench(rules, units, seed, false);
+    let mut control = scenarios::build(&setup, rules);
+    for t in 0..ticks {
+        let cmds = sim::scenarios::commands_at(&stream, t);
+        let start = Instant::now();
+        control.step(cmds);
+        b.control_step_ms
+            .push(start.elapsed().as_secs_f64() * 1000.0);
+        control.drain_events();
+    }
+    b
+}
+
+/// The `bench --bots` report, one line per entry.
+fn bots_bench_report(b: &BotsBench, units: u16, ticks: u32, seed: u64) -> Vec<String> {
+    let (ai_mean, ai_p95, ai_max) = stats_ms(&b.ai_ms);
+    let (mean, p95, max) = stats_ms(&b.step_ms);
+    let (control, _, _) = stats_ms(&b.control_step_ms);
+    vec![
+        format!("bench bots units={units} ticks={ticks} seed={seed}"),
+        format!(
+            "ai_ms mean={ai_mean:.4} p95={ai_p95:.4} max={ai_max:.4} plans={} plan_ms_max={:.4} commands={}",
+            b.plans, b.plan_ms_max, b.commands
+        ),
+        format!("step_ms mean={mean:.3} p95={p95:.3} max={max:.3}"),
+        format!("control_step_ms mean={control:.3}"),
+        format!(
+            "waves_launched={} defends={} engaged={} rejected={} path_queue_max={} final_hash=0x{:016x}",
+            b.waves_launched, b.defends, b.engaged, b.rejected, b.path_queue_max, b.final_hash
+        ),
+    ]
+}
+
+/// `bench --bots` (M5b): the time the Standard bots add per tick, read
+/// against ROADMAP M5b's "< 0.5 ms mean per tick" from the `ai_ms mean`
+/// line (the time inside `think` alone, so the cost of the behaviour the
+/// bots cause is not mixed in: `step_ms` against `control_step_ms` shows
+/// that). Exits 1 when the bots were not exercised (fewer than
+/// [`BOTS_MIN_PLANS`] plans, [`BOTS_MIN_WAVES`] waves or
+/// [`BOTS_MIN_DEFENDS`] defences), never on the timing budget, like the
+/// other benches.
+fn bench_bots(data: &Path, units: u16, ticks: u32, seed: u64) -> ExitCode {
+    let rules = match load_rules(data) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let b = run_bots_bench(&rules, units, ticks, seed);
+    for line in bots_bench_report(&b, units, ticks, seed) {
+        println!("{line}");
+    }
+    if b.plans < BOTS_MIN_PLANS
+        || b.waves_launched < BOTS_MIN_WAVES
+        || b.defends + b.engaged < BOTS_MIN_DEFENDS
+    {
+        eprintln!(
+            "bench bots: plans={} waves_launched={} defends+engaged={}: the bots were not exercised (need {BOTS_MIN_PLANS} plans, {BOTS_MIN_WAVES} waves, {BOTS_MIN_DEFENDS} defence)",
+            b.plans,
+            b.waves_launched,
+            b.defends + b.engaged
+        );
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 /// What one fuzz case observed.
 struct FuzzCase {
     commands: usize,
@@ -1494,8 +1725,9 @@ mod tests {
     }
 
     /// M5a: `--hash-every N` parses, conflicts with `--hash-every-tick`,
-    /// and the scenarios' own cadence is 1000 for `stalemate_45min` and the
-    /// replay default otherwise; only `capture_seat` stops at its outcome.
+    /// and the scenarios' own cadence is 1000 for `stalemate_45min`, 100
+    /// for `m5_first_match` and the replay default otherwise;
+    /// `capture_seat` and `m5_first_match` stop at their outcome.
     #[test]
     fn record_hash_every_flag_and_scenario_defaults() {
         let cli = Cli::try_parse_from([
@@ -1543,6 +1775,11 @@ mod tests {
         );
         let rules = Rules::load(data()).unwrap();
         assert_eq!(stalemate.default_ticks(&rules), rules.match_cap_ticks());
+        let first = Scenario::parse("m5_first_match").unwrap();
+        assert_eq!(first, Scenario::FirstMatch);
+        assert_eq!(first.default_hash_every(), 100);
+        assert!(first.stops_at_outcome());
+        assert_eq!(first.default_ticks(&rules), rules.match_cap_ticks());
     }
 
     /// `capture_seat` records up to the step that decides the match and
@@ -1824,6 +2061,71 @@ mod tests {
         assert!(report[3].contains(" deaths_p0=") && report[3].contains(" destroyed=0"));
         // Exit 1 only for too few fighting ticks: 50 ticks cannot hold 100.
         assert_eq!(bench_combat(&data(), 40, 50, 1, false), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn cli_parses_bench_bots_flags() {
+        let cli = Cli::try_parse_from([
+            "sim-cli", "bench", "--units", "400", "--ticks", "1200", "--bots",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Bench {
+                bots: true,
+                combat: false,
+                units: 400,
+                ticks: 1200,
+                seed: 1,
+                ..
+            }
+        ));
+        for other in ["--astar", "--territory", "--combat"] {
+            assert!(Cli::try_parse_from(["sim-cli", "bench", "--bots", other]).is_err());
+        }
+    }
+
+    /// `bench --bots` at its acceptance size for 60 ticks: 200 units a
+    /// side, the report's lines, both seats plan every 10 ticks and both
+    /// defend at once against the other side's forward half (which holds
+    /// their launches, `defend_max_block_ds`); the run repeats exactly, and
+    /// 60 ticks are too few plans to pass the exercise gate. (The 1200-tick
+    /// acceptance run launches both waves once the defences end.)
+    #[test]
+    fn bench_bots_reports_ai_time_and_exercises_waves() {
+        let rules = load_rules(&data()).unwrap();
+        let (setup, stream) = scenarios::bots_bench(&rules, 400, 1, true);
+        let mut sim = scenarios::build(&setup, &rules);
+        sim.step(sim::scenarios::commands_at(&stream, 0));
+        for _ in 0..setup.cmd_delay {
+            sim.step(&[]);
+        }
+        let view = sim.view();
+        for p in [PlayerId(0), PlayerId(1)] {
+            assert_eq!(view.units().filter(|u| u.owner == p).count(), 200, "{p:?}");
+        }
+        let b = run_bots_bench(&rules, 400, 60, 1);
+        assert_eq!((b.step_ms.len(), b.control_step_ms.len()), (60, 60));
+        assert_eq!(b.ai_ms.len(), 60);
+        assert_eq!(b.plans, 12, "every 10 ticks, two seats");
+        assert!(b.commands > 0);
+        assert_eq!((b.waves_launched, b.engaged), (0, 2));
+        assert_eq!(run_bots_bench(&rules, 400, 60, 1).final_hash, b.final_hash);
+        let report = bots_bench_report(&b, 400, 60, 1);
+        let prefixes = [
+            "bench bots units=400 ticks=60 seed=1",
+            "ai_ms mean=",
+            "step_ms mean=",
+            "control_step_ms mean=",
+            "waves_launched=0 defends=0 engaged=2 ",
+        ];
+        assert_eq!(report.len(), prefixes.len());
+        for (line, prefix) in report.iter().zip(prefixes) {
+            assert!(line.starts_with(prefix), "{line}");
+        }
+        assert!(report[1].contains(" plans=12 ") && report[1].contains(" plan_ms_max="));
+        assert!(report[4].contains(" path_queue_max=") && report[4].contains(" final_hash=0x"));
+        assert_eq!(bench_bots(&data(), 400, 60, 1), ExitCode::FAILURE);
     }
 
     #[test]

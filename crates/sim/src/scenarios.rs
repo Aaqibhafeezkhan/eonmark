@@ -1983,7 +1983,12 @@ pub fn commands_at(stream: &Stream, tick: u32) -> &[PlayerCommand] {
 struct NoSlots;
 
 impl AiController for NoSlots {
-    fn think(&mut self, _player: PlayerId, _view: &SimView<'_>) -> Vec<Command> {
+    fn think(
+        &mut self,
+        _player: PlayerId,
+        _view: &SimView<'_>,
+        _memory: &mut crate::ai_hook::AiMemory,
+    ) -> Vec<Command> {
         Vec::new()
     }
 }

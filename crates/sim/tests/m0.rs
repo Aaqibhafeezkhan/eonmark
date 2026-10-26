@@ -42,7 +42,12 @@ fn human_commands(tick: u32) -> Vec<PlayerCommand> {
 struct TestBot;
 
 impl AiController for TestBot {
-    fn think(&mut self, _player: PlayerId, view: &SimView<'_>) -> Vec<Command> {
+    fn think(
+        &mut self,
+        _player: PlayerId,
+        view: &SimView<'_>,
+        _memory: &mut sim::AiMemory,
+    ) -> Vec<Command> {
         let mut out = Vec::new();
         if view.tick % 10 == 3 {
             out.push(Command::Stop {

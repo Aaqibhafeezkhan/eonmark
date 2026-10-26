@@ -60,7 +60,7 @@ pub mod town;
 pub mod training;
 pub mod victory;
 
-pub use ai_hook::{AiController, SimView};
+pub use ai_hook::{AI_MEMORY_GUIDE_BYTES, AiController, AiMemory, NoAi, SimView};
 pub use annexation::AnnexView;
 pub use attrition::Exposure;
 pub use combat::{AttackStats, Engage, UnitStats};
@@ -73,10 +73,12 @@ pub use ids::{
 pub use map::Map;
 pub use movement::SpatialGrid;
 pub use pathing::{AStarSearch, PathRequest, Pathing, SearchStatus};
-pub use replay::{ReplayError, ReplayFile, ReplayReader, ReplayWriter, VerifyOutcome, verify};
+pub use replay::{
+    ReplayError, ReplayFile, ReplayReader, ReplayWriter, VerifyOutcome, verify, verify_with,
+};
 pub use rules::Rules;
 pub use state::{
-    Building, Construction, Hold, Intent, Job, MatchResult, MatchSetup, MoveOrder, Outcome,
+    AiSeat, Building, Construction, Hold, Intent, Job, MatchResult, MatchSetup, MoveOrder, Outcome,
     OutcomeReason, Player, PlayerSlot, Post, QueueEntry, QueueItem, RejectReason, SIM_VERSION, Sim,
     SimEvent, SnapshotError, StartKind, SubHashes, TownState, Unit,
 };

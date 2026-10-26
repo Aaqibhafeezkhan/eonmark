@@ -21,7 +21,9 @@ reads these files; it never defines gameplay constants of its own.
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
 | `rules/strings/en.ron` | UI strings: the message line's text for every command rejection, HUD labels and tooltips. Presentation only, outside `rules_hash` (see `crates/rules/src/strings.rs`) | written | M3b |
 | `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere \| Cone)` and, from M4b, `Body(shape, height_tiles_x100, lying)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear | `crates/rules/src/visuals.rs` (`Visuals`) | M2, M4b |
-| `ai/` | Build orders, personalities, difficulty table | not yet written | M5b |
+| `ai/personalities.ron` | One row per bot personality: its build order and every knob of the bot (cadence, caps, site policies, army mix, waves, defence and recall); M5b ships `standard`. Loaded last by `Rules::load`, attached as `Rules::ai` and in `rules_hash`, so an edit needs a `rules_version` bump | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
+| `ai/build_orders/*.ron` | One build order per file, its `id` equal to the file stem; M5b ships `standard.ron`. In `rules_hash` like the personalities | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
+| `ai/difficulty.ron` | Easy, Standard, Hard: income interval and aggression | not yet written | M6 |
 
 Each subdirectory has its own README with the schema in plain English and a
 worked example: [rules/README.md](rules/README.md),

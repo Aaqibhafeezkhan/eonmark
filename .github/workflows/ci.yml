@@ -95,16 +95,18 @@ jobs:
           cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay | tail -n 1 | tee hash-macos.txt
           grep -q '^tick=1200 hash=0x[0-9a-f]\{16\}$' hash-macos.txt
 
-      - name: verify golden fixtures move_500, combat_skirmish, enemy_outpost_walkthrough, capture_seat and stalemate_45min (release)
+      - name: verify golden fixtures move_500, combat_skirmish, enemy_outpost_walkthrough, capture_seat, stalemate_45min and m5_first_match (release)
         # The same commands run in the headless job on Linux; hash-parity
         # diffs each pair of `OK final_hash=...` lines (combat_skirmish puts
         # acquisition, shooters, hits and destruction under the parity
         # check; capture_seat (M5a) attrition, annexation and the outcome;
         # stalemate_45min (M5a) 54000 ticks of income and the territory
-        # cap). enemy_outpost_walkthrough (M4b: a 200 vs 200 prologue, then
-        # the line-1 build-up and siege) is verified on both OSes against
-        # the hashes recorded in it. `verify` exits 1 on any other outcome
-        # and pipefail propagates it through grep and tee.
+        # cap; m5_first_match (M5b) the Standard bot in both seats, rebuilt
+        # from the header, to its Seat capture). enemy_outpost_walkthrough
+        # (M4b: a 200 vs 200 prologue, then the line-1 build-up and siege)
+        # is verified on both OSes against the hashes recorded in it.
+        # `verify` exits 1 on any other outcome and pipefail propagates it
+        # through grep and tee.
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-macos-fixture.txt
           test -s hash-macos-fixture.txt
@@ -115,6 +117,8 @@ jobs:
           test -s hash-macos-capture-seat.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/stalemate_45min.eonreplay | grep '^OK' | tee hash-macos-stalemate.txt
           test -s hash-macos-stalemate.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/m5_first_match.eonreplay | grep '^OK' | tee hash-macos-m5.txt
+          test -s hash-macos-m5.txt
 
       - uses: actions/upload-artifact@v7
         with:
@@ -125,6 +129,7 @@ jobs:
             hash-macos-combat.txt
             hash-macos-capture-seat.txt
             hash-macos-stalemate.txt
+            hash-macos-m5.txt
           if-no-files-found: error
 
   headless:
@@ -173,7 +178,7 @@ jobs:
         # only their `OK final_hash=...` lines are kept so the diffs are
         # clean; `verify` exits 1 on any other outcome and pipefail
         # propagates it.
-        # M5b: `cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --jobs 2`
+        # m5_first_match (M5b) is the bot-match parity fixture.
         run: |
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/move_500.eonreplay | grep '^OK' | tee hash-linux-fixture.txt
           test -s hash-linux-fixture.txt
@@ -188,6 +193,41 @@ jobs:
           test -s hash-linux-capture-seat.txt
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/stalemate_45min.eonreplay | grep '^OK' | tee hash-linux-stalemate.txt
           test -s hash-linux-stalemate.txt
+          cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/m5_first_match.eonreplay | grep '^OK' | tee hash-linux-m5.txt
+          test -s hash-linux-m5.txt
+
+      - name: M5b acceptance 1 (Standard vs Standard, five seeds, twice)
+        # ROADMAP M5b line 1: the literal play-bots command twice. Exit 0
+        # already means a declared winner in every game (no draw, no
+        # undecided game, no panic); the two CSVs (which hold no wall time)
+        # must be identical, every winner must be a or b, and seed 1's final
+        # hash must be the m5_first_match golden's. The stderr summary
+        # (wall_s, decisive and tiebreak counts) is in the log.
+        run: |
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --a standard --b standard --max-ticks 54000 --jobs 5 | tee m5b-run1.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --a standard --b standard --max-ticks 54000 --jobs 5 > m5b-run2.csv
+          diff m5b-run1.csv m5b-run2.csv
+          if awk -F, 'NR>1 && $2!="a" && $2!="b"' m5b-run1.csv | grep -q .; then
+            echo "::error::a Standard-vs-Standard game has no declared winner"; exit 1
+          fi
+          test "$(awk -F, '$1==1{print $5}' m5b-run1.csv)" = "$(cat crates/sim/tests/fixtures/m5_first_match.hash)"
+
+      - name: M5b acceptance 2 (the first wave against Passive, from either side)
+        # ROADMAP M5b line 2 through scripts/check_first_wave.sh with
+        # --decisive: owner decision 4's Seat capture from either side, plus
+        # the plan's extra gates from the ROADMAP M5b Goal (the second Town
+        # and the Watchtower before tick 18000), for the Standard bot as
+        # player a and, swapped, as player b (the New Game seat).
+        run: |
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --a standard --b passive --max-ticks 36000 | tee m5b-wave-a.csv
+          scripts/check_first_wave.sh --decisive m5b-wave-a.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --a passive --b standard --max-ticks 36000 | tee m5b-wave-b.csv
+          scripts/check_first_wave.sh --side b --decisive m5b-wave-b.csv
+
+      - name: ignored M5b bot tests (long games)
+        # The m5b_ filter leaves out golden_m5_first_match, which the
+        # release verify above covers. `ai` is opt-level 3 in dev.
+        run: cargo test -p ai --locked -- --ignored m5b_
 
       - name: engine boundary (no bevy/glam/wgpu/winit in engine-free crates)
         run: |
@@ -227,6 +267,12 @@ jobs:
         # if its final hash matches the recorded one.
         run: cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/enemy_outpost_walkthrough.eonreplay | tail -n 1
 
+      - name: headless replay (m5_first_match fixture)
+        # M5b: the game builds the two Standard bots from the header and
+        # re-simulates the first match to its Seat capture; it exits 0 only
+        # if its final hash matches the recorded one.
+        run: cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/m5_first_match.eonreplay | tail -n 1
+
       - uses: actions/upload-artifact@v7
         with:
           name: hash-linux
@@ -236,6 +282,7 @@ jobs:
             hash-linux-combat.txt
             hash-linux-capture-seat.txt
             hash-linux-stalemate.txt
+            hash-linux-m5.txt
           if-no-files-found: error
 
   game-linux:
@@ -360,3 +407,13 @@ jobs:
           test -s hashes/macos/hash-macos-stalemate.txt
           test -s hashes/linux/hash-linux-stalemate.txt
           diff hashes/macos/hash-macos-stalemate.txt hashes/linux/hash-linux-stalemate.txt
+
+      - name: compare golden fixture m5_first_match
+        # The M5b first-match golden (two Standard bots to the Seat
+        # capture), verified the same way on each OS.
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos-m5.txt
+          echo "Linux:"; cat hashes/linux/hash-linux-m5.txt
+          test -s hashes/macos/hash-macos-m5.txt
+          test -s hashes/linux/hash-linux-m5.txt
+          diff hashes/macos/hash-macos-m5.txt hashes/linux/hash-linux-m5.txt

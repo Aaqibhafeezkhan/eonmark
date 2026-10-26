@@ -337,6 +337,63 @@ mod tests {
         assert_eq!(overlay_texts(&unrecorded, p0, &view, &rules, &s)[4], "");
     }
 
+    /// M5b: the local player against the Standard bot. The bot taking the
+    /// Seat, or the human surrendering, reads "Defeat" with its reason,
+    /// the time, the hash and the replay; the human winning reads
+    /// "Victory".
+    #[test]
+    fn defeat_by_the_bot_texts() {
+        let rules = Rules::load(data()).unwrap();
+        let s = strings();
+        let sim = SimHandle::vs_bot(rules.clone(), 1, ai::BOT_STANDARD, "standard");
+        let view = sim.view();
+        let bot = PlayerId(1);
+        let won = |player| Outcome::Victory {
+            player,
+            decisive: true,
+        };
+        assert_eq!(
+            overlay_texts(
+                &over(won(bot), OutcomeReason::SeatCaptured, 26012),
+                LOCAL_PLAYER,
+                &view,
+                &rules,
+                &s
+            ),
+            [
+                "Defeat",
+                "The Seat was captured",
+                "21:40, tick 26012",
+                "Final hash 0x2c9a9ef52a5184d0",
+                "Replay 20261023-120000-31.eonreplay",
+            ]
+        );
+        let quit = overlay_texts(
+            &over(won(bot), OutcomeReason::Surrender, 603),
+            LOCAL_PLAYER,
+            &view,
+            &rules,
+            &s,
+        );
+        assert_eq!(quit[..3], ["Defeat", "Surrender", "0:30, tick 603"]);
+        let lost = overlay_texts(
+            &over(won(bot), OutcomeReason::AllTownsLost, 40000),
+            LOCAL_PLAYER,
+            &view,
+            &rules,
+            &s,
+        );
+        assert_eq!(lost[..2], ["Defeat", "Every Town was lost"]);
+        let beat = overlay_texts(
+            &over(won(LOCAL_PLAYER), OutcomeReason::SeatCaptured, 30000),
+            LOCAL_PLAYER,
+            &view,
+            &rules,
+            &s,
+        );
+        assert_eq!(beat[0], "Victory");
+    }
+
     /// The overlay is hidden until `MatchOver` appears, then shows the
     /// five lines once; world input stops, an order mode is left, a drag
     /// box held at the outcome is dropped and its node hidden, a showing
