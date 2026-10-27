@@ -32,7 +32,7 @@ This directory holds one document per game system. Each states Eonmark's own tar
 
 ## Proposing a balance change
 
-Balance changes are data changes. Open an issue with the `kind:balance` form: which RON file, what number, and the `sim-cli play-bots` result. A data PR bumps `rules_version`, re-records the golden fixtures with `just rerecord` (any RON edit changes `rules_hash`), needs `sim-cli data-check` and `cargo test -p sim` to pass and, when the change touches pacing, a play-bots table. See `../../CONTRIBUTING.md`.
+Balance changes are data changes. Open an issue with the `kind:balance` form: which RON file, what number, and the `sim-cli play-bots` result. A data PR bumps `rules_version`, re-records the golden fixtures with `just rerecord` (any edit to a hashed RON file changes `rules_hash`; `data/visuals.ron` and the UI strings are not hashed), needs `sim-cli data-check` and `cargo test -p sim` to pass and, when the change touches pacing, a play-bots table. See `../../CONTRIBUTING.md`.
 
 ```bash
 cargo run -p sim-cli -- data-check data/

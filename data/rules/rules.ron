@@ -3,11 +3,10 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  // 24: M5b waves slice review: data/ai only (personalities.ron gains
-  // defend_guard_pop_ratio, the size of the home guard once a defence is
-  // past defend_max_block_ds); every fixture is re-recorded for the new
-  // rules_hash in its header and no existing .hash moves.
-  rules_version: 24,
+  // 25: data/visuals.ron leaves rules_hash (ADR 0003); no sim change, no
+  // value changed: every fixture is re-recorded for the new rules_version
+  // and rules_hash in its header and no .hash moves.
+  rules_version: 25,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",

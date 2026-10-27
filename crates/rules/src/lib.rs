@@ -17,7 +17,7 @@
 //! | `rules/ages.ron` | [`Ages`] |
 //! | `rules/factions.ron` | [`Factions`] |
 //! | `maps/*.ron` | [`map::MapDef`] |
-//! | `visuals.ron` | [`Visuals`] (how each unit kind is drawn; validated here, read by the game) |
+//! | `visuals.ron` | [`Visuals`] (how each unit kind is drawn; validated here, read by the game, not in [`Rules::rules_hash`]: ADR 0003) |
 //! | `ai/personalities.ron`, `ai/build_orders/*.ron` | [`ai::AiRules`] (the bot's knobs and build orders, M5b; validated here, read by `crates/ai`) |
 //!
 //! Every error names the file and, when the data parsed, the field.
@@ -316,13 +316,17 @@ pub struct Rules {
     pub maps: BTreeMap<String, MapDef>,
     /// Contents of `visuals.ron`: a [`Visual`] per unit kind id. Attached by
     /// [`Rules::load`] and validated against `units`; read by the game crate's
-    /// presenter, never by the sim.
-    #[serde(skip_deserializing)]
+    /// presenter, never by the sim. `#[serde(skip)]`, not only
+    /// `skip_deserializing`, so it is the one attached file left out of
+    /// [`Rules::rules_hash`] (ADR 0003, `docs/adr/0003-visuals-outside-rules-hash.md`):
+    /// a look edit needs no `rules_version` bump and no re-record, and a
+    /// bad or missing entry still fails `Rules::load` and `data-check`.
+    #[serde(skip)]
     pub visuals: Visuals,
     /// Everything under `ai/` (M5b): the bot personalities and build
     /// orders. Attached by [`Rules::load`] and validated against the rest
     /// of the rules; read by `crates/ai`, never by the sim, and in
-    /// `rules_hash` like every attached file.
+    /// `rules_hash` like every attached file but `visuals`.
     #[serde(skip_deserializing)]
     pub ai: AiRules,
 }
@@ -1708,9 +1712,11 @@ impl Rules {
     }
 
     /// Content hash of the loaded rules (match rules, resources, units and
-    /// their counter table, buildings, techs, ages, factions, maps and
-    /// visuals); stored in replay headers so a changed RON file is reported
-    /// as `RULES CHANGED` instead of a sim divergence.
+    /// their counter table, buildings, techs, ages, factions, maps and the
+    /// bot data under `ai/`); stored in replay headers so a changed RON file
+    /// is reported as `RULES CHANGED` instead of a sim divergence.
+    /// `visuals.ron` is loaded and validated but not hashed (ADR 0003: the
+    /// sim never reads it), like the UI strings, which are not in `Rules`.
     pub fn rules_hash(&self) -> u64 {
         let bytes = postcard::to_allocvec(self).expect("Rules serialises");
         xxhash_rust::xxh3::xxh3_64(&bytes)
@@ -2046,22 +2052,75 @@ mod tests {
             d.rules_hash(),
             "units.ron is part of the hash"
         );
-        let mut e = Rules::load(data_dir()).unwrap();
-        e.visuals.units.insert(
-            "yeoman".into(),
-            Visual::Primitive(visuals::Primitive::Sphere),
-        );
-        assert_ne!(
-            a.rules_hash(),
-            e.rules_hash(),
-            "visuals.ron is part of the hash"
-        );
         let mut f = Rules::load(data_dir()).unwrap();
         f.buildings[1].hp += 1;
         assert_ne!(
             a.rules_hash(),
             f.rules_hash(),
             "buildings.ron is part of the hash"
+        );
+    }
+
+    /// ADR 0003: `visuals.ron` is attached and validated by `load` but left
+    /// out of `rules_hash` (`#[serde(skip)]`), so a look edit needs no
+    /// `rules_version` bump and no re-record. Checked in memory and through
+    /// an edited copy of the file, which must load with the edit in place.
+    #[test]
+    fn rules_hash_ignores_visuals_ron() {
+        let a = Rules::load(data_dir()).unwrap();
+        let mut e = Rules::load(data_dir()).unwrap();
+        e.visuals.units.insert(
+            "yeoman".into(),
+            Visual::Primitive(visuals::Primitive::Sphere),
+        );
+        assert_ne!(a.visuals, e.visuals);
+        assert_eq!(
+            a.rules_hash(),
+            e.rules_hash(),
+            "visuals.ron is not part of the hash"
+        );
+        let mut cleared = Rules::load(data_dir()).unwrap();
+        cleared.visuals = Visuals::default();
+        assert_eq!(a.rules_hash(), cleared.rules_hash());
+
+        let edited = loads_after_edits(
+            "visuals-edit",
+            &[(
+                "visuals.ron",
+                r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
+                r#""skirmisher": Body(shape: Cone, height_tiles_x100: 160)"#,
+            )],
+        );
+        assert_eq!(
+            edited.visuals.units.get("skirmisher"),
+            Some(&Visual::Body {
+                shape: visuals::Primitive::Cone,
+                height_tiles_x100: 160,
+                lying: false,
+            }),
+            "the edited file is loaded"
+        );
+        assert_eq!(
+            a.rules_hash(),
+            edited.rules_hash(),
+            "a visuals.ron edit keeps rules_hash"
+        );
+    }
+
+    /// The other half of ADR 0003: leaving the hash does not mean leaving
+    /// validation. A bad entry still fails `load`, naming the file and field.
+    #[test]
+    fn bad_visual_still_fails_to_load_naming_file_and_field() {
+        let msg = load_error_after_edit(
+            "visual-bad-height",
+            "visuals.ron",
+            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
+            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 500)"#,
+        );
+        assert!(msg.contains("visuals.ron"), "{msg}");
+        assert!(
+            msg.contains(r#"units["skirmisher"].height_tiles_x100"#),
+            "{msg}"
         );
     }
 

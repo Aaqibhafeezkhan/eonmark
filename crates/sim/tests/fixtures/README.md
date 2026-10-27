@@ -29,6 +29,18 @@ The `snapshot_restore` recording snapshots the sim before tick 300, restores
 the bytes into a fresh sim and continues recording on that sim; `verify`
 re-simulates without the swap, so an `OK` proves the restore was exact.
 
+Recorded 2026-10-26 at `rules_version` 25, `SIM_VERSION` 17 with
+`just rerecord` (ADR 0003, `docs/adr/0003-visuals-outside-rules-hash.md`:
+`data/visuals.ron` left `rules_hash`; no value and no sim code changed).
+Each of the eleven files differs from its `rules_version` 24 recording in
+the header's `rules_version` and `rules_hash` only (10 bytes, offsets 8 to
+17; every other byte is equal), and no `.hash` file changed. A per-tick
+`sim-cli hash-dump --every 1` of `move_500`, `combat_skirmish`,
+`capture_seat` and `m5_first_match` as recorded at 24, run by the
+pre-bump binary with its own `data/`, equals that of the re-recorded
+fixture run by the new binary on every tick. From here an edit of
+`data/visuals.ron` alone needs no bump and no re-record.
+
 Recorded 2026-10-23 at `rules_version` 24, `SIM_VERSION` 17 with
 `just rerecord` (the M5b waves slice's review fixes: `data/ai/` gained the
 `defend_guard_pop_ratio` knob, and the Standard bot's defence, build-order

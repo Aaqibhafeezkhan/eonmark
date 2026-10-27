@@ -2,8 +2,12 @@
 //!
 //! The simulation never reads this file; it is loaded by `Rules::load` so
 //! that it is validated with everything else (every unit kind must have a
-//! visual) and so that it is part of `rules_hash`. The game crate maps a
-//! [`Visual`] to a Bevy mesh and material in `present.rs`.
+//! visual, so `sim-cli data-check` fails on a bad or missing entry). It is
+//! not part of `rules_hash` (ADR 0003,
+//! `docs/adr/0003-visuals-outside-rules-hash.md`; `Rules::visuals` is
+//! `#[serde(skip)]`): changing a look needs no `rules_version` bump and no
+//! re-record, and replays never record which looks were loaded. The game
+//! crate maps a [`Visual`] to a Bevy mesh and material in `present.rs`.
 //!
 //! M2 shipped primitives only; M4b adds [`Visual::Body`], one primitive
 //! with its own height (or length, lying along the unit's facing), so each

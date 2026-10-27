@@ -4,7 +4,9 @@ This directory holds every tuning number, map and (from M5b) AI script that the
 Eonmark simulation reads at start-up. Nothing in here is compiled into the
 binary; `rules::Rules::load("data")` parses and validates it, and the
 resulting `rules_hash` is written into every replay header so a changed file
-is reported as `RULES CHANGED` rather than as a simulation bug. The code
+is reported as `RULES CHANGED` rather than as a simulation bug. The two
+presentation files, `visuals.ron` and `rules/strings/`, are validated too
+but are not in `rules_hash`, since the simulation never reads them. The code
 reads these files; it never defines gameplay constants of its own.
 
 ## Layout
@@ -20,7 +22,7 @@ reads these files; it never defines gameplay constants of its own.
 | `rules/factions.ron` | The factions and their Modifier rows (Freeholders, none) | `crates/rules/src/factions.rs` (`Factions`) | M4a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
 | `rules/strings/en.ron` | UI strings: the message line's text for every command rejection, HUD labels and tooltips. Presentation only, outside `rules_hash` (see `crates/rules/src/strings.rs`) | written | M3b |
-| `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere \| Cone)` and, from M4b, `Body(shape, height_tiles_x100, lying)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear | `crates/rules/src/visuals.rs` (`Visuals`) | M2, M4b |
+| `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere \| Cone)` and, from M4b, `Body(shape, height_tiles_x100, lying)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear. Presentation only: validated by `Rules::load`, outside `rules_hash` since `rules_version` 25 ([ADR 0003](../docs/adr/0003-visuals-outside-rules-hash.md)) | `crates/rules/src/visuals.rs` (`Visuals`) | M2, M4b |
 | `ai/personalities.ron` | One row per bot personality: its build order and every knob of the bot (cadence, caps, site policies, army mix, waves, defence and recall); M5b ships `standard`. Loaded last by `Rules::load`, attached as `Rules::ai` and in `rules_hash`, so an edit needs a `rules_version` bump | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
 | `ai/build_orders/*.ron` | One build order per file, its `id` equal to the file stem; M5b ships `standard.ron`. In `rules_hash` like the personalities | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
 | `ai/difficulty.ron` | Easy, Standard, Hard: income interval and aggression | not yet written | M6 |
@@ -33,8 +35,11 @@ reference for contributors is [../docs/DATA_FORMAT.md](../docs/DATA_FORMAT.md).
 ## visuals.ron
 
 Read by the game's presenter, never by the simulation, but loaded and
-validated by `Rules::load` so a missing visual is caught before a window
-opens and so the file is part of `rules_hash`. Schema `crates/rules/src/visuals.rs`.
+validated by `Rules::load`, so a missing or bad visual fails `sim-cli
+data-check` and is caught before a window opens. Since `rules_version` 25
+the file is not part of `rules_hash`
+([ADR 0003](../docs/adr/0003-visuals-outside-rules-hash.md); before that it
+was, from M2). Schema `crates/rules/src/visuals.rs`.
 
 | Field | Meaning |
 |-------|---------|
@@ -43,10 +48,12 @@ opens and so the file is part of `rules_hash`. Schema `crates/rules/src/visuals.
 | `Body(shape, height_tiles_x100, lying)` | The same primitive two radii wide with its own height in hundredths of a tile (M4b): `height_tiles_x100` in 20..=400, a `Capsule` at least two radii. `lying: true` (default `false`, `Capsule` or `Cylinder` only) lays it along the unit's facing, `height_tiles_x100` long and two radii tall. A `Body` is never a `Sphere`. Errors name `units["<id>"].shape`, `.lying` or `.height_tiles_x100`. |
 | `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` | glTF under `assets/` (`.glb` or `.gltf`), uniform scale in hundredths (1..=10000), vertical offset in hundredths of a tile, extra yaw in whole degrees (-360..=360). Parsed and validated now, used from M7. |
 
-The game draws every look low-poly and flat-shaded. A changed look changes
-`rules_hash`, so it needs a `rules_version` bump and `just rerecord` like
-any other data edit; the sim never reads it, so every `.hash` file stays the
-same and only the replay headers change.
+The game draws every look low-poly and flat-shaded. A changed look leaves
+`rules_hash` alone, so it needs no `rules_version` bump and no `just
+rerecord`: every replay still verifies (`OK`, not `RULES CHANGED`), and
+`sim-cli data-check` still rejects an entry that breaks the rules above.
+Anything the simulation or a bot reads does not belong in this file; it
+goes in a hashed file under `rules/` or `ai/`.
 
 ```ron
 (units: {
@@ -82,10 +89,13 @@ exits 1 and prints the file path, the span and the field, for example:
 error: data/rules/rules.ron: 8:3-8:18: Unexpected field named `tick_rate_hertz` in `Rules`, expected one of `rules_version`, `tick_rate_hz`, ... instead
 ```
 
-Every edit here changes `rules_hash`, so a change you keep also bumps
+Every edit here except `visuals.ron` and `rules/strings/` changes
+`rules_hash`, so a change you keep to any other file also bumps
 `rules_version` in `rules/rules.ron` and re-records the golden fixtures
 with `just rerecord` before `cargo test -p sim`; the full data-only path is
-the worked example in [rules/README.md](rules/README.md).
+the worked example in [rules/README.md](rules/README.md). A look or UI
+string edit needs only `data-check`: neither file is hashed, so it takes no
+bump and no re-record.
 
 ## License
 

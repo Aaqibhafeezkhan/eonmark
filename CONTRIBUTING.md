@@ -71,7 +71,7 @@ Other recipes in the [justfile](justfile):
 
 Most contributions need no engine knowledge. Every tuning number lives in `data/rules/*.ron` as an integer: time in deciseconds (fields ending in `_ds`) and distance in tiles (fields ending in `_tiles`). The loader converts to ticks once. If you find yourself typing a gameplay constant in Rust, stop and move it to RON. The schema is explained in [docs/DATA_FORMAT.md](docs/DATA_FORMAT.md).
 
-Any edit to a RON file changes `rules_hash`, and every golden replay fixture records the hash it was made with, so without a re-record `cargo test -p sim` fails with `RULES CHANGED since recording`. The data-only path is therefore always the same, and touches no Rust:
+Any edit to a RON file changes `rules_hash` (except the two presentation files: the UI strings under `data/rules/strings/` and, since `rules_version` 25, `data/visuals.ron`, [ADR 0003](docs/adr/0003-visuals-outside-rules-hash.md); `data-check` validates both, but a change to either needs no bump and no re-record), and every golden replay fixture records the hash it was made with, so without a re-record `cargo test -p sim` fails with `RULES CHANGED since recording`. The data-only path is therefore always the same, and touches no Rust:
 
 ```bash
 # 1. Edit a value, for example the Croft gather rate in data/rules/buildings.ron
@@ -117,7 +117,7 @@ $ git status --short
 
 Only `economy_second_town` changes its final hash: it is the only fixture with a worked Croft. A test that hard-codes a number the data controls fails this walkthrough; read the value from `Rules` instead.
 
-Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, so with the repository at `rules_version` 24 and the bump to 25 of step 2, step 3 now prints a line of the form `OK rules_version=25 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=24`). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
+Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, so with the repository at `rules_version` 25 and the bump to 26 of step 2, step 3 now prints a line of the form `OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=25`). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
 
 ### A build order or personality (`data/ai/`)
 

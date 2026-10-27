@@ -136,6 +136,7 @@ cargo run --release -p game
 #    the time, the final hash and the replay's name on the overlay; stdout has the
 #    `replay:` and `outcome:` lines).
 # 3. Verify that replay: it must print OK final_hash=<the overlay's hash> ticks=<its tick>.
+#    Verify it from the same checkout that recorded it (timing trap below).
 replay=$(ls -t ~/Library/Application\ Support/com.tonianev.Eonmark/replays/*.eonreplay | head -n 1)
 cargo run -p sim-cli --release -- verify "$replay"
 # 4. ROADMAP M5b line 1 on the Mac (owner decision 8): paste the stderr summary and wall_s.
@@ -144,7 +145,7 @@ cargo run -p sim-cli --release -- play-bots --seeds 1..5 --a standard --b standa
 just m5b-checks
 ```
 
-What to look for: 1. the menu over the dimmed map, New Game and Quit; Quit exits 0 and writes no replay. 2. The bot's first attack wave reaches you at about minute 11 (tick 13400 against an idle opponent); the overlay reads "Victory" or "Defeat" with the reason, the time, "Final hash ..." and "Replay <file>". 3. One `OK` line with the overlay's hash and tick. 4. `play-bots: games=5 ... a=... b=... draw=0 none=0 panic=0` and `wall_s` under 120 s. 5. `m5b_checks: ok`. Then note in the PR whether the bot felt winnable and losable (owner decision 4), and do the open M3b, M4a, M4b and M5a Mac rows below (M4b owner decision 3).
+What to look for: 1. the menu over the dimmed map, New Game and Quit; Quit exits 0 and writes no replay. 2. The bot's first attack wave reaches you at about minute 11 (tick 13400 against an idle opponent); the overlay reads "Victory" or "Defeat" with the reason, the time, "Final hash ..." and "Replay <file>". 3. One `OK` line with the overlay's hash and tick. Timing trap ([ADR 0003](adr/0003-visuals-outside-rules-hash.md)): `rules_version` 25 took `data/visuals.ron` out of `rules_hash`, so a match recorded on a build before that bump (`rules_version` 24, `main` at the M5b merge `e84af88`) prints `RULES CHANGED since recording (replay 0xb231ab753cb4197e, loaded ...)` on any later build. That is not a failure of line 4: verify the replay with the build that recorded it (for example `git worktree add ../eonmark-m5b e84af88` and run the same `verify` there). No command prints the header's `rules_version`; the `replay 0x...` value in that line is the recording build's `rules_hash`, which `cargo run -p sim-cli -- data-check data` prints at each commit (`0xb231ab753cb4197e` at 24). 4. `play-bots: games=5 ... a=... b=... draw=0 none=0 panic=0` and `wall_s` under 120 s. 5. `m5b_checks: ok`. Then note in the PR whether the bot felt winnable and losable (owner decision 4), and do the open M3b, M4a, M4b and M5a Mac rows below (M4b owner decision 3).
 
 ## Owner's Mac checklist (M4b)
 

@@ -219,3 +219,77 @@ fn a_cadence_inside_the_command_delay_exits_1_naming_personalities_ron() {
         &["personalities[0].think_every_ds: ", "cmd_delay_ticks"],
     );
 }
+
+/// ADR 0003: `visuals.ron` is out of `rules_hash` but still validated. A
+/// unit kind without a visual fails data-check naming the file and kind.
+#[test]
+fn a_unit_kind_without_a_visual_exits_1_naming_visuals_ron() {
+    rejects_edit(
+        "visual-missing",
+        "visuals.ron",
+        "    \"yeoman\": Primitive(Capsule),\n",
+        "",
+        &[r#"units["yeoman"]: "#, "needs a visual"],
+    );
+}
+
+/// ADR 0003: a look out of range still fails data-check, naming the field.
+#[test]
+fn a_visual_out_of_range_exits_1_naming_visuals_ron() {
+    rejects_edit(
+        "visual-height",
+        "visuals.ron",
+        r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
+        r#""skirmisher": Body(shape: Cone, height_tiles_x100: 500)"#,
+        &[r#"units["skirmisher"].height_tiles_x100: "#, "20..=400"],
+    );
+}
+
+/// ADR 0003: a missing `visuals.ron` still fails data-check, naming it.
+#[test]
+fn a_missing_visuals_ron_exits_1_naming_it() {
+    let dir = edited_copy("visuals-gone", "visuals.ron", |text| text);
+    std::fs::remove_file(dir.join("visuals.ron")).unwrap();
+    let out = data_check(&dir);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}{stderr}", text(&out.stdout));
+    assert!(
+        stderr.starts_with("error: ")
+            && stderr.lines().count() == 1
+            && stderr.contains("visuals.ron"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR 0003's point: a valid edit of `visuals.ron` passes data-check with
+/// the same `OK` line as the repository data, `rules_hash` included, so it
+/// needs no `rules_version` bump and no re-record.
+#[test]
+fn a_valid_visuals_edit_keeps_the_rules_hash() {
+    let repo = data_check(&repo_data());
+    let from = r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#;
+    let dir = edited_copy("visuals-edit", "visuals.ron", |text| {
+        assert!(
+            text.contains(from),
+            "visuals.ron no longer contains {from:?}"
+        );
+        text.replacen(
+            from,
+            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 160)"#,
+            1,
+        )
+    });
+    let edited = data_check(&dir);
+    let (repo_out, edited_out) = (text(&repo.stdout), text(&edited.stdout));
+    assert_eq!(repo.status.code(), Some(0), "{repo_out}");
+    assert_eq!(
+        edited.status.code(),
+        Some(0),
+        "{edited_out}{}",
+        text(&edited.stderr)
+    );
+    assert!(edited_out.contains(" rules_hash=0x"), "{edited_out}");
+    assert_eq!(repo_out, edited_out);
+    let _ = std::fs::remove_dir_all(&dir);
+}

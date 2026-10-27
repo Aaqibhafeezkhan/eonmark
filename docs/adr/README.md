@@ -8,6 +8,7 @@ This directory holds Eonmark's architecture decision records. An ADR is a short,
 |---|---|---|---|
 | [0001](0001-license.md) | Licensing of code, data and assets | Accepted | 2026-10-05 |
 | [0002](0002-bevy-0-20-migration.md) | Migration to Bevy 0.20 | Proposed | |
+| [0003](0003-visuals-outside-rules-hash.md) | `data/visuals.ron` outside `rules_hash` | Accepted | 2026-10-26 |
 
 ## Statuses
 

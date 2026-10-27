@@ -29,13 +29,13 @@ freezes a decided match and draws the outcome overlay). Its good first
 issues are #44, #45 and #46.
 
 M5b, the first complete skirmish opponent and the first playable match, is
-on PR #47 at `SIM_VERSION` 17 and `rules_version` 24, with eleven golden
-fixtures. Its lines 1, 2 and 3 are ticked there with pasted output,
-observed on the 4-vCPU Linux VM and, for line 1's last clause, in PR #47's
-Actions run 40258854764 (`m5_first_match` verified on macOS and Linux to
-`OK final_hash=0x3d2552033d51b4a2 ticks=26012`, empty parity diff). Line
-1's "under 120 s on the dev Mac" is re-run by the owner on the Mac (owner
-decision 8). M5b is done once the PR merges.
+merged as PR #47 (`e84af88`) at `SIM_VERSION` 17 and `rules_version` 24,
+with eleven golden fixtures. Its lines 1, 2 and 3 are ticked there with
+pasted output, observed on the 4-vCPU Linux VM and, for line 1's last
+clause, in PR #47's Actions run 40258854764 (`m5_first_match` verified on
+macOS and Linux to `OK final_hash=0x3d2552033d51b4a2 ticks=26012`, empty
+parity diff). Line 1's "under 120 s on the dev Mac" is re-run by the owner
+on the Mac (owner decision 8).
 Its [owner] line 4 waits for the owner's own match; its automated proxy,
 `just m5b-checks`, passes and is pasted in `docs/PLAYTEST.md`, and goes
 into the PR description with the CI results. The owner answered the nine
@@ -81,13 +81,22 @@ Next is the pre-stream art pass, before the first gameplay stream and
 before M6 (the owner's decision of 2026-10-21 under "Order of work" in the
 ROADMAP): CC0 models through `data/visuals.ron`, dressed terrain, a
 minimap and a dev-panel draw-call counter. The owner took every default of
-its implementation plan on 2026-10-26. It starts with ADR 0003 as its own
-small PR right after PR #47 merges: `docs/adr/0003-visuals-outside-rules-hash.md`
-takes `data/visuals.ron` out of `rules_hash` (the sim never reads it; UI
-strings are the precedent, and `data-check` still validates every entry),
-with one `rules_version` bump (24 to 25) and a header-only re-record of
-the eleven fixtures, no `.hash` change. The art slices follow in one PR
-rebased on it, with no further bump: the packs (KayKit Medieval Hexagon
+its implementation plan on 2026-10-26. It starts with ADR 0003, its own
+small PR on top of the M5b merge (`e84af88`):
+`docs/adr/0003-visuals-outside-rules-hash.md` (Accepted) takes
+`data/visuals.ron` out of `rules_hash` (`Rules::visuals` is
+`#[serde(skip)]`; the sim never reads it; UI strings are the precedent, and
+`data-check` still validates every entry), with one `rules_version` bump
+(24 to 25) and a header-only re-record of the eleven fixtures, no `.hash`
+change. From 25 a look edit needs no bump. The timing trap: a replay
+recorded on a build before the bump (the owner's M5b match, if it is played
+on `e84af88`) prints `RULES CHANGED` on later builds and is verified with
+the build that recorded it. No command prints a header's
+`rules_version`; the `replay 0x…` hash in the `RULES CHANGED` line names
+the build (`0xb231ab753cb4197e` is `rules_version` 24, `e84af88`; `sim-cli
+data-check data` prints each commit's hash; `docs/PLAYTEST.md`, "Owner's
+Mac checklist (M5b)"). The art slices follow
+in one PR rebased on it, with no further bump: the packs (KayKit Medieval Hexagon
 and KayKit Adventurers, and the Inter font) vendored with their licence
 proof, buildings, sites and terrain, the eight unit kinds, the minimap,
 the draw-call counter and the close. Its first slice records the pass, its
@@ -139,8 +148,8 @@ ticked with pasted command output in a merged PR.
 | Architecture and invariants | `docs/ARCHITECTURE.md`, `docs/DETERMINISM.md`, `docs/DATA_FORMAT.md` | Complete |
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
-| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a merged (PR #43: attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); M5b on PR #47, done when line 1's CI clause is pasted and it merges (`SIM_VERSION` 17, `rules_version` 24: the bot seats and hashed bot memory, `data/ai/`, the Standard bot in `crates/ai`, `play-bots`, `bench --bots`, the `m5_first_match` golden) |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a merged (PR #43): the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout; M5b's game half on PR #47 (line 4 waits for the owner's match): the main menu and New Game against the Standard bot, `--skip-menu`, `--spectate` and `--fast-forward-to`, the lazy recorder |
+| Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a merged (PR #43: attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); M5b merged (PR #47, `SIM_VERSION` 17, `rules_version` 24: the bot seats and hashed bot memory, `data/ai/`, the Standard bot in `crates/ai`, `play-bots`, `bench --bots`, the `m5_first_match` golden) |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a merged (PR #43): the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout; M5b's game half merged (PR #47; line 4 waits for the owner's match): the main menu and New Game against the Standard bot, `--skip-menu`, `--spectate` and `--fast-forward-to`, the lazy recorder |
 | CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
 
 ## Read these first, in this order
