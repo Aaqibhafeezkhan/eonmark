@@ -388,6 +388,11 @@ pub fn run(cli: &Cli) -> AppExit {
     // tracing subscriber, and an event before it is dropped.
     // `scripts/render_smoke.sh` requires this line.
     info!("assets: {}", assets.display());
+    // Art pass: Inter replaces Bevy's built-in FiraMono before the first
+    // text layout (`crate::fonts`).
+    app.add_plugins(crate::fonts::FontsPlugin {
+        assets: assets.clone(),
+    });
     // Display sleep or a screen lock must not end the session.
     app.add_plugins(MonitorLossPlugin);
     if background {
@@ -437,16 +442,27 @@ pub fn run(cli: &Cli) -> AppExit {
         crate::terrain_props::TerrainPropsPlugin,
     ));
     // M5a: the attrition indicator, supply ring, annexation timer and
-    // readout, and the outcome overlay over the frozen world.
+    // readout, and the outcome overlay over the frozen world. Art pass:
+    // arrows, stones and melee lunges for every hit (presentation only).
     app.add_plugins((
         crate::markers::MarkersPlugin,
         crate::outcome::OutcomeOverlayPlugin,
+        crate::combat_fx::CombatFxPlugin,
     ));
+
+    // Art pass AP6 (owner decision 7): the minimap bottom-left over the
+    // bottom bar; it prints `frame_stats: minimap ...` on exit.
+    app.add_plugins(crate::minimap::MinimapPlugin);
 
     // Art pass AP10: every unit selectable by a real click (a driver
     // clicks the printed targets; `crate::click_check`).
     if cli.click_check {
         app.add_plugins(crate::click_check::ClickCheckPlugin);
+    }
+    // Art pass AP6: the minimap's input with real X input (a driver
+    // performs the printed steps; `crate::minimap_check`).
+    if cli.minimap_check {
+        app.add_plugins(crate::minimap_check::MinimapCheckPlugin);
     }
 
     // Presentation only: frames and selects the walkthrough's beats, or

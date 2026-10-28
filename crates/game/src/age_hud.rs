@@ -28,7 +28,6 @@
 use bevy::picking::events::{Click, Pointer};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use rules::Rules;
 use rules::strings::fill;
 use sim::{Command, RejectReason, SimView};
@@ -145,10 +144,7 @@ impl Plugin for AgeHudPlugin {
 fn text(value: &str, size: f32) -> impl Bundle {
     (
         Text::new(value),
-        TextFont {
-            font_size: FontSize::Px(size),
-            ..default()
-        },
+        crate::fonts::hud_font(size),
         TextColor(palette::HUD_TEXT),
         TextLayout::no_wrap(),
     )
@@ -287,6 +283,7 @@ mod tests {
     use super::*;
     use crate::economy_hud::PopReadout;
     use crate::hud::spawn_hud;
+    use bevy::text::FontSize;
 
     fn data_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -493,14 +490,10 @@ mod tests {
         }));
     }
 
-    /// The glyph advance of Bevy 0.19.1's default font, the only one the
-    /// game uses until M7 (`bevy_text-0.19.1/src/FiraMono-subset.ttf`, a
-    /// monospace font: every glyph advances 600 of 1000 units per em).
-    const GLYPH_ADVANCE_EM: f32 = 0.6;
-
     /// The width `e` lays out to, logical px, with `text_of` the text of a
-    /// readout (else its current text): a text, `GLYPH_ADVANCE_EM` per
-    /// character of its font size; a node, its children side by side with
+    /// readout (else its current text): a text, the sum of the UI font's
+    /// advances at its size (Inter since the art pass,
+    /// `crate::fonts::measure`); a node, its children side by side with
     /// its column gap, plus its horizontal padding; nothing when hidden.
     fn laid_out_width(world: &World, e: Entity, text_of: &dyn Fn(Entity) -> Option<String>) -> f32 {
         let px = |v: Val| if let Val::Px(x) = v { x } else { 0.0 };
@@ -514,7 +507,7 @@ mod tests {
                 panic!("HUD text is sized in px");
             };
             let shown = text_of(e).unwrap_or_else(|| text.0.clone());
-            return padding + shown.chars().count() as f32 * GLYPH_ADVANCE_EM * font;
+            return padding + crate::fonts::measure::text_width_px(&shown, font);
         }
         let children: Vec<Entity> = world
             .get::<Children>(e)

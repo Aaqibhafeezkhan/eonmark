@@ -16,7 +16,7 @@ Area: `area:sim` (grid, `SimView`) and `area:game` (shader channel, visibility t
 | Texture channel | B of the 128 x 128 RGBA8 field texture (R owner, G strength, B fog, A supply) | `crates/game/src/field.rs` |
 | Enemy units | hidden unless their tile is state 2 for the viewing player | `present.rs` |
 | Enemy buildings | shown with current state when their tile is state 1 or 2; no ghosting | `present.rs` |
-| Minimap | same grid, same multipliers, repainted every frame | `hud/minimap.rs` |
+| Minimap | same grid, same multipliers, repainted when the tick, camera, selection or territory changed | `crates/game/src/minimap.rs` (built without fog by the art pass; M7 adds the fog layer) |
 | Frame budget | 400 units + two full Towns + fog at >= 60 fps, 1440p, release, base M-series | M7 acceptance |
 | Hash impact | one `rules_version` bump in M7; every earlier golden fixture must verify after it | M7 acceptance |
 
@@ -73,6 +73,8 @@ The minimap is a CPU-painted 128 x 128 `Image` shown through an `ImageNode`, one
 4. Dots: own units and buildings always; enemy units only on state 2 tiles; enemy buildings on state 1 or 2 tiles.
 
 Left-clicking the minimap moves the camera to that tile. Right-clicking it orders the current selection there, through the same command path as a right-click on the ground. The minimap must mirror fog and borders within one frame of the sim change that caused them.
+
+The art pass built this minimap without fog (`crates/game/src/minimap.rs`, [ui.md](ui.md)): steps 1, 2 and 4 with every unit and building shown, plus the view trapezoid and Town outlines. It is painted from cached layers rather than every frame: the terrain once, the territory again in the `FixedUpdate` step that changed the field's border sources (so a border shows in the frame of its tick: `the_plugin_shows_a_new_border_in_the_update_of_its_tick` runs `MinimapPlugin` on its own schedule with `SimPlugin`, and `a_new_border_source_repaints_territory_in_the_same_update` checks the repaint itself), and the rest whenever the tick, the camera or the selection changed. M7 adds step 3 as one more cached layer rebuilt when the visibility grid changes, and filters the enemy dots of step 4.
 
 ## Interactions with other systems
 

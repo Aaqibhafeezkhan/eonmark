@@ -381,11 +381,44 @@ pub fn context_order(
             }
         }
     }
-    Some(Command::Move {
-        units: own,
-        target: point,
-        queue,
-    })
+    ground_order(OrderMode::Normal, view, selection, point, queue)
+}
+
+/// The order a click on bare ground at `target` issues in `mode`, with
+/// nothing under the pointer (the right click's last context, and every
+/// minimap order, `minimap.rs`): in [`OrderMode::Normal`], `SetRally` when
+/// an own building is selected, else `Move` of the own selected units
+/// (queued when `queue`); in [`OrderMode::AttackMove`], `AttackMove` of the
+/// own selected units. `None` when there is nothing to order: no own unit
+/// (or own building) selected, or placement mode.
+pub fn ground_order(
+    mode: OrderMode,
+    view: &SimView<'_>,
+    selection: &Selection,
+    target: FxVec2,
+    queue: bool,
+) -> Option<Command> {
+    match mode {
+        OrderMode::Normal => {
+            if let Some(building) = selection.building {
+                return view
+                    .building(building)
+                    .filter(|b| b.owner == LOCAL_PLAYER)
+                    .map(|_| Command::SetRally { building, target });
+            }
+            let units = own_selected_units(view, selection);
+            (!units.is_empty()).then_some(Command::Move {
+                units,
+                target,
+                queue,
+            })
+        }
+        OrderMode::AttackMove => {
+            let units = own_selected_units(view, selection);
+            (!units.is_empty()).then_some(Command::AttackMove { units, target })
+        }
+        OrderMode::Place(_) => None,
+    }
 }
 
 /// Where an attack marker for `target` goes: a unit's position on the

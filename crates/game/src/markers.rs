@@ -42,7 +42,6 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::gizmos::config::GizmoLineConfig;
 use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use bevy::transform::TransformSystems;
 use rules::Rules;
 use rules::strings::fill;
@@ -471,10 +470,7 @@ pub fn spawn_annex_readout(mut commands: Commands, root: Query<Entity, With<HudR
             line.spawn((
                 AnnexReadout,
                 Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(HUD_FONT_PX),
-                    ..default()
-                },
+                crate::fonts::hud_font(HUD_FONT_PX),
                 TextColor(palette::HUD_TEXT),
                 Pickable::IGNORE,
             ));

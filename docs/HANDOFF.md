@@ -77,44 +77,72 @@ build order whose `Research` host is never built) and #50
 (`sim-cli data-check --verbose` printing each build order's step count
 and the step of its first `Advance`).
 
-Next is the pre-stream art pass, before the first gameplay stream and
+The pre-stream art pass came next, before the first gameplay stream and
 before M6 (the owner's decision of 2026-10-21 under "Order of work" in the
-ROADMAP): CC0 models through `data/visuals.ron`, dressed terrain, a
-minimap and a dev-panel draw-call counter. The owner took every default of
-its implementation plan on 2026-10-26. It starts with ADR 0003, its own
-small PR on top of the M5b merge (`e84af88`):
-`docs/adr/0003-visuals-outside-rules-hash.md` (Accepted) takes
-`data/visuals.ron` out of `rules_hash` (`Rules::visuals` is
-`#[serde(skip)]`; the sim never reads it; UI strings are the precedent, and
-`data-check` still validates every entry), with one `rules_version` bump
-(24 to 25) and a header-only re-record of the eleven fixtures, no `.hash`
-change. From 25 a look edit needs no bump. The timing trap: a replay
-recorded on a build before the bump (the owner's M5b match, if it is played
-on `e84af88`) prints `RULES CHANGED` on later builds and is verified with
-the build that recorded it. No command prints a header's
-`rules_version`; the `replay 0x…` hash in the `RULES CHANGED` line names
-the build (`0xb231ab753cb4197e` is `rules_version` 24, `e84af88`; `sim-cli
-data-check data` prints each commit's hash; `docs/PLAYTEST.md`, "Owner's
-Mac checklist (M5b)"). The art slices follow
-in one PR rebased on it, with no further bump: the packs (KayKit Medieval Hexagon
-and KayKit Adventurers, and the Inter font) vendored with their licence
-proof, buildings, sites and terrain, the eight unit kinds, the minimap,
-the draw-call counter and the close. Its first slice records the pass, its
-acceptance list and the owner's answers as a ROADMAP section "Art pass
-(pre-stream)"; until then the plan is not in the repository. M6 follows
-the art pass.
+ROADMAP; its section "Art pass (pre-stream)" holds the acceptance list AP1
+to AP10 and the owner's answers). The owner took every default of its
+implementation plan on 2026-10-26 and answered the questions the slices
+raised on 2026-10-28 (owner decisions 12 to 16: team banners, the
+Mangonel's smaller banner, the Seat flag's placement rule). It landed in
+four PRs with no sim change after the first:
+
+- ADR 0003 (PR #51, `15f1616`): `data/visuals.ron` leaves `rules_hash`
+  (`Rules::visuals` is `#[serde(skip)]`; the sim never reads it; UI strings
+  are the precedent, and `data-check` still validates every entry), with
+  one `rules_version` bump (24 to 25) and a header-only re-record of the
+  eleven fixtures, no `.hash` change. From 25 a look edit needs no bump.
+  The timing trap: a replay recorded on a build before the bump (the
+  owner's M5b match, if it is played on `e84af88`) prints `RULES CHANGED`
+  on later builds and is verified with the build that recorded it. No
+  command prints a header's `rules_version`; the `replay 0x…` hash in the
+  `RULES CHANGED` line names the build (`0xb231ab753cb4197e` is
+  `rules_version` 24, `e84af88`; `sim-cli data-check data` prints each
+  commit's hash; `docs/PLAYTEST.md`, "Owner's Mac checklist (M5b)").
+- Slices 1 and 2 (PR #52): the `visuals.ron` schema for buildings, sites,
+  rubble, the Seat flag, terrain and team swatches; `data-check --assets`;
+  the `art_bench` stress scene; the asset root, `--window-size`, the grid
+  off by default; the draw-call counter (`--draw-stats`, the dev panel's
+  `draw calls` row, `scripts/draw_trace_xcheck.sh`); rings and attrition
+  diamonds as shared meshes; `tools/inspect_gltf`; the KayKit and Inter
+  files vendored with sha256 pins, licence texts and per-file rows.
+- Slices 3 and 4 (PR #53, `d0dabbf`): every building, site, rubble, the
+  Seat flag, terrain props and all eight unit kinds drawn as KayKit models
+  with data-driven team banners, the load gate, the walk bob and
+  `--click-check`.
+- Slices 5 and 6 (the art-pass close PR, branch `art-s56`): the minimap
+  (bottom-left, no fog), Inter, hit feedback, the Mangonel's 1.25 m
+  banner; `scripts/art_checks.sh` (`just art-checks`: the AP1 to AP4 and
+  AP7 proxies and the five `docs/screenshots/art-*.png`),
+  `scripts/art_drive.sh` (`just art-drive`: `click_check: ok 16/16` and
+  `minimap_check: ok` with real X input), CI's `art_bench` render smoke
+  with its draw-call gate (`scripts/check_draws.sh`), the owner's Mac
+  checklist and [STREAMING.md](STREAMING.md). The AP ticks and M7's
+  `check_assets` and `data-check` ticks are made in that PR with its
+  observed output.
+
+**The art pass is ready for the owner's Mac sign-off and then the first
+stream.** What only the owner can close: AP5 (60 fps in `art_bench` at
+1280x720 on the Retina display, with the `--max-fps 1000` headroom run),
+AP8 (the four `docs/screenshots/art-*.png` against the `ART_STYLE.md`
+checklist, on the P3 display and as sRGB exports), and AP6's "by hand" (the
+minimap clicked, dragged and right-clicked in a real match); the commands
+are in `docs/PLAYTEST.md`, "Owner's Mac checklist (art pass)". The stream
+itself follows [STREAMING.md](STREAMING.md): the two commands, the window
+and focus settings that bite, OBS, a five-minute pre-flight and what to
+keep afterwards. M6 follows the art pass.
 
 Open owner checks on the dev Mac, batched into one session under the owner's
 decision 3 in the ROADMAP's M4b Notes, which M5b's decision 9 extends to
 M5b (an exception to rule 1 in `docs/IMPLEMENTER_NOTES.md`; accepted risk:
 Mac-only problems surface late). The exact commands are in
-`docs/PLAYTEST.md`, "Owner's Mac checklist (M5b)" and "Owner's Mac
-checklist (M4b)":
+`docs/PLAYTEST.md`, "Owner's Mac checklist (art pass)", "Owner's Mac
+checklist (M5b)" and "Owner's Mac checklist (M4b)":
 
 - M3b: `cargo run --release -p game -- --scenario economy_walkthrough` at
-  >= 60 fps with the draw-call count (an Xcode Metal frame capture, since
-  no dev-panel counter exists yet), the border screenshot review against
-  `docs/ART_STYLE.md` ([owner]), and the M2 and M3b controls checklists.
+  >= 60 fps with the draw-call count (since the art pass the dev panel's
+  `draw calls` row, and `--draw-stats` in a release build), the border
+  screenshot review against `docs/ART_STYLE.md` ([owner]), and the M2 and
+  M3b controls checklists.
 - M4a: re-measure `sim-cli bench --units 400 --ticks 1200 --combat` and
   `cargo test -p sim` (under 10 s) on the Mac; both were measured on a
   Linux VM.
@@ -137,6 +165,11 @@ checklist (M4b)":
   `just m5b-checks` on Metal (the menu, the New Game click and the
   overlay have only been drawn by lavapipe); and a note on whether the
   bot felt winnable and losable (owner decision 4).
+- Art pass: AP5's fps run with its headroom run, AP8's sign-off of the
+  four screenshots with the P3 and sRGB check, the minimap by hand, the
+  dev panel's counter with 100+ units selected, and M3b line 2 and M4b
+  line 2 re-measured with the models (`docs/PLAYTEST.md`, "Owner's Mac
+  checklist (art pass)").
 
 A milestone is done when every acceptance checkbox in `docs/ROADMAP.md` is
 ticked with pasted command output in a merged PR.
@@ -149,8 +182,9 @@ ticked with pasted command output in a merged PR.
 | Per-system design | `docs/design/*.md` | Complete, with target numbers |
 | Dependency pins and policy | `docs/DEPENDENCIES.md`, `docs/adr/` | Complete |
 | Simulation crates | `crates/sim`, `crates/rules`, `crates/ai`, `crates/sim-cli` | M3a merged (PR #26: economy, Towns, territory, construction, gathering, training); M4a merged (PR #35: tech, ages, combat, the counter triangle, `bench --combat`, the `combat_skirmish` golden); M4b merged (PR #38: the `enemy_outpost` scenarios, their golden and `SimView::building_hp`); M5a merged (PR #43: attrition, supply, annexation, the outcome, `bench --combat --harrying`, the `capture_seat` and `stalemate_45min` goldens); M5b merged (PR #47, `SIM_VERSION` 17, `rules_version` 24: the bot seats and hashed bot memory, `data/ai/`, the Standard bot in `crates/ai`, `play-bots`, `bench --bots`, the `m5_first_match` golden) |
-| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a merged (PR #43): the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout; M5b's game half merged (PR #47; line 4 waits for the owner's match): the main menu and New Game against the Standard bot, `--skip-menu`, `--spectate` and `--fast-forward-to`, the lazy recorder |
-| CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity |
+| Presentation crate | `crates/game` | M2 merged: camera, selection and orders, replay recorder, headless run, macOS menu; M3b merged (PR #31): buildings, terrain, the FieldExt territory shader, resource bar and messages, command card, placement ghost, context orders; M4b merged (PR #38; line 2 waits for the Mac): unit looks, health bars, attack orders, research panel, age strip, notices, the walkthrough director and the fight window; M5a merged (PR #43): the freeze at the outcome, the outcome overlay with the final hash, the attrition indicator, the supply ring, the annexation timer and readout; M5b's game half merged (PR #47; line 4 waits for the owner's match): the main menu and New Game against the Standard bot, `--skip-menu`, `--spectate` and `--fast-forward-to`, the lazy recorder; the art pass (PRs #52 and #53, and its close PR; AP5, AP8 and AP6's hand check wait for the owner's Mac): KayKit models through `data/visuals.ron` with team banners, terrain props, the minimap, Inter, hit feedback and the draw-call counter |
+| Art and assets | `assets/`, `data/visuals.ron`, `tools/inspect_gltf`, `tools/assets/` | Art pass: KayKit Medieval Hexagon and KayKit Adventurers (CC0) and Inter 4.1 (OFL) vendored with sha256 pins and per-file `ATTRIBUTION.md` rows; `inspect_gltf check` runs in CI |
+| CI and release automation | `.github/workflows/`, `scripts/`, `justfile` | In use since M0: every PR runs check, headless, game-linux, deny and hash-parity; since the art pass game-linux also renders `art_bench` and gates draw calls under 500 |
 
 ## Read these first, in this order
 

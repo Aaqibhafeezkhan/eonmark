@@ -53,7 +53,6 @@
 use bevy::picking::events::{Click, Pointer};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use rules::Rules;
 use rules::strings::fill;
 use sim::{
@@ -72,10 +71,12 @@ use crate::selection::Selection;
 use crate::sim_driver::{LOCAL_PLAYER, PendingCommands, SimHandle};
 
 /// Card button size, logical px. Every line a button can show fits one
-/// line of it at [`CARD_FONT_PX`] (7.2 px a character): the longest are
-/// "Needs Statecraft II" (19 characters; [`research_actions`] never offers
-/// a level whose level before is missing, but the blocker exists) and the
-/// Bowman at the military ramp's cap, "45 Grain 90 Lumber" (18).
+/// line of it at [`CARD_FONT_PX`] in Inter (art pass; measured with its
+/// advances): the longest are the Bowman at the military ramp's cap, "45
+/// Grain 90 Lumber" (114 px), and "Needs Statecraft II" (106 px;
+/// [`research_actions`] never offers a level whose level before is
+/// missing, but the blocker exists). With M4b's monospace Fira Mono they
+/// were 18 and 19 characters of 7.2 px.
 pub const CARD_BUTTON_PX: Vec2 = Vec2::new(140.0, 36.0);
 /// Gap between card buttons, logical px.
 pub const CARD_GAP_PX: f32 = 4.0;
@@ -88,8 +89,9 @@ pub const CARD_FONT_PX: f32 = 12.0;
 /// window does). Every line a Scriptorium shows fits one row of it, the
 /// longest being its queue of the four level III researches and a Scribe,
 /// "Queue: Statecraft III 99%, Letters III, Trade III, Arms III, Scribe"
-/// (67 characters of 8.4 px at the 14 px HUD font): its five lines then
-/// fit the 88 px between the bar's top padding and the window's bottom.
+/// (406 px in Inter at the 14 px HUD font, art pass; 67 characters of
+/// 8.4 px, 563 px, in M4b's monospace Fira Mono): its five lines then fit
+/// the 88 px between the bar's top padding and the window's bottom.
 pub const INFO_WIDTH_PX: f32 = 580.0;
 /// Most lines the selection panel shows for a selection of units: the
 /// rows of 14 px text that fit the 88 px between the bottom bar's top
@@ -193,10 +195,7 @@ impl Plugin for CommandCardPlugin {
 fn text(value: &str, size: f32) -> impl Bundle {
     (
         Text::new(value),
-        TextFont {
-            font_size: FontSize::Px(size),
-            ..default()
-        },
+        crate::fonts::hud_font(size),
         TextColor(palette::HUD_TEXT),
     )
 }
@@ -2089,16 +2088,13 @@ mod tests {
         );
     }
 
-    /// Bevy 0.19.1's default font, the only one the game uses until M7
-    /// (`bevy_text-0.19.1/src/FiraMono-subset.ttf`), is monospace: every
-    /// glyph advances 600 of its 1000 units per em.
-    const GLYPH_ADVANCE_EM: f32 = 0.6;
     /// Bevy 0.19.1's default line height, `LineHeight::RelativeToFont(1.2)`.
     const LINE_HEIGHT_EM: f32 = 1.2;
 
-    /// How many characters of `font_px` text fit on one line `width_px` wide.
-    fn chars_per_line(width_px: f32, font_px: f32) -> usize {
-        (width_px / (GLYPH_ADVANCE_EM * font_px)).floor() as usize
+    /// The width of one line of `font_px` text in the UI font (Inter since
+    /// the art pass: its real advances, `crate::fonts::measure`).
+    fn line_width(line: &str, font_px: f32) -> f32 {
+        crate::fonts::measure::text_width_px(line, font_px)
     }
 
     /// How many rows of HUD text fit in the selection panel: from the
@@ -2111,17 +2107,17 @@ mod tests {
     /// row of `INFO_WIDTH_PX`, and the lines within the rows from the bar's
     /// top padding to the bottom of the window.
     fn assert_fits_the_panel(text: &str) {
-        let (rows, width) = (panel_rows(), chars_per_line(INFO_WIDTH_PX, HUD_FONT_PX));
+        let rows = panel_rows();
         assert!(
             text.lines().count() <= rows,
             "{} lines, {rows} fit:\n{text}",
             text.lines().count()
         );
         for line in text.lines() {
+            let width = line_width(line, HUD_FONT_PX);
             assert!(
-                line.chars().count() <= width,
-                "{} characters, {width} fit on a row: {line}",
-                line.chars().count()
+                width <= INFO_WIDTH_PX,
+                "{width} px, {INFO_WIDTH_PX} fit on a row: {line}"
             );
         }
     }
@@ -2317,7 +2313,6 @@ mod tests {
     /// building and Yeoman ramps) and every blocker a Research button shows.
     #[test]
     fn every_card_line_fits_its_button() {
-        let width = chars_per_line(CARD_BUTTON_PX.x, CARD_FONT_PX);
         let mut lab = Lab::new(standard());
         let rules = lab.sim.rules().clone();
         let s = strings();
@@ -2399,10 +2394,11 @@ mod tests {
         lines.extend(capped);
 
         for line in &lines {
+            let width = line_width(line, CARD_FONT_PX);
             assert!(
-                line.chars().count() <= width,
-                "{} characters, {width} fit on a button: {line}",
-                line.chars().count()
+                width <= CARD_BUTTON_PX.x,
+                "{width} px, {} fit on a button: {line}",
+                CARD_BUTTON_PX.x
             );
         }
     }

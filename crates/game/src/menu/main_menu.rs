@@ -23,7 +23,6 @@ use bevy::camera::RenderTarget;
 use bevy::picking::events::{Click, Pointer};
 use bevy::picking::pointer::{PointerButton, PointerInput};
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use bevy::window::{PrimaryWindow, WindowRef};
 use rules::strings::fill;
 
@@ -81,10 +80,7 @@ pub fn button_label(button: MenuButton, strings: &UiStrings) -> String {
 fn text(value: &str, size: f32) -> impl Bundle {
     (
         Text::new(value),
-        TextFont {
-            font_size: FontSize::Px(size),
-            ..default()
-        },
+        crate::fonts::hud_font(size),
         TextColor(palette::HUD_TEXT),
         Pickable::IGNORE,
     )

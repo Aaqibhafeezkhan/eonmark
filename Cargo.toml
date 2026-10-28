@@ -48,6 +48,9 @@ png = "0.18"
 
 # dev-dependencies
 pathfinding = "4.16"
+# The game's HUD fit tests measure Inter's advances (art pass); the version
+# parley 0.9 (Bevy's text layout) already locks, without its defaults.
+skrifa = { version = "=0.42.1", default-features = false, features = ["std"] }
 proptest = "1.11"
 criterion = "0.8"
 

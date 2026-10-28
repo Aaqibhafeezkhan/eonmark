@@ -16,7 +16,6 @@
 //! moves. Registered only by the windowed app, never by `--headless-run`.
 
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use rules::Rules;
 use rules::strings::fill;
 use sim::{Outcome, OutcomeReason, PlayerId, SimView};
@@ -93,10 +92,7 @@ pub fn spawn_outcome_overlay(mut commands: Commands) {
                 overlay.spawn((
                     OutcomeLine(i),
                     Text::new(""),
-                    TextFont {
-                        font_size: FontSize::Px(size),
-                        ..default()
-                    },
+                    crate::fonts::hud_font(size),
                     TextColor(palette::HUD_TEXT),
                 ));
             }

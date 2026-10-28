@@ -3215,6 +3215,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "rules",
  "sim",
+ "skrifa 0.42.1",
 ]
 
 [[package]]

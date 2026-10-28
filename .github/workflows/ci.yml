@@ -329,9 +329,17 @@ jobs:
       # slice 4 its 400 units are KayKit character models (about 2.2 M
       # triangles in the main pass), which lavapipe draws at about 1.4 s a
       # frame, so tick 400 comes about 120 s in: it gets a 180 s deadline
-      # (the sixth argument; docs/BUILD_TIMES.md). winit
-      # loads libxkbcommon-x11 and the X libraries at run time; the runner
-      # image lacks the first. The screenshots are uploaded for review.
+      # (the sixth argument; docs/BUILD_TIMES.md). Since art slice 6 it
+      # also renders `art_bench`, the art pass's stress scene (two full
+      # Towns, 400 units fighting, all of P0's units selected at tick 40),
+      # in its own 60 m framing: on lavapipe it draws about one frame a
+      # second, so on the 4-vCPU VM tick 200 came 64 s in and the run's
+      # 120 s reached tick 493, past the whole fight (ticks 47 to 388);
+      # tick 300 came 78 to 87 s in, too close to 120 s for a runner of
+      # unknown speed.
+      # winit loads libxkbcommon-x11 and the X libraries at run time; the
+      # runner image lacks the first. The screenshots are uploaded for
+      # review.
       - name: Render smoke test (Xvfb, lavapipe)
         run: |
           sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxi6 libxrandr2
@@ -339,6 +347,21 @@ jobs:
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke"
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/unit_looks" unit_looks 20,32,40 100
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/enemy_outpost" enemy_outpost '' 400 180
+          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/art_bench" art_bench '' 200 120
+
+      # Art pass AP4: every render smoke runs with --draw-stats and prints
+      # `frame_stats: draws ... max=<n> ...`; fail unless every run's maximum
+      # is under 500 draw calls a frame (scripts/check_draws.sh; `mode=none`
+      # fails, since the counter does not count it). For `art_bench` (and
+      # `enemy_outpost`) --fight also requires that the fight was measured:
+      # a non-zero `fight_max` and a `frame_stats: fight` line with fight
+      # frames and ticks, so a run whose armies never fought fails.
+      - name: Draw-call gate (under 500 a frame)
+        run: |
+          scripts/check_draws.sh "$RUNNER_TEMP/render-smoke/render_smoke.log"
+          scripts/check_draws.sh "$RUNNER_TEMP/render-smoke/unit_looks/render_smoke.log"
+          scripts/check_draws.sh --fight "$RUNNER_TEMP/render-smoke/enemy_outpost/render_smoke.log"
+          scripts/check_draws.sh --fight "$RUNNER_TEMP/render-smoke/art_bench/render_smoke.log"
 
       - uses: actions/upload-artifact@v7
         if: always()

@@ -49,7 +49,7 @@ damage   = floor(floor(raw * counter / 1000) * variance / 1000)
 defender.hp -= damage
 ```
 
-`damage_variance_permille` defaults to 0 in `rules.ron`, so combat is exactly reproducible from stats alone and stays readable. Setting it above 0 draws from the single `Pcg32` in the sim, which is hashed, so replays still verify. Hits land immediately in the sim; projectiles are render-side only. Cooldowns are authored in deciseconds (`_ds` fields) and converted once by `Rules::ticks_from_ds`.
+`damage_variance_permille` defaults to 0 in `rules.ron`, so combat is exactly reproducible from stats alone and stays readable. Setting it above 0 draws from the single `Pcg32` in the sim, which is hashed, so replays still verify. Hits land immediately in the sim; projectiles are render-side only (art pass: `crates/game/src/combat_fx.rs` draws an arrow, a stone or a melee lunge for every `SimEvent::Hit`, chosen from the attacker's class and range, and never writes to the sim). Cooldowns are authored in deciseconds (`_ds` fields) and converted once by `Rules::ticks_from_ds`.
 
 ## Shooters
 

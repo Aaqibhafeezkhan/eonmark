@@ -31,7 +31,6 @@
 use std::collections::BTreeMap;
 
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use rules::Rules;
 use rules::strings::{Strings, fill};
 use sim::{BuildingId, PlayerId, RejectReason, SimEvent};
@@ -275,10 +274,7 @@ impl Plugin for EconomyHudPlugin {
 fn hud_text(text: &str) -> impl Bundle {
     (
         Text::new(text),
-        TextFont {
-            font_size: FontSize::Px(HUD_FONT_PX),
-            ..default()
-        },
+        crate::fonts::hud_font(HUD_FONT_PX),
         TextColor(palette::HUD_TEXT),
     )
 }
@@ -1172,5 +1168,60 @@ mod tests {
             resource_text(&s, &r, lore, 12, &uncapped),
             "Lore 12 / 999  +10 / 30 s"
         );
+    }
+
+    /// The top bar laid out with Inter at 1280 x 800 (`ui_test`): a stock
+    /// that changes without changing its number of digits moves no
+    /// readout. Each readout's figures are tabular (Inter's `tnum`), so
+    /// "Grain 111" and "Grain 444" are one width and every readout right of
+    /// it stays put; with Inter's default proportional figures '1' is
+    /// 5.7 px and '4' 9.0 px at 14 px, and each later readout would slide
+    /// by about 10 px. The same holds for the pop readout's own digits.
+    #[test]
+    fn readouts_hold_their_place_when_a_number_changes() {
+        use crate::ui_test::{layout_app, rect, settle};
+        let rules = rules();
+        let (setup, _) = sim::scenarios::economy_walkthrough(&rules);
+        let names: Vec<String> = rules
+            .resources
+            .resources
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let mut app = layout_app(UVec2::new(1280, 800));
+        app.world_mut()
+            .insert_non_send(SimHandle::from_setup(setup, rules));
+        app.add_systems(Startup, (crate::hud::spawn_hud, spawn_economy_hud).chain());
+        settle(&mut app);
+        let readouts: Vec<(usize, Entity)> = {
+            let mut q = app.world_mut().query::<(Entity, &ResourceReadout)>();
+            let mut v: Vec<(usize, Entity)> = q.iter(app.world()).map(|(e, r)| (r.0, e)).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(readouts.len(), names.len());
+        let pop = crate::ui_test::single::<PopReadout>(&mut app);
+        let set = |app: &mut App, digit: char| {
+            for (i, e) in &readouts {
+                let n: String = std::iter::repeat_n(digit, 3).collect();
+                app.world_mut().get_mut::<Text>(*e).unwrap().0 =
+                    format!("{} {n}  +{n} / 30 s", names[*i]);
+            }
+            let n: String = std::iter::repeat_n(digit, 2).collect();
+            app.world_mut().get_mut::<Text>(pop).unwrap().0 = format!("Pop {n} / {n}");
+            settle(app);
+            let mut rects: Vec<Rect> = readouts.iter().map(|(_, e)| rect(app, *e)).collect();
+            rects.push(rect(app, pop));
+            rects
+        };
+        let ones = set(&mut app, '1');
+        let fours = set(&mut app, '4');
+        for (i, (a, b)) in ones.iter().zip(&fours).enumerate() {
+            assert!(a.width() > 50.0, "readout {i} was measured: {a:?}");
+            assert!(
+                (a.min.x - b.min.x).abs() < 0.01 && (a.max.x - b.max.x).abs() < 0.01,
+                "readout {i} moved from {a:?} to {b:?}"
+            );
+        }
     }
 }

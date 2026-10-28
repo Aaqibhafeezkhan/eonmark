@@ -51,5 +51,10 @@ objc2-app-kit = { workspace = true, features = [
   "NSWorkspace",
 ] }
 
+[dev-dependencies]
+# HUD fit tests: Inter's advance widths (`fonts::measure`), the skrifa that
+# parley already locks.
+skrifa.workspace = true
+
 [lints]
 workspace = true

@@ -30,6 +30,12 @@
 //!   units and buildings, flat entities keyed by `TargetId` (M4b), and the
 //!   dev-only hierarchy check.
 //! - [`hud`]: top and bottom bars, `PointerOverUi`, the `hud_click` check.
+//! - [`minimap`]: the minimap bottom-left over the bottom bar (art pass):
+//!   terrain, territory, buildings, units, the selection and the view
+//!   trapezoid; a click or drag moves the camera, a right click orders;
+//!   [`minimap_check`] is its real-input check (`--minimap-check`).
+//! - [`fonts`]: Inter as the UI font, installed over Bevy's Fira Mono in
+//!   `Startup` (art pass).
 //! - [`age_hud`]: the age readout and the Advance button on a strip under
 //!   the top bar (M4b), greyed by `SimView::check_advance_age`.
 //! - [`camera`]: the yaw-locked RTS camera.
@@ -43,6 +49,8 @@
 //! - [`draw_stats`]: the draw-call counter (art pass), rebuilt from Bevy's
 //!   public render-phase data in the render world; the dev panel row and
 //!   the `draws` and `triangles` exit lines (`--draw-stats`, `dev`).
+//! - [`combat_fx`]: hit feedback (art pass): arrows, Mangonel stones and
+//!   melee lunges from `SimEvent::Hit`, presentation only.
 //! - [`markers`]: the attrition indicator under bleeding units, the supply
 //!   ring around a selected Supply Wain, the annexation timer around a
 //!   contested Town and the annexation readout (M5a).
@@ -64,6 +72,7 @@ pub mod buildings;
 pub mod camera;
 pub mod cli;
 pub mod click_check;
+pub mod combat_fx;
 pub mod command_card;
 #[cfg(feature = "dev")]
 pub mod dev_tools;
@@ -71,6 +80,7 @@ pub mod director;
 pub mod draw_stats;
 pub mod economy_hud;
 pub mod field;
+pub mod fonts;
 pub mod frame_stats;
 pub mod ground;
 pub mod headless;
@@ -80,6 +90,8 @@ pub mod hud;
 pub mod macos_menu;
 pub mod markers;
 pub mod menu;
+pub mod minimap;
+pub mod minimap_check;
 pub mod models;
 pub mod monitor_loss;
 pub mod orders;
@@ -91,3 +103,5 @@ pub mod render_watchdog;
 pub mod selection;
 pub mod sim_driver;
 pub mod terrain_props;
+#[cfg(test)]
+mod ui_test;

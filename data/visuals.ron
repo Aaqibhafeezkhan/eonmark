@@ -47,10 +47,12 @@
 //     roof mount sinks the pole into the building so the cloth clears it,
 //     and a free front corner of the footprint takes it on the ground.
 //     Every banner is one shared mesh with one material per team. The
-//     Mangonel carries the same banner (art slice 4), which follows it.
+//     Mangonel carries the same banner (art slice 4), which follows it,
+//     smaller, against its own 120‰ floor (owner decision 15).
 //     seat_flag_at (Town kinds) puts `seat_flag` on a Seat: on the castle's
 //     keep, inside the footprint and wholly above the Town's own banner, so
-//     a Seat reads apart from any other Town by its place.
+//     a Seat reads apart from any other Town by its place (owner decision
+//     16 of 2026-10-28 accepted this rule; no height ratio applies).
 // sites: one look per equal share of the build progress, neutral, scaled by
 //     the footprint side; rubble: the wreck of a destroyed building for
 //     ds deciseconds; terrain: props on forest, mountain and water (never
@@ -64,9 +66,10 @@
   // Shieldbearer 1.45 m, Outrider 2.05 m, 1.41x the Shieldbearer), lifted
   // 1 cm, each in its character's team swatch; the Mangonel is the catapult
   // of the KayKit catapult tower (its `catapult_*` nodes, turned to face +X,
-  // lowered from the tower top) with the team banner (scale 700, 204‰; it
-  // reaches past the engine's 0.5 m radius, so packed Mangonels' poles and
-  // cloths cross, an owner trade-off in docs/ART_STYLE.md); the Wain a
+  // lowered from the tower top) with the team banner centred on it (scale
+  // 450, a 1.25 m banner, 123‰ against the Mangonel's own 120‰ floor, owner
+  // decision 15 of 2026-10-28; it reaches 0.60 m from the centre, 0.10 m
+  // past the engine's 0.5 m radius, docs/ART_STYLE.md); the Wain a
   // KayKit wheelbarrow loaded with a sack and a crate, flying the flag 1.4x
   // as a pennant. Each fallback is the kind's M4b look. A one-line swap
   // back: `"yeoman": Primitive(Capsule),` (docs/ART_STYLE.md).
@@ -77,7 +80,7 @@
     "shieldbearer": Scene(path: "models/kaykit_adventurers/shieldbearer.glb", scale_x100: 60, y_offset_tiles_x100: 1, yaw_deg: 0, team: Some("adv_knight"), fallback: Some(Body(shape: Cuboid, height_tiles_x100: 130))),
     "bowman": Scene(path: "models/kaykit_adventurers/bowman.glb", scale_x100: 63, y_offset_tiles_x100: 1, yaw_deg: 0, team: Some("adv_rogue"), fallback: Some(Body(shape: Cylinder, height_tiles_x100: 190))),
     "outrider": Scene(path: "models/kaykit_adventurers/outrider.glb", scale_x100: 84, y_offset_tiles_x100: 1, yaw_deg: 0, team: Some("adv_knight"), fallback: Some(Body(shape: Capsule, height_tiles_x100: 180, lying: true))),
-    "mangonel": Scene(path: "models/kaykit_hexagon/buildings/blue/building_tower_catapult_blue.gltf", nodes: ["catapult_*"], scale_x100: 140, y_offset_tiles_x100: -195, yaw_deg: 90, x_offset_tiles_x100: 29, z_offset_tiles_x100: 6, team: Some("kaykit_hexagon"), fallback: Some(Primitive(Sphere)), banner_at: Some((offset_x100: (-40, 0, 40), scale_x100: 700))),
+    "mangonel": Scene(path: "models/kaykit_hexagon/buildings/blue/building_tower_catapult_blue.gltf", nodes: ["catapult_*"], scale_x100: 140, y_offset_tiles_x100: -195, yaw_deg: 90, x_offset_tiles_x100: 29, z_offset_tiles_x100: 6, team: Some("kaykit_hexagon"), fallback: Some(Primitive(Sphere)), banner_at: Some((offset_x100: (0, 0, 0), scale_x100: 450))),
     "supply_wain": Scene(path: "models/kaykit_hexagon/decoration/props/wheelbarrow.gltf", parts: [(path: "models/kaykit_hexagon/decoration/props/sack.gltf", offset_x100: (0, 11, 8), scale_x100: 130), (path: "models/kaykit_hexagon/decoration/props/crate_A_big.gltf", offset_x100: (0, 8, -6), scale_x100: 75), (path: "models/kaykit_hexagon/decoration/props/flag_blue.gltf", offset_x100: (0, 22, -8), scale_x100: 140)], scale_x100: 220, y_offset_tiles_x100: 1, yaw_deg: 90, x_offset_tiles_x100: 14, team: Some("kaykit_hexagon"), fallback: Some(Body(shape: Cuboid, height_tiles_x100: 60))),
   },
   // Scales fill 0.95 of the footprint side (the check's suggestion);

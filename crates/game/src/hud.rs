@@ -39,7 +39,6 @@ use bevy::picking::events::{Click, Pointer};
 use bevy::picking::hover::HoverMap;
 use bevy::picking::pointer::{Location, PointerAction, PointerButton, PointerId, PointerInput};
 use bevy::prelude::*;
-use bevy::text::FontSize;
 use bevy::window::{PrimaryWindow, WindowRef};
 use sim::{Command, UnitId, scenarios};
 
@@ -266,10 +265,7 @@ impl Plugin for HudPlugin {
 fn hud_text(text: &str) -> impl Bundle {
     (
         Text::new(text),
-        TextFont {
-            font_size: FontSize::Px(HUD_FONT_PX),
-            ..default()
-        },
+        crate::fonts::hud_font(HUD_FONT_PX),
         TextColor(palette::HUD_TEXT),
     )
 }

@@ -113,6 +113,21 @@ m5b-checks OUT="":
     cargo build -p sim-cli --locked --release
     scripts/m5b_checks.sh target/ci/eonmark target/release/sim-cli "{{OUT}}"
 
+# Art pass acceptance proxies, local only (ROADMAP "Art pass (pre-stream)"): data-check, the Yeoman swap walkthrough on a scratch copy of data/ (AP2), `inspect_gltf check` (AP3), check_assets and its self-test (AP1), then five windowed runs in background mode at 1280x720 that save art-units-40m.png, art-town-40m.png, art-battle-60m.png (with AP4's draw-call gate), art-match-minimap.png and, from a dev build, art-dev-panel.png (AP7), each verifying its replay; see scripts/art_checks.sh. On Linux without a display it runs under xvfb-run on lavapipe, about 9 minutes. The dev binary is kept as target/ci/eonmark-dev, since the plain build writes target/ci/eonmark.
+art-checks OUT="":
+    cargo build -p game --locked --profile ci --features dev
+    cp target/ci/eonmark target/ci/eonmark-dev
+    cargo build -p game --locked --profile ci
+    cargo build -p sim-cli --locked --release
+    cargo build -p inspect_gltf --locked --release
+    scripts/art_checks.sh target/ci/eonmark target/release/sim-cli target/release/inspect_gltf "{{OUT}}" target/ci/eonmark-dev
+
+# Art pass real-input checks, local only (AP10 and AP6): xdotool clicks every unit of `--scenario unit_looks --click-check` (`click_check: ok 16/16`) and performs the four steps of `--scenario economy_walkthrough --minimap-check` (`minimap_check: ok`) under Xvfb on lavapipe, and verifies both replays (needs Xvfb and xdotool; Linux); see scripts/art_drive.sh.
+art-drive OUT="":
+    cargo build -p game --locked --profile ci
+    cargo build -p sim-cli --locked --release
+    scripts/art_drive.sh target/ci/eonmark target/release/sim-cli "{{OUT}}"
+
 # Determinism self-test: scripted ticks twice on two threads, hashes must match.
 selftest:
     cargo run -p sim-cli --locked -- selftest

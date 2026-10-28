@@ -76,6 +76,8 @@ pub struct Budgets {
     pub unit_team_permille: u32,
     /// Least team share of the Supply Wain (only its pennant), permille.
     pub wain_team_permille: u32,
+    /// Least team share of the Mangonel (catapult plus banner), permille.
+    pub mangonel_team_permille: u32,
     /// Least team share of a building, permille.
     pub building_team_permille: u32,
     /// Least team share of the Seat flag, permille.
@@ -101,7 +103,12 @@ impl Default for Budgets {
     /// - edge props: `tree_single_B` 220.
     ///
     /// The team floors are the plan's (units 200‰, the Wain 80‰, buildings
-    /// 100‰); the Seat flag's 300‰ sits under its measured 457‰.
+    /// 100‰); the Seat flag's 300‰ sits under its measured 457‰. The
+    /// Mangonel's own floor is 120‰ (owner decision 15 of the art pass,
+    /// 2026-10-28: its banner shrinks to scale 450, about 123‰, "no crowd
+    /// clipping"; centred it still reaches 0.10 m past the 0.5 m radius,
+    /// which `check` notes, and a banner inside the radius would miss the
+    /// floor; every other unit keeps 200‰).
     fn default() -> Self {
         Budgets {
             file_bytes: 2 * 1024 * 1024,
@@ -115,6 +122,7 @@ impl Default for Budgets {
             edge_prop_triangles: 300,
             unit_team_permille: 200,
             wain_team_permille: 80,
+            mangonel_team_permille: 120,
             building_team_permille: 100,
             flag_team_permille: 300,
         }
@@ -653,6 +661,26 @@ pub fn check_visuals(
                     let h = height(&bp.tris);
                     banner_top = bounds(bp.tris.iter().flat_map(|(p, _)| p.iter())).map(|b| b.1[1]);
                     mounts_desc.push_str(&format!(" banner={h:.2}m"));
+                    if let Use::Unit(kind) = usage {
+                        // A unit's banner moves with it, so no footprint
+                        // holds it; how far it reaches from the unit's
+                        // centre in plan view (any facing) says whether
+                        // packed units' banners cross (owner decision 15).
+                        let reach = bp
+                            .tris
+                            .iter()
+                            .flat_map(|(p, _)| p.iter())
+                            .map(|v| v[0].hypot(v[2]))
+                            .fold(0.0f32, f32::max);
+                        let radius = kind.radius_tiles_x100 as f32 / 100.0;
+                        mounts_desc.push_str(&format!(" banner_reach={reach:.2}m"));
+                        if reach > radius + FOOTPRINT_TOLERANCE {
+                            notes.push(format!(
+                                "the banner reaches {reach:.2} m from the unit's centre, {:.2} m past its {radius:.2} m radius, so packed units' banners cross (a size for the owner to judge)",
+                                reach - radius
+                            ));
+                        }
+                    }
                     if let Use::Building(kind) = usage {
                         if let Some(past) = past_footprint(&bp.tris, kind) {
                             problems.push(format!(
@@ -754,6 +782,7 @@ pub fn check_visuals(
         if let Some(permille) = team_permille {
             let floor = match usage {
                 Use::Unit(k) if k.id == "supply_wain" => budgets.wain_team_permille,
+                Use::Unit(k) if k.id == "mangonel" => budgets.mangonel_team_permille,
                 Use::Unit(_) => budgets.unit_team_permille,
                 Use::Building(_) => budgets.building_team_permille,
                 Use::Flag | Use::Banner => budgets.flag_team_permille,
@@ -1542,9 +1571,11 @@ mod tests {
 
     /// Art slice 4 (owner decision 12): a unit's `banner_at` plants the
     /// team banner on it too, and its team share is measured on model plus
-    /// banner against the unit floor (200‰). A unit's banner may stand
-    /// taller than the unit (a standard on a pole over a siege engine),
-    /// unlike a building's.
+    /// banner against the unit floor: 200‰ for every unit but the Mangonel,
+    /// whose own floor is 120‰ (owner decision 15, 2026-10-28). A unit's
+    /// banner may stand taller than the unit (a standard on a pole over a
+    /// siege engine), unlike a building's, and the line prints how far it
+    /// reaches from the unit's centre, with a note past the unit's radius.
     #[test]
     fn check_measures_a_unit_banner() {
         let dir = TempDir::new("check-unit-banner");
@@ -1553,9 +1584,9 @@ mod tests {
         box_gltf(&m, "cart", [2.0, 1.5, 2.0], 0.0, false);
         box_gltf(&m, "flag", [0.1, 0.5, 1.0], 0.0, true);
         let rules = rules::Rules::load(repo_root().join("data")).unwrap();
-        let run = |banner: u32| {
+        let run = |kind: &str, banner: u32| {
             let text = format!(
-                r#"(units: {{ "mangonel": Scene(path: "m/cart.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("t"), banner_at: Some((offset_x100: (-80, 0, 80), scale_x100: {banner}))) }},
+                r#"(units: {{ "{kind}": Scene(path: "m/cart.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("t"), banner_at: Some((offset_x100: (-80, 0, 80), scale_x100: {banner}))) }},
                    buildings: {{}},
                    team_swatches: {{ "t": (rects: [(4, 0, 4, 4)], desaturate_permille: 0) }},
                    banner: Some(Scene(path: "m/flag.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 270, team: Some("t"))))"#
@@ -1570,24 +1601,46 @@ mod tests {
             )
             .text()
         };
-        // At 1.5x the banner lifts the neutral cart to 108‰: under 200‰.
-        let text = run(150);
+        // At 1.5x the banner lifts the neutral cart to 108‰: under even the
+        // Mangonel's 120‰.
+        let text = run("mangonel", 150);
         assert!(
             text.contains(
-                "FAIL units[\"mangonel\"] m/cart.gltf: team area 108‰ (model plus banner) is under the 200‰ floor"
+                "FAIL units[\"mangonel\"] m/cart.gltf: team area 108‰ (model plus banner) is under the 120‰ floor"
+            ),
+            "{text}"
+        );
+        // At 1.9x it gives 161‰ (3.97 of 24.69 m² on team texels): over the
+        // Mangonel's floor, under every other unit's 200‰.
+        let text = run("mangonel", 190);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("ok units[\"mangonel\"]") && l.contains(" team=161‰ ")),
+            "{text}"
+        );
+        let text = run("skirmisher", 190);
+        assert!(
+            text.contains(
+                "FAIL units[\"skirmisher\"] m/cart.gltf: team area 161‰ (model plus banner) is under the 200‰ floor"
             ),
             "{text}"
         );
         // At 4x it stands 2.00 m over the 1.5 m cart and passes: 17.6 of
-        // 40.8 m² on team texels.
-        let text = run(400);
+        // 40.8 m² on team texels. Turned by yaw 270 the 1.0 m deep flag lies
+        // along x, so its far corner at (-0.8 - 2.0, 0.8 + 0.2) is 2.97 m
+        // from the centre, 2.47 m past the Mangonel's 0.5 m radius.
+        let text = run("mangonel", 400);
         let line = text
             .lines()
             .find(|l| l.starts_with("ok units[\"mangonel\"]"))
             .unwrap_or_else(|| panic!("{text}"));
         assert!(
-            line.contains(" team=431‰ model_team=0‰ banner=2.00m "),
+            line.contains(" team=431‰ model_team=0‰ banner=2.00m banner_reach=2.97m "),
             "{line}"
+        );
+        assert!(
+            text.contains("note units[\"mangonel\"]: the banner reaches 2.97 m from the unit's centre, 2.47 m past its 0.50 m radius"),
+            "{text}"
         );
         assert!(!text.contains("taller than"), "{text}");
     }

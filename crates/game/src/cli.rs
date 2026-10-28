@@ -14,8 +14,9 @@
 //! The art pass adds `--assets-dir <dir>` ([`Cli::resolve_assets_dir`], also
 //! `EONMARK_ASSETS`), `--window-size <W>x<H>`, `--grid` (the debug grid,
 //! off by default; G toggles it), `--draw-stats` (the draw-call counter,
-//! `crate::draw_stats`) and `--click-check` (every unit selectable by a
-//! real click, `crate::click_check`).
+//! `crate::draw_stats`), `--click-check` (every unit selectable by a
+//! real click, `crate::click_check`) and `--minimap-check` (the minimap's
+//! input with real clicks, `crate::minimap_check`).
 //! Parsing is complete and tested here.
 
 use std::path::{Path, PathBuf};
@@ -87,6 +88,12 @@ Options:
                                each primary click against the next target, then print
                                `click_check: ok <n>/<n>` (exit 0) or `click_check: FAIL
                                ...` (exit 1). A driver clicks with real X input.
+  --minimap-check              With --scenario economy_walkthrough: from tick 40 print
+                               the minimap's rect and four steps (`minimap_check: step
+                               <n> ...`: press, drag, right click, A then left click),
+                               judge each, then print `minimap_check: ok` (exit 0) or
+                               `minimap_check: FAIL ...` (exit 1). A driver performs the
+                               steps with real X input.
   -h, --help                   Show this text.
 
 Data directory resolution order:
@@ -225,6 +232,9 @@ pub struct Cli {
     /// `--click-check` (art pass): print every unit's click target and
     /// judge real clicks against them (`crate::click_check`).
     pub click_check: bool,
+    /// `--minimap-check` (art pass): print the minimap's steps and judge
+    /// real input against them (`crate::minimap_check`).
+    pub minimap_check: bool,
 }
 
 impl Default for Cli {
@@ -254,6 +264,7 @@ impl Default for Cli {
             grid: false,
             draw_stats: false,
             click_check: false,
+            minimap_check: false,
         }
     }
 }
@@ -343,6 +354,7 @@ impl Cli {
                 "--grid" => cli.grid = true,
                 "--draw-stats" => cli.draw_stats = true,
                 "--click-check" => cli.click_check = true,
+                "--minimap-check" => cli.minimap_check = true,
                 "--scenario" => {
                     let name = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
                     if name.is_empty() || name.starts_with("--") {
@@ -426,6 +438,7 @@ impl Cli {
                 (cli.grid, "--grid"),
                 (cli.draw_stats, "--draw-stats"),
                 (cli.click_check, "--click-check"),
+                (cli.minimap_check, "--minimap-check"),
                 (cli.fast_forward_to.is_some(), "--fast-forward-to"),
                 (
                     cli.new_game_after_seconds.is_some(),
@@ -440,6 +453,12 @@ impl Cli {
         if cli.click_check && cli.headless_run.is_none() && cli.scenario.is_none() {
             return Err(
                 "--click-check judges clicks on a scenario's units; add --scenario unit_looks"
+                    .into(),
+            );
+        }
+        if cli.minimap_check && cli.headless_run.is_none() && cli.scenario.is_none() {
+            return Err(
+                "--minimap-check drives a scenario's minimap; add --scenario economy_walkthrough"
                     .into(),
             );
         }
@@ -696,6 +715,7 @@ mod tests {
                 grid: false,
                 draw_stats: false,
                 click_check: false,
+                minimap_check: false,
             })
         );
         let Parsed::Run(cli) = parsed else {
@@ -983,11 +1003,22 @@ mod tests {
         );
         let err = parse(&["--click-check"]).unwrap_err();
         assert!(err.contains("--scenario unit_looks"), "{err}");
+        assert_eq!(
+            parse(&["--scenario", "economy_walkthrough", "--minimap-check"]),
+            Ok(Parsed::Run(Cli {
+                scenario: Some("economy_walkthrough".into()),
+                minimap_check: true,
+                ..Cli::default()
+            }))
+        );
+        let err = parse(&["--minimap-check"]).unwrap_err();
+        assert!(err.contains("--scenario economy_walkthrough"), "{err}");
         for flag in [
             vec!["--window-size", "1280x720"],
             vec!["--grid"],
             vec!["--draw-stats"],
             vec!["--click-check"],
+            vec!["--minimap-check"],
         ] {
             let mut args = vec!["--headless-run", "10"];
             args.extend(flag.iter().copied());
