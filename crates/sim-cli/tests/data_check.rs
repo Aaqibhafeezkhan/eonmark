@@ -36,10 +36,24 @@ fn edited_copy(name: &str, file: &str, edit: impl FnOnce(String) -> String) -> P
     dir
 }
 
+/// The repository's `assets/` directory.
+fn repo_assets() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
+}
+
+/// `sim-cli data-check <dir> --assets <repo assets>`: copies of `data/` live
+/// in a temporary directory with no `assets/` beside them, so their Scene
+/// files are checked against the repository's.
 fn data_check(dir: &Path) -> Output {
+    data_check_with(dir, &["--assets".as_ref(), repo_assets().as_os_str()])
+}
+
+/// `sim-cli data-check <dir>` with `flags`.
+fn data_check_with(dir: &Path, flags: &[&std::ffi::OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sim-cli"))
         .arg("data-check")
         .arg(dir)
+        .args(flags)
         .output()
         .expect("sim-cli runs")
 }
@@ -69,6 +83,26 @@ fn repo_data_passes_with_three_ages_eight_kinds_and_twelve_techs() {
         stdout.contains(" factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en"),
         "{stdout}"
     );
+    // Art pass: the visuals counts and the Scene files found under assets/.
+    assert_visuals_line(&stdout);
+    // The default assets directory is `<data>/../assets`, the repository's.
+    let default = text(&data_check_with(&repo_data(), &[]).stdout);
+    assert_eq!(default, stdout);
+}
+
+/// The art pass's end of the `OK` line: `strings=en visuals=units:8
+/// buildings:8 terrain:<n> models=<n>`, with nothing after the model count
+/// (the terrain and model counts follow `visuals.ron`).
+fn assert_visuals_line(stdout: &str) {
+    let line = stdout.trim_end();
+    let (_, tail) = line
+        .split_once(" strings=en visuals=units:8 buildings:8 terrain:")
+        .unwrap_or_else(|| panic!("no visuals counts: {line}"));
+    let (terrain, models) = tail
+        .split_once(" models=")
+        .unwrap_or_else(|| panic!("no model count: {line}"));
+    assert!(terrain.parse::<u32>().is_ok(), "{line}");
+    assert!(models.parse::<u32>().is_ok(), "{line}");
 }
 
 /// Run data-check on a copy of `data/` with the first `from` in `file`
@@ -292,4 +326,110 @@ fn a_valid_visuals_edit_keeps_the_rules_hash() {
     assert!(edited_out.contains(" rules_hash=0x"), "{edited_out}");
     assert_eq!(repo_out, edited_out);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Art pass: `visuals.ron` needs a visual for every building kind too.
+#[test]
+fn a_building_without_a_visual_exits_1_naming_visuals_ron() {
+    rejects_edit(
+        "building-visual-missing",
+        "visuals.ron",
+        "    \"croft\": Primitive(Cuboid),\n",
+        "",
+        &[r#"buildings["croft"]: "#, "every building kind"],
+    );
+    rejects_edit(
+        "building-visual-sphere",
+        "visuals.ron",
+        r#""croft": Primitive(Cuboid)"#,
+        r#""croft": Primitive(Sphere)"#,
+        &[r#"buildings["croft"]: "#, "Primitive(Cuboid)"],
+    );
+}
+
+/// A copy of `data/` whose Town is a Scene naming `models/test/castle.gltf`,
+/// and an empty assets directory beside it.
+fn scene_copy(name: &str) -> (PathBuf, PathBuf) {
+    let dir = edited_copy(name, "visuals.ron", |text| {
+        let from = r#""town": Primitive(Cuboid)"#;
+        assert!(
+            text.contains(from),
+            "visuals.ron no longer contains {from:?}"
+        );
+        text.replacen(
+            from,
+            r#""town": Scene(path: "models/test/castle.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, fallback: Some(Primitive(Cuboid)))"#,
+            1,
+        )
+    });
+    let assets = dir.with_file_name(format!(
+        "{}-assets",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&assets);
+    std::fs::create_dir_all(&assets).unwrap();
+    (dir, assets)
+}
+
+/// The Scene-file check: a Scene whose file is missing under `--assets`
+/// exits 1 naming `visuals.ron`, the field and the path; once the file is
+/// there, the line counts one model.
+#[test]
+fn a_scene_whose_file_is_missing_exits_1_naming_the_path() {
+    let (dir, assets) = scene_copy("scene-missing");
+    let out = data_check_with(&dir, &["--assets".as_ref(), assets.as_os_str()]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}{stderr}", text(&out.stdout));
+    assert!(
+        stderr.starts_with("error: ")
+            && stderr.lines().count() == 1
+            && stderr.contains("visuals.ron: buildings[\"town\"].path: ")
+            && stderr.contains(r#""models/test/castle.gltf" is not a file under "#),
+        "{stderr}"
+    );
+    std::fs::create_dir_all(assets.join("models/test")).unwrap();
+    std::fs::write(assets.join("models/test/castle.gltf"), "{}").unwrap();
+    let out = data_check_with(&dir, &["--assets".as_ref(), assets.as_os_str()]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert_visuals_line(&stdout);
+    assert!(stdout.trim_end().ends_with(" models=1"), "{stdout}");
+    // `--assets` and `--no-assets` exclude each other.
+    let both = data_check_with(
+        &dir,
+        &[
+            "--assets".as_ref(),
+            assets.as_os_str(),
+            "--no-assets".as_ref(),
+        ],
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", text(&both.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&assets);
+}
+
+/// `--no-assets` skips the file check, still counts the Scene files and
+/// says so on the `OK` line; the default assets directory is the one beside
+/// the data directory, where the file is missing.
+#[test]
+fn no_assets_skips_the_file_check() {
+    let (dir, assets) = scene_copy("scene-no-assets");
+    let out = data_check_with(&dir, &["--no-assets".as_ref()]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", text(&out.stderr));
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with(" models=1 (files not checked: --no-assets)"),
+        "{stdout}"
+    );
+    let out = data_check_with(&dir, &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("castle.gltf"),
+        "{}",
+        text(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&assets);
 }

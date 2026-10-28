@@ -32,12 +32,16 @@
 //! match; [`stalemate_45min`] (M5a) runs to the 45-minute cap with no unit;
 //! [`combat_bench_harrying`] (M5a) is [`combat_bench`] with attrition on.
 //!
+//! [`art_bench`] (art pass) is the draw-call and frame-time stress scene of
+//! the game: two full Towns and 400 units fighting in front of P0's.
+//!
 //! Scenarios start empty ([`StartKind::Empty`]) except
 //! [`economy_second_town`], [`economy_walkthrough`], the two outpost
-//! scenarios and [`capture_seat`], which start from the standard start. On
-//! `plains_1v1` that start creates the Seats `BuildingId(1)` (P0) and
-//! `BuildingId(2)` (P1), P0's Yeomen `UnitId(1..=5)` and P1's
-//! `UnitId(6..=10)`, so a stream's own buildings begin at `BuildingId(3)`.
+//! scenarios, [`capture_seat`] and [`art_bench`], which start from the
+//! standard start. On `plains_1v1` that start creates the Seats
+//! `BuildingId(1)` (P0) and `BuildingId(2)` (P1), P0's Yeomen
+//! `UnitId(1..=5)` and P1's `UnitId(6..=10)`, so a stream's own buildings
+//! begin at `BuildingId(3)`.
 
 use crate::ai_hook::{AiController, SimView};
 use crate::command::{Command, PlayerCommand};
@@ -134,8 +138,9 @@ pub const ECONOMY_WALKTHROUGH_TICKS: u32 = 2400;
 /// scenario and `enemy_outpost_walkthrough` its scripted proxy, the M4b
 /// golden fixture; `capture_seat` (M5a) is the annexation acceptance
 /// scenario and golden, and `stalemate_45min` the 45-minute territory
-/// golden.
-pub const NAMES: [&str; 16] = [
+/// golden; `art_bench` (art pass) is the windowed stress scene, never a
+/// fixture.
+pub const NAMES: [&str; 17] = [
     "move_500",
     "move_500_short",
     "group_spiral",
@@ -152,6 +157,7 @@ pub const NAMES: [&str; 16] = [
     "enemy_outpost_walkthrough",
     "capture_seat",
     "stalemate_45min",
+    "art_bench",
 ];
 
 /// Spawn rows of [`bench_cross`]: a band along the west side from the
@@ -1898,6 +1904,248 @@ pub fn stalemate_45min(rules: &Rules) -> (MatchSetup, Stream) {
     (setup, stream)
 }
 
+/// Seed of [`art_bench`].
+pub const ART_BENCH_SEED: u64 = 40;
+/// Length of [`art_bench`] by name: two minutes, well past the fight. A
+/// windowed scene (`--scenario art_bench`), never a fixture.
+pub const ART_BENCH_TICKS: u32 = 2400;
+/// P0's complete buildings in [`art_bench`] around its Seat (whose
+/// north-west tile is (23, 63)), as `(kind id, north-west tile)`, placed in
+/// this order as `BuildingId(3..=13)`: five Crofts, the Lumber Yard beside
+/// the forest at (10-18, 48-56), the Ore Pit beside the mountain at
+/// (32-36, 52-56), the Scriptorium, the Muster Hall, the Engine Yard and the
+/// Watchtower. With the Seat that is twelve complete buildings. Every
+/// footprint is grass and clear of the ring two tiles around the Seat,
+/// where the start Yeomen stand. P1's are mirrored across the map's
+/// `MirrorX` midline ([`art_bench_mirror`]), `BuildingId(17..=27)`.
+pub const ART_BENCH_P0_BUILDINGS: [(&str, Tile); 11] = [
+    ("croft", Tile::new(18, 60)),
+    ("croft", Tile::new(18, 66)),
+    ("croft", Tile::new(21, 69)),
+    ("croft", Tile::new(24, 69)),
+    ("croft", Tile::new(27, 69)),
+    ("lumber_yard", Tile::new(19, 52)),
+    ("ore_pit", Tile::new(30, 53)),
+    ("scriptorium", Tile::new(28, 58)),
+    ("muster_hall", Tile::new(29, 63)),
+    ("engine_yard", Tile::new(13, 63)),
+    ("watchtower", Tile::new(31, 68)),
+];
+/// P0's construction sites in [`art_bench`] (progress 0),
+/// `BuildingId(14..=16)`: P0's start Yeomen build the first two from
+/// [`ART_BENCH_BUILD_TICK`] (Yeomen 1 and 2 the Croft, 3 to 5 the Muster
+/// Hall), and the Watchtower site stays at its start, so all three
+/// construction stages show.
+pub const ART_BENCH_P0_SITES: [(&str, Tile); 3] = [
+    ("croft", Tile::new(15, 69)),
+    ("muster_hall", Tile::new(13, 58)),
+    ("watchtower", Tile::new(20, 74)),
+];
+/// Tick during which [`art_bench`] sends P0's start Yeomen to the first two
+/// sites (tick 1 issues nothing, as in every scenario).
+pub const ART_BENCH_BUILD_TICK: u32 = 2;
+/// Tick during which [`art_bench`]'s two armies attack-move at each other.
+pub const ART_BENCH_CHARGE_TICK: u32 = 20;
+/// Tick during which [`art_bench`] damages three of P0's buildings
+/// ([`ART_BENCH_DAMAGED`]), so their health bars show.
+pub const ART_BENCH_DAMAGE_TICK: u32 = 30;
+/// The P0 buildings [`art_bench`] takes a third of the hit points from:
+/// the first Croft, the Scriptorium and the Muster Hall.
+pub const ART_BENCH_DAMAGED: [BuildingId; 3] = [BuildingId(3), BuildingId(10), BuildingId(11)];
+/// Each side's army in [`art_bench`], `(kind id, count)`, front to back:
+/// 195 units, so with the five start Yeomen 200 a side.
+pub const ART_BENCH_ARMY: [(&str, u16); 8] = [
+    ("skirmisher", 60),
+    ("shieldbearer", 40),
+    ("bowman", 40),
+    ("outrider", 24),
+    ("mangonel", 10),
+    ("supply_wain", 6),
+    ("yeoman", 10),
+    ("scribe", 5),
+];
+/// Units per spawn point of an [`art_bench`] army: each kind's count is
+/// split into groups of at most this many, one `DebugSpawn` each (21
+/// groups a side).
+pub const ART_BENCH_GROUP: u16 = 10;
+/// Spawn columns of P0's army, front (east) first: the groups fill the
+/// front column's [`ART_BENCH_ROWS`] first, then the next. A group stands
+/// on the nearest passable tiles around its point, so the army covers
+/// about x 34-42.
+pub const ART_BENCH_P0_COLUMNS: [i32; 3] = [41, 38, 35];
+/// Spawn columns of P1's army, front (west) first: about x 51-59, eight
+/// tiles clear of P0's front, beyond `acquire_range_tiles`, so the fight
+/// starts with the charge.
+pub const ART_BENCH_P1_COLUMNS: [i32; 3] = [52, 55, 58];
+/// Spawn rows of both armies (south of P0's mountain at (32-36, 52-56)).
+pub const ART_BENCH_ROWS: [i32; 7] = [58, 61, 64, 67, 70, 73, 76];
+/// Where each army's armed units attack-move to, by owner: the middle of
+/// the other army.
+pub const ART_BENCH_TARGETS: [FxVec2; 2] = [FxVec2::from_ints(55, 67), FxVec2::from_ints(38, 67)];
+
+/// `nw`, the north-west tile of a `kind` footprint, mirrored across the
+/// vertical midline of a map `width` tiles wide (`MirrorX`: column `x`
+/// becomes `width - 1 - x`, so the footprint's east column becomes the
+/// mirror's west column).
+pub fn art_bench_mirror(rules: &Rules, kind: &str, nw: Tile, width: u16) -> Tile {
+    let w = rules
+        .building_kind_by_id(kind)
+        .unwrap_or_else(|| panic!("buildings.ron has {kind}"))
+        .1
+        .width_tiles;
+    let w = u16::try_from(w).expect("validated footprint");
+    Tile::new(width - nw.x - w, nw.y)
+}
+
+/// The art-pass stress scene (`--scenario art_bench`, seed
+/// [`ART_BENCH_SEED`], standard start on `plains_1v1`): two full Towns and
+/// 400 units fighting in front of P0's, for the draw-call counter and the
+/// frame-time lines. Never a fixture. Ids from the standard start: the
+/// Seats `BuildingId(1)` and `BuildingId(2)`, P0's Yeomen `UnitId(1..=5)`
+/// and P1's `UnitId(6..=10)`.
+///
+/// - During tick 0, P0 places its eleven complete buildings
+///   ([`ART_BENCH_P0_BUILDINGS`], `BuildingId(3..=13)`) and three sites
+///   ([`ART_BENCH_P0_SITES`], `BuildingId(14..=16)`), and spawns its army
+///   ([`ART_BENCH_ARMY`] at [`ART_BENCH_P0_COLUMNS`] x [`ART_BENCH_ROWS`],
+///   `UnitId(11..=205)`); P1 places the mirrored buildings
+///   (`BuildingId(17..=27)`) and spawns its army east of P0's
+///   ([`ART_BENCH_P1_COLUMNS`], `UnitId(206..=400)`). Each player has
+///   twelve complete buildings and 200 units.
+/// - During [`ART_BENCH_BUILD_TICK`] P0's start Yeomen go to work on the
+///   first two sites.
+/// - During [`ART_BENCH_CHARGE_TICK`] each army's armed units (kinds with
+///   an attack) attack-move to the middle of the other
+///   ([`ART_BENCH_TARGETS`]).
+/// - During [`ART_BENCH_DAMAGE_TICK`] three of P0's buildings lose a third
+///   of their hit points ([`ART_BENCH_DAMAGED`]).
+///
+/// No command is rejected. Length [`ART_BENCH_TICKS`] (informational).
+pub fn art_bench(rules: &Rules) -> (MatchSetup, Stream) {
+    let mut setup = MatchSetup::scenario(rules, ART_BENCH_SEED);
+    setup.start = StartKind::Standard;
+    let width = rules
+        .map(&setup.map)
+        .expect("the setup map is in the rules")
+        .width;
+    let mut seq = [0u32; 2];
+    let mut cmd = |owner: u8, c: Command| {
+        let i = usize::from(owner);
+        seq[i] += 1;
+        PlayerCommand::new(PlayerId(owner), seq[i] - 1, c)
+    };
+    let place = |owner: u8, kind: &str, tile: Tile, complete: bool| Command::DebugPlaceBuilding {
+        owner: PlayerId(owner),
+        kind: building_kind(rules, kind),
+        tile,
+        complete,
+    };
+    let armed = |kind: &str| {
+        rules
+            .units
+            .iter()
+            .find(|u| u.id == kind)
+            .is_some_and(|u| u.attack.is_some())
+    };
+    let mut tick0 = Vec::new();
+    for (kind, tile) in ART_BENCH_P0_BUILDINGS {
+        tick0.push(cmd(0, place(0, kind, tile, true)));
+    }
+    for (kind, tile) in ART_BENCH_P0_SITES {
+        tick0.push(cmd(0, place(0, kind, tile, false)));
+    }
+    // Both armies in groups of at most ART_BENCH_GROUP, front column
+    // first; P0's ids follow the ten start Yeomen, P1's follow P0's (the
+    // sim applies P0's commands before P1's).
+    let mut next_id = 11u32;
+    let mut charges = Vec::new();
+    for (owner, columns) in [(0u8, ART_BENCH_P0_COLUMNS), (1, ART_BENCH_P1_COLUMNS)] {
+        if owner == 1 {
+            for (kind, tile) in ART_BENCH_P0_BUILDINGS {
+                let mirrored = art_bench_mirror(rules, kind, tile, width);
+                tick0.push(cmd(1, place(1, kind, mirrored, true)));
+            }
+        }
+        let mut points = columns
+            .iter()
+            .flat_map(|&x| ART_BENCH_ROWS.iter().map(move |&y| FxVec2::from_ints(x, y)));
+        let mut armed_ids = Vec::new();
+        for (kind, count) in ART_BENCH_ARMY {
+            let mut left = count;
+            while left > 0 {
+                let n = left.min(ART_BENCH_GROUP);
+                let at = points.next().expect("a spawn point per group");
+                tick0.push(cmd(
+                    owner,
+                    Command::DebugSpawn {
+                        owner: PlayerId(owner),
+                        kind: unit_kind(rules, kind),
+                        at,
+                        count: n,
+                    },
+                ));
+                if armed(kind) {
+                    armed_ids.extend((next_id..next_id + u32::from(n)).map(UnitId));
+                }
+                next_id += u32::from(n);
+                left -= n;
+            }
+        }
+        charges.push((owner, armed_ids));
+    }
+    let builds = (1..=5u32)
+        .map(|u| {
+            let (kind, tile) = ART_BENCH_P0_SITES[if u <= 2 { 0 } else { 1 }];
+            cmd(
+                0,
+                Command::Build {
+                    unit: UnitId(u),
+                    kind: building_kind(rules, kind),
+                    tile,
+                },
+            )
+        })
+        .collect();
+    let charge = charges
+        .into_iter()
+        .map(|(owner, units)| {
+            cmd(
+                owner,
+                Command::AttackMove {
+                    units,
+                    target: ART_BENCH_TARGETS[usize::from(owner)],
+                },
+            )
+        })
+        .collect();
+    let damage = ART_BENCH_DAMAGED
+        .iter()
+        .map(|&b| {
+            let i = usize::try_from(b.0 - 3).expect("one of P0's complete buildings");
+            let kind = ART_BENCH_P0_BUILDINGS[i].0;
+            let hp = rules
+                .building_kind_by_id(kind)
+                .unwrap_or_else(|| panic!("buildings.ron has {kind}"))
+                .1
+                .hp;
+            cmd(
+                0,
+                Command::DebugDamage {
+                    target: crate::ids::TargetId::Building(b),
+                    amount: hp / 3,
+                },
+            )
+        })
+        .collect();
+    let stream = vec![
+        (0, tick0),
+        (ART_BENCH_BUILD_TICK, builds),
+        (ART_BENCH_CHARGE_TICK, charge),
+        (ART_BENCH_DAMAGE_TICK, damage),
+    ];
+    (setup, stream)
+}
+
 /// Look a scenario up by name: `(setup, stream, ticks)`.
 pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
     let (setup, stream, ticks) = match name {
@@ -1964,6 +2212,10 @@ pub fn by_name(name: &str, rules: &Rules) -> Option<(MatchSetup, Stream, u32)> {
         "stalemate_45min" => {
             let (s, c) = stalemate_45min(rules);
             (s, c, rules.match_cap_ticks())
+        }
+        "art_bench" => {
+            let (s, c) = art_bench(rules);
+            (s, c, ART_BENCH_TICKS)
         }
         _ => return None,
     };
@@ -2296,6 +2548,136 @@ mod tests {
         assert_eq!(b.construction, crate::state::Construction::Complete);
         assert_eq!(view.buildings().count(), 1);
         assert!(combat_bench_harrying(&rules, 7, 1).1.is_empty());
+    }
+
+    /// The art-pass stress scene: once its tick-0 commands apply, two
+    /// Seats, twelve complete buildings a side with the documented ids and
+    /// tiles (P1's mirrored), P0's three sites at progress 0, and 200 units
+    /// a side with the documented ids and kinds; no command is rejected,
+    /// up to the damage beat either.
+    #[test]
+    fn art_bench_places_two_full_towns_and_400_units() {
+        use crate::state::Construction;
+        let rules = rules();
+        let (setup, stream) = art_bench(&rules);
+        assert_eq!(setup.start, StartKind::Standard);
+        let width = rules.map(&setup.map).unwrap().width;
+        let delay = setup.cmd_delay;
+        let mut sim = Sim::new(setup, rules.clone(), Box::new(NoSlots));
+        // Step to `ticks`, returning the rejections on the way.
+        let step_to = |sim: &mut Sim, ticks: u32| {
+            let mut rejected = Vec::new();
+            while sim.tick() < ticks {
+                sim.step(commands_at(&stream, sim.tick()));
+                rejected.extend(
+                    sim.drain_events()
+                        .into_iter()
+                        .filter(|e| matches!(e, crate::SimEvent::CommandRejected { .. })),
+                );
+            }
+            rejected
+        };
+        let rejected = step_to(&mut sim, delay + 1);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let view = sim.view();
+        // Buildings: the Seats, P0's eleven and three sites, P1's eleven.
+        assert_eq!(view.buildings().count(), 2 + 11 + 3 + 11);
+        let seats: Vec<_> = view
+            .buildings()
+            .filter(|b| b.town_state.as_ref().is_some_and(|t| t.seat))
+            .map(|b| (b.id, b.owner))
+            .collect();
+        assert_eq!(
+            seats,
+            [(BuildingId(1), PlayerId(0)), (BuildingId(2), PlayerId(1))]
+        );
+        for p in [PlayerId(0), PlayerId(1)] {
+            let complete = view
+                .buildings()
+                .filter(|b| b.owner == p && b.construction == Construction::Complete)
+                .count();
+            assert_eq!(complete, 12, "{p:?}");
+        }
+        for (i, (kind, tile)) in ART_BENCH_P0_BUILDINGS.iter().enumerate() {
+            let id = u32::try_from(i).unwrap();
+            let p0 = view.building(BuildingId(3 + id)).expect("P0's building");
+            assert_eq!(
+                (p0.owner, p0.kind, p0.tile, &p0.construction),
+                (
+                    PlayerId(0),
+                    building_kind(&rules, kind),
+                    *tile,
+                    &Construction::Complete
+                )
+            );
+            let p1 = view.building(BuildingId(17 + id)).expect("P1's building");
+            let mirrored = art_bench_mirror(&rules, kind, *tile, width);
+            assert_eq!(
+                (p1.owner, p1.kind, p1.tile),
+                (PlayerId(1), building_kind(&rules, kind), mirrored)
+            );
+            // The mirror of the mirror is the original.
+            assert_eq!(art_bench_mirror(&rules, kind, mirrored, width), *tile);
+        }
+        for (i, (kind, tile)) in ART_BENCH_P0_SITES.iter().enumerate() {
+            let id = u32::try_from(i).unwrap();
+            let site = view.building(BuildingId(14 + id)).expect("P0's site");
+            assert_eq!(
+                (site.owner, site.kind, site.tile, &site.construction),
+                (
+                    PlayerId(0),
+                    building_kind(&rules, kind),
+                    *tile,
+                    &Construction::Site { progress: 0 }
+                )
+            );
+        }
+        // Units: the start Yeomen, then P0's army, then P1's, in
+        // ART_BENCH_ARMY order.
+        assert_eq!(view.unit_count(), 400);
+        let mut kinds: Vec<UnitKindId> = Vec::new();
+        for (kind, count) in ART_BENCH_ARMY {
+            kinds.extend(std::iter::repeat_n(
+                unit_kind(&rules, kind),
+                usize::from(count),
+            ));
+        }
+        assert_eq!(kinds.len(), 195);
+        let yeoman = unit_kind(&rules, "yeoman");
+        for u in view.units() {
+            let (owner, kind) = match u.id.0 {
+                1..=5 => (0, yeoman),
+                6..=10 => (1, yeoman),
+                11..=205 => (0, kinds[usize::try_from(u.id.0 - 11).unwrap()]),
+                _ => (1, kinds[usize::try_from(u.id.0 - 206).unwrap()]),
+            };
+            assert_eq!((u.owner, u.kind), (PlayerId(owner), kind), "{:?}", u.id);
+            // The armies stand where the doc says: P0's at about x 34-42,
+            // P1's at about x 51-59, south of row 56.
+            if u.id.0 > 10 {
+                let tile = view.map().tile_of(u.pos);
+                let (lo, hi) = if owner == 0 { (33, 43) } else { (50, 60) };
+                assert!((lo..=hi).contains(&tile.x), "{:?} at {tile:?}", u.id);
+                assert!((56..=78).contains(&tile.y), "{:?} at {tile:?}", u.id);
+            }
+        }
+        // Up to the damage beat: the Yeomen build, the armies charge, three
+        // of P0's buildings lose a third of their hit points, and nothing
+        // is rejected.
+        let rejected = step_to(&mut sim, ART_BENCH_DAMAGE_TICK + delay + 1);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let view = sim.view();
+        for b in ART_BENCH_DAMAGED {
+            let building = view.building(b).expect("damaged, not destroyed");
+            let max = rules.building_kind(building.kind.0).unwrap().hp;
+            assert_eq!(i64::from(building.hp), i64::from(max - max / 3), "{b:?}");
+        }
+        for u in 1..=5 {
+            assert!(
+                view.unit(UnitId(u)).is_some_and(|u| u.order.is_some()),
+                "Yeoman {u} works on a site"
+            );
+        }
     }
 
     #[test]

@@ -33,9 +33,11 @@
 //! kinds and counts, or the building with its state (construction
 //! progress, Town tier, workers, the techs researched there, the training
 //! and research queue). One selected unit of either player, or the
-//! selected own building, also shows its hit points (M4b); another
-//! player's building is not selectable yet (`selection::on_building_click`),
-//! so its hit points show only on its bar once it is damaged. The panel
+//! selected own building, also shows its hit points (M4b); a selection of
+//! more than [`MAX_KIND_LINES`] unit kinds ends in an "+N more kinds" line
+//! (art pass); another player's building is not selectable yet
+//! (`selection::on_building_click`), so its hit points show only on its
+//! bar once it is damaged. The panel
 //! takes the room left of the card, up to [`INFO_WIDTH_PX`]: each line a
 //! Scriptorium shows fits one row of that, so its five lines (name, hit
 //! points, workers, researched, queue) fit the bar and the queue line stays
@@ -89,6 +91,13 @@ pub const CARD_FONT_PX: f32 = 12.0;
 /// (67 characters of 8.4 px at the 14 px HUD font): its five lines then
 /// fit the 88 px between the bar's top padding and the window's bottom.
 pub const INFO_WIDTH_PX: f32 = 580.0;
+/// Most lines the selection panel shows for a selection of units: the
+/// rows of 14 px text that fit the 88 px between the bottom bar's top
+/// padding and the window's bottom. A selection of more kinds than this
+/// shows the first `MAX_KIND_LINES - 1` kinds (in `units.ron` order) and
+/// one `info.more_kinds` line for the rest, so the last line stays on
+/// screen (`art_bench`'s select-all has all eight kinds).
+pub const MAX_KIND_LINES: usize = 5;
 
 /// What a card button does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -928,6 +937,14 @@ pub fn selection_text(
             })
         })
         .collect();
+    if lines.len() > MAX_KIND_LINES {
+        let more = lines.len() - (MAX_KIND_LINES - 1);
+        lines.truncate(MAX_KIND_LINES - 1);
+        lines.push(fill(
+            strings.hud("info.more_kinds"),
+            &[("count", &more.to_string())],
+        ));
+    }
     // One unit, the local player's or not: its hit points.
     if let [id] = selection.units.iter().copied().collect::<Vec<_>>()[..]
         && let Some(hp) = view.unit_hp(id)
@@ -2107,6 +2124,80 @@ mod tests {
                 line.chars().count()
             );
         }
+    }
+
+    /// A selection of every unit kind (as `art_bench`'s select-all at tick
+    /// 40) fits the bottom bar: past [`MAX_KIND_LINES`] kinds the panel
+    /// shows the first kinds in `units.ron` order and one "+N more kinds"
+    /// line, so nothing falls off the window. Before the art pass fix the
+    /// eight kind lines ran three rows past the window's bottom edge.
+    #[test]
+    fn a_selection_of_every_kind_fits_the_panel() {
+        assert_eq!(MAX_KIND_LINES, panel_rows(), "one line a row");
+        let mut sim = standard();
+        let rules = sim.rules().clone();
+        let s = strings();
+        let at = sim.view().unit(sim::UnitId(1)).unwrap().pos;
+        let cmds: Vec<_> = (0..rules.units.len())
+            .map(|i| {
+                let kind = UnitKindId(u16::try_from(i).unwrap());
+                sim::PlayerCommand::new(
+                    LOCAL_PLAYER,
+                    u32::try_from(i).unwrap(),
+                    Command::DebugSpawn {
+                        owner: LOCAL_PLAYER,
+                        kind,
+                        at,
+                        count: 2,
+                    },
+                )
+            })
+            .collect();
+        sim.step(&cmds);
+        for _ in 0..sim.setup().cmd_delay {
+            sim.step(&[]);
+        }
+        let view = sim.view();
+        let mut selection = Selection::default();
+        selection.set(
+            view.units()
+                .filter(|u| u.owner == LOCAL_PLAYER)
+                .map(|u| u.id),
+        );
+        let kinds: std::collections::BTreeSet<u16> = selection
+            .units
+            .iter()
+            .filter_map(|id| view.unit(*id))
+            .map(|u| u.kind.0)
+            .collect();
+        assert_eq!(kinds.len(), rules.units.len(), "every kind is selected");
+        let text = selection_text(&view, &rules, &s, &selection);
+        assert_fits_the_panel(&text);
+        let lines: Vec<&str> = text.lines().collect();
+        if kinds.len() > MAX_KIND_LINES {
+            assert_eq!(lines.len(), MAX_KIND_LINES, "{text}");
+            let shown = MAX_KIND_LINES - 1;
+            for (line, kind) in lines.iter().zip(&rules.units[..shown]) {
+                assert!(line.starts_with(&format!("{} x", kind.name)), "{text}");
+            }
+            assert_eq!(
+                lines[shown],
+                format!("+{} more kinds", kinds.len() - shown),
+                "{text}"
+            );
+        } else {
+            assert_eq!(lines.len(), kinds.len(), "{text}");
+        }
+        // Exactly MAX_KIND_LINES kinds still get a line each.
+        let first: Vec<u16> = kinds.iter().copied().take(MAX_KIND_LINES).collect();
+        selection.set(
+            view.units()
+                .filter(|u| u.owner == LOCAL_PLAYER && first.contains(&u.kind.0))
+                .map(|u| u.id),
+        );
+        let text = selection_text(&view, &rules, &s, &selection);
+        assert_eq!(text.lines().count(), first.len(), "{text}");
+        assert!(!text.contains("more kinds"), "{text}");
     }
 
     /// A Scriptorium's panel at its longest fits the bottom bar, its queue

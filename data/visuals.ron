@@ -1,12 +1,13 @@
-// Eonmark visuals: how each unit kind is drawn. Schema:
-// crates/rules/src/visuals.rs (deny_unknown_fields). Keys are unit kind ids
-// from rules/units.ron; every kind listed there must appear here (the loader
+// Eonmark visuals: how each unit and building kind is drawn. Schema:
+// crates/rules/src/visuals.rs (deny_unknown_fields). `units` keys are unit
+// kind ids from rules/units.ron and `buildings` keys building kind ids from
+// rules/buildings.ron; every kind listed there must appear here (the loader
 // rejects a missing or unknown key and names it). Loaded and validated by
-// rules::Rules::load, so `sim-cli data-check` fails on a bad entry, but not
-// part of rules_hash (ADR 0003, docs/adr/0003-visuals-outside-rules-hash.md):
-// the sim never reads it, so a look edit needs no rules_version bump and no
-// re-record. Building kinds are drawn by crates/game/src/buildings.rs; M7
-// moves them here.
+// rules::Rules::load, so `sim-cli data-check` fails on a bad entry (and, with
+// its assets check, on a Scene whose file is missing), but not part of
+// rules_hash (ADR 0003, docs/adr/0003-visuals-outside-rules-hash.md): the sim
+// never reads it, so a look edit needs no rules_version bump and no
+// re-record. Nothing the sim reads may go in here.
 //
 // Primitive(Capsule | Cuboid | Cylinder | Sphere | Cone): one shared mesh
 //     sized from the kind's radius_tiles_x100 (a Capsule 3.4 radii tall,
@@ -17,8 +18,18 @@
 //     unit's facing, height_tiles_x100 long and two radii tall. Not Sphere
 //     (M4b: one silhouette per kind, docs/ART_STYLE.md).
 // The game draws every look low-poly and flat-shaded (crates/game/src/present.rs).
-// M7: Scene(path: "models/x.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0)
-//     is parsed and validated now and used by the presenter from M7.
+// Scene(path: "models/x.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0
+//     [, nodes: ["glob*"], parts: [(path: ..., offset_x100: (x, y, z))],
+//     team: Some("swatch key"), fallback: Some(Body(...))]): a glTF model under
+//     assets/ (art pass); the game draws its fallback until models load.
+//
+// buildings: Primitive(Cuboid) is the M3b team-coloured box over the
+//     footprint (crates/game/src/buildings.rs), or a Scene whose fallback is
+//     that box. The art pass (docs/ROADMAP.md, "Art pass (pre-stream)") swaps
+//     them for KayKit models one line at a time. Optional tables, empty or
+//     default here: sites (default [Primitive(Cuboid)], the rising box),
+//     rubble, seat_flag and terrain (props on forest, mountain and water);
+//     team_swatches holds the KayKit Hexagon rects measured in art slice 2.
 (
   units: {
     // Upright pill, 1.19 m (radius 0.35 m).
@@ -38,4 +49,25 @@
     // Low box, 1.0 x 0.6 x 1.0 m.
     "supply_wain": Body(shape: Cuboid, height_tiles_x100: 60),
   },
+  // The M3b box for every kind until the art pass's models (slice 3).
+  buildings: {
+    "town": Primitive(Cuboid),
+    "croft": Primitive(Cuboid),
+    "lumber_yard": Primitive(Cuboid),
+    "ore_pit": Primitive(Cuboid),
+    "scriptorium": Primitive(Cuboid),
+    "muster_hall": Primitive(Cuboid),
+    "watchtower": Primitive(Cuboid),
+    "engine_yard": Primitive(Cuboid),
+  },
+  // Texel rects of a model's base texture that the game repaints in the
+  // owner's team colour (art pass). "kaykit_hexagon" is the union of the
+  // rects `inspect_gltf swatches` found by diffing KayKit's blue and red
+  // variants of every vendored building, the catapult tower and the flag
+  // over the shared 1024x1024 hexagons_medieval.png (art slice 2): no
+  // non-team face of any of them samples it. No Scene names it until slice 3.
+  team_swatches: {
+    "kaykit_hexagon": (rects: [(17, 787, 91, 207)], desaturate_permille: 200),
+  },
+  terrain: {},
 )

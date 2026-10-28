@@ -11,3 +11,9 @@ indent_size = 2
 [justfile]
 indent_style = space
 indent_size = 4
+# Vendored third-party files stay byte for byte as shipped (their sha256 pins
+# in tools/assets/sources.tsv, checked by scripts/check_assets.sh); KayKit's
+# licence texts end lines in tabs.
+[assets/**]
+trim_trailing_whitespace = false
+insert_final_newline = false

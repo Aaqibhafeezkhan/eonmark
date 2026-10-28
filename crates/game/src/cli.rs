@@ -11,6 +11,10 @@
 //! click proxy `--new-game-after-seconds <s>` (`crate::menu`), and
 //! [`Cli::seed_explicit`], so a plain launch without `--seed` plays a fresh
 //! wall-clock seed (`app::match_seed`).
+//! The art pass adds `--assets-dir <dir>` ([`Cli::resolve_assets_dir`], also
+//! `EONMARK_ASSETS`), `--window-size <W>x<H>`, `--grid` (the debug grid,
+//! off by default; G toggles it) and `--draw-stats` (the draw-call counter,
+//! `crate::draw_stats`).
 //! Parsing is complete and tested here.
 
 use std::path::{Path, PathBuf};
@@ -69,6 +73,14 @@ Options:
                                The New Game proxy: after S seconds click the menu's real
                                New Game button with a synthetic mouse (picking path).
   --data-dir <PATH>            Override the data directory (default: see below).
+  --assets-dir <PATH>          Override the assets directory (default: see below).
+  --window-size <W>x<H>        Logical window size (default 1280x800); the frame_stats
+                               `window` line prints the physical size it got.
+  --grid                       Draw the 8-tile debug grid (off by default; G toggles it).
+  --draw-stats                 Count the draw calls the render passes issue each frame
+                               and print `frame_stats: draws ...` and `frame_stats:
+                               triangles ...` on exit (always on in dev builds, which
+                               also show it in the Sim panel).
   -h, --help                   Show this text.
 
 Data directory resolution order:
@@ -76,6 +88,13 @@ Data directory resolution order:
   2. $EONMARK_DATA
   3. <workspace>/data when running from a checkout
   4. <directory of the executable>/data
+
+Assets directory resolution order (models; the shaders are built in):
+  1. --assets-dir
+  2. $EONMARK_ASSETS
+  3. <workspace>/assets when running from a checkout
+  4. <directory of the executable>/assets
+  5. assets (relative to the working directory)
 ";
 
 /// What `--headless-run` asks for.
@@ -187,6 +206,16 @@ pub struct Cli {
     pub fast_forward_to: Option<u32>,
     /// `--new-game-after-seconds <s>` (M5b): the menu's New Game click proxy.
     pub new_game_after_seconds: Option<f64>,
+    /// `--assets-dir <dir>` (art pass): the asset root, see
+    /// [`Cli::resolve_assets_dir`].
+    pub assets_dir: Option<PathBuf>,
+    /// `--window-size <w>x<h>` (art pass): the logical window size;
+    /// `None` is `app::WINDOW_SIZE`.
+    pub window_size: Option<(u32, u32)>,
+    /// `--grid` (art pass): start with the debug grid shown.
+    pub grid: bool,
+    /// `--draw-stats` (art pass): count draw calls and print the exit lines.
+    pub draw_stats: bool,
 }
 
 impl Default for Cli {
@@ -211,8 +240,39 @@ impl Default for Cli {
             spectate: false,
             fast_forward_to: None,
             new_game_after_seconds: None,
+            assets_dir: None,
+            window_size: None,
+            grid: false,
+            draw_stats: false,
         }
     }
+}
+
+/// Smallest `--window-size` side, logical pixels.
+pub const MIN_WINDOW_SIDE: u32 = 320;
+/// Largest `--window-size` side, logical pixels (8K).
+pub const MAX_WINDOW_SIDE: u32 = 7680;
+
+/// Parse `--window-size`'s `<w>x<h>`: two whole numbers of logical pixels,
+/// each in [`MIN_WINDOW_SIDE`]`..=`[`MAX_WINDOW_SIDE`].
+pub fn parse_window_size(value: &str) -> Result<(u32, u32), String> {
+    let (w, h) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected <w>x<h>, got `{value}`"))?;
+    let side = |s: &str| -> Result<u32, String> {
+        let n: u32 = s
+            .trim()
+            .parse()
+            .map_err(|e| format!("`{s}` in `{value}`: {e}"))?;
+        if (MIN_WINDOW_SIDE..=MAX_WINDOW_SIDE).contains(&n) {
+            Ok(n)
+        } else {
+            Err(format!(
+                "{n} in `{value}` is outside {MIN_WINDOW_SIDE}..={MAX_WINDOW_SIDE}"
+            ))
+        }
+    };
+    Ok((side(w)?, side(h)?))
 }
 
 /// Outcome of parsing: run the game, or print usage. Built once at start-up,
@@ -264,6 +324,14 @@ impl Cli {
                     cli.new_game_after_seconds = Some(secs);
                 }
                 "--data-dir" => cli.data_dir = Some(parse_path(&arg, args.next())?),
+                "--assets-dir" => cli.assets_dir = Some(parse_path(&arg, args.next())?),
+                "--window-size" => {
+                    let value = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
+                    cli.window_size =
+                        Some(parse_window_size(&value).map_err(|e| format!("{arg}: {e}"))?);
+                }
+                "--grid" => cli.grid = true,
+                "--draw-stats" => cli.draw_stats = true,
                 "--scenario" => {
                     let name = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
                     if name.is_empty() || name.starts_with("--") {
@@ -343,6 +411,9 @@ impl Cli {
             for (given, flag) in [
                 (cli.skip_menu, "--skip-menu"),
                 (cli.spectate, "--spectate"),
+                (cli.window_size.is_some(), "--window-size"),
+                (cli.grid, "--grid"),
+                (cli.draw_stats, "--draw-stats"),
                 (cli.fast_forward_to.is_some(), "--fast-forward-to"),
                 (
                     cli.new_game_after_seconds.is_some(),
@@ -419,6 +490,55 @@ impl Cli {
         }
         PathBuf::from("data")
     }
+
+    /// Locate the `assets/` directory the game loads models from (see
+    /// [`USAGE`] for the order), the way [`Cli::resolve_data_dir`] finds
+    /// `data/`: Bevy's own default under `cargo run` would be
+    /// `crates/game/assets`, which does not exist. `app::run` hands the
+    /// result to `AssetPlugin::file_path`.
+    pub fn resolve_assets_dir(&self) -> PathBuf {
+        resolve_assets_dir_with(
+            self.assets_dir.as_deref(),
+            std::env::var_os(ASSETS_ENV).as_deref(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                .as_deref(),
+        )
+    }
+}
+
+/// Environment variable naming the assets directory, after `--assets-dir`.
+pub const ASSETS_ENV: &str = "EONMARK_ASSETS";
+
+/// [`Cli::resolve_assets_dir`] with its inputs passed in: `flag`
+/// (`--assets-dir`), then `env` ([`ASSETS_ENV`]), then
+/// `<manifest>/../../assets` when that is a directory (a checkout), then
+/// `<exe_dir>/assets` when that is one (`bundle.sh` copies `assets/` beside
+/// the executable), then `assets`.
+pub fn resolve_assets_dir_with(
+    flag: Option<&Path>,
+    env: Option<&std::ffi::OsStr>,
+    manifest: &Path,
+    exe_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(dir) = flag {
+        return dir.to_path_buf();
+    }
+    if let Some(dir) = env.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let checkout = manifest.join("../../assets");
+    if checkout.is_dir() {
+        return checkout;
+    }
+    if let Some(beside_exe) = exe_dir.map(|d| d.join("assets"))
+        && beside_exe.is_dir()
+    {
+        return beside_exe;
+    }
+    PathBuf::from("assets")
 }
 
 /// Environment variable that turns on background mode like `--background`;
@@ -553,6 +673,10 @@ mod tests {
                 spectate: false,
                 fast_forward_to: None,
                 new_game_after_seconds: None,
+                assets_dir: None,
+                window_size: None,
+                grid: false,
+                draw_stats: false,
             })
         );
         let Parsed::Run(cli) = parsed else {
@@ -787,6 +911,102 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// The art pass's flags: `--assets-dir`, `--window-size`, `--grid` and
+    /// `--draw-stats` parse, the size is checked, and the three that need a
+    /// window refuse `--headless-run`.
+    #[test]
+    fn art_flags_parse() {
+        assert_eq!(
+            parse(&[
+                "--assets-dir",
+                "/tmp/assets",
+                "--window-size",
+                "1280x720",
+                "--grid",
+                "--draw-stats",
+            ]),
+            Ok(Parsed::Run(Cli {
+                assets_dir: Some(PathBuf::from("/tmp/assets")),
+                window_size: Some((1280, 720)),
+                grid: true,
+                draw_stats: true,
+                ..Cli::default()
+            }))
+        );
+        assert_eq!(parse_window_size("2560X1440"), Ok((2560, 1440)));
+        assert_eq!(parse_window_size("320x320"), Ok((320, 320)));
+        assert_eq!(parse_window_size("7680x4320"), Ok((7680, 4320)));
+        for bad in [
+            "1280",
+            "1280x",
+            "x720",
+            "1280x719.5",
+            "319x720",
+            "1280x7681",
+            "-1x720",
+        ] {
+            assert!(parse_window_size(bad).is_err(), "{bad}");
+            assert!(parse(&["--window-size", bad]).is_err(), "{bad}");
+        }
+        assert!(parse(&["--window-size"]).is_err());
+        assert!(parse(&["--assets-dir"]).is_err());
+        assert!(parse(&["--assets-dir", ""]).is_err());
+        for flag in [
+            vec!["--window-size", "1280x720"],
+            vec!["--grid"],
+            vec!["--draw-stats"],
+        ] {
+            let mut args = vec!["--headless-run", "10"];
+            args.extend(flag.iter().copied());
+            assert!(parse(&args).is_err(), "{args:?} needs a window");
+        }
+        // The asset root is only a path; a headless run may name it.
+        assert!(parse(&["--headless-run", "10", "--assets-dir", "/x"]).is_ok());
+    }
+
+    /// `--assets-dir`, then `EONMARK_ASSETS`, then the checkout's
+    /// `assets/`, then `assets/` beside the executable, then `assets`.
+    #[test]
+    fn resolve_assets_dir_order() {
+        let root = std::env::temp_dir().join(format!("eonmark-assets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = root.join("checkout/crates/game");
+        let exe_dir = root.join("bundle");
+        std::fs::create_dir_all(&manifest).unwrap();
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let env = std::ffi::OsStr::new("/from/env");
+        let flag = Path::new("/from/flag");
+        let resolve = |flag, env| resolve_assets_dir_with(flag, env, &manifest, Some(&exe_dir));
+        // Nothing exists yet: the relative fallback.
+        assert_eq!(resolve(None, None), PathBuf::from("assets"));
+        assert_eq!(
+            resolve(None, Some(std::ffi::OsStr::new(""))),
+            PathBuf::from("assets"),
+            "an empty variable is unset"
+        );
+        // Beside the executable.
+        std::fs::create_dir_all(exe_dir.join("assets")).unwrap();
+        assert_eq!(resolve(None, None), exe_dir.join("assets"));
+        // The checkout's wins over the bundle's.
+        std::fs::create_dir_all(root.join("checkout/assets")).unwrap();
+        assert_eq!(resolve(None, None), manifest.join("../../assets"));
+        // The variable wins over both, and the flag over everything.
+        assert_eq!(resolve(None, Some(env)), PathBuf::from("/from/env"));
+        assert_eq!(resolve(Some(flag), Some(env)), PathBuf::from("/from/flag"));
+        let _ = std::fs::remove_dir_all(&root);
+        // In this checkout the default is the repository's assets/.
+        let here = Cli::default();
+        if std::env::var_os(ASSETS_ENV).is_none() {
+            let dir = here.resolve_assets_dir();
+            assert!(dir.join("ATTRIBUTION.md").is_file(), "{}", dir.display());
+        }
+        let flagged = Cli {
+            assets_dir: Some(PathBuf::from("/x/assets")),
+            ..Cli::default()
+        };
+        assert_eq!(flagged.resolve_assets_dir(), PathBuf::from("/x/assets"));
     }
 
     #[test]

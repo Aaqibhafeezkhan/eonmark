@@ -43,7 +43,8 @@ The game opens on its main menu (since M5b); New Game starts a skirmish against 
 | Unused dependencies | `cargo machete` |
 | Spelling | `typos` |
 | Licenses and advisories | `cargo deny check` (a separate `deny` job in CI; skipped locally if cargo-deny is missing) |
-| Assets | `scripts/check_assets.sh` |
+| Assets | `scripts/check_assets.sh` (it also holds every file vendored through `tools/assets/sources.tsv` to its sha256 pin), then `scripts/check_assets.sh --self-test` (an unattributed file, and a changed pinned file, must fail with its path) |
+| Models | `cargo run -p inspect_gltf --locked --release -- check data assets`: every Scene of `data/visuals.ron` against the art pass's budgets and import rules ([docs/ART_STYLE.md](docs/ART_STYLE.md)) |
 | Naming | `scripts/check_trademark.sh` |
 | One Bevy | `cargo tree -i bevy_ecs --depth 0` must print exactly one line |
 | Headless replay | `cargo run -p game --locked --profile ci -- --headless-run crates/sim/tests/fixtures/move_500.eonreplay` must end with a `tick=1200 hash=0x...` line and exit 0 (the game re-simulates the golden and compares hashes; `--headless-run <ticks>` still runs a plain skirmish) |
@@ -117,7 +118,7 @@ $ git status --short
 
 Only `economy_second_town` changes its final hash: it is the only fixture with a worked Croft. A test that hard-codes a number the data controls fails this walkthrough; read the value from `Rules` instead.
 
-Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, so with the repository at `rules_version` 25 and the bump to 26 of step 2, step 3 now prints a line of the form `OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en` (before the bump it prints `rules_version=25`). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
+Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, and since the art pass it ends with the `visuals.ron` counts and the number of glTF files its Scenes name (`visuals=units:8 buildings:8 terrain:<n> models=<n>`; each file must exist under `assets/`, `--no-assets` skips that check), so with the repository at `rules_version` 25 and the bump to 26 of step 2, step 3 now prints a line of the form `OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:0 models=0` (before the bump it prints `rules_version=25`). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
 
 ### A build order or personality (`data/ai/`)
 

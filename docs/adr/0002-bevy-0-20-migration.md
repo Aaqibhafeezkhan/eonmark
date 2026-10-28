@@ -37,11 +37,12 @@ If the inspector lags for more than two months after `bevy_egui` and Bevy are re
 4. Delete `crates/game/src/monitor_loss.rs`, its `pub mod` line and the `MonitorLossPlugin` line in `app.rs`, and update the "Display sleep closes the game" row in [IMPLEMENTER_NOTES.md](../IMPLEMENTER_NOTES.md). 0.20's `create_monitors` removes `HasWindows` before it despawns a monitor ([bevyengine/bevy#25427](https://github.com/bevyengine/bevy/pull/25427)), which is what the plugin does on 0.19.1. Confirm that in the 0.20 `bevy_winit` source first, and run the [PLAYTEST.md](../PLAYTEST.md) "Display sleep" row on the development Mac after the deletion.
 5. Rebuild the `dev` feature: `cargo clippy -p game --features dev --profile ci -- -D warnings`.
 6. Rebuild on Linux through the `game-linux` CI job.
-7. Run every golden fixture: `cargo test -p sim` and `sim-cli verify --release` on the long ones. The sim crates do not depend on Bevy, so no hash may change. If one does, the branch has leaked into the sim side and the PR stops until that is found.
-8. Run `--headless-run` on the smoke fixture and play one skirmish to the game-over screen on the development Mac. Verify the replay.
-9. Walk the [PLAYTEST.md](../PLAYTEST.md) controls checklist once; picking and gestures are the most likely regressions.
-10. Update [DEPENDENCIES.md](../DEPENDENCIES.md): pins, the egui compatibility table, every pinned doc link from `0.19.1` to `0.20.0`, and the drift log.
-11. Fill in the date fields in this ADR and set the status to Accepted in the same PR.
+7. Re-run `scripts/draw_trace_xcheck.sh <out>` under Xvfb and lavapipe (art pass). The draw-call counter (`crates/game/src/draw_stats.rs`, the dev panel and the `frame_stats: draws` line) rebuilds the count from render-phase internals (indirect-parameter buffers, binned and sorted phases, `prepare_uinodes`) that 0.20 may move; the script compares it with Bevy's own `detailed_trace` draw lines and must print `PASS` for every scenario in both the `culling` and the `preprocessing_only` mode.
+8. Run every golden fixture: `cargo test -p sim` and `sim-cli verify --release` on the long ones. The sim crates do not depend on Bevy, so no hash may change. If one does, the branch has leaked into the sim side and the PR stops until that is found.
+9. Run `--headless-run` on the smoke fixture and play one skirmish to the game-over screen on the development Mac. Verify the replay.
+10. Walk the [PLAYTEST.md](../PLAYTEST.md) controls checklist once; picking and gestures are the most likely regressions.
+11. Update [DEPENDENCIES.md](../DEPENDENCIES.md): pins, the egui compatibility table, every pinned doc link from `0.19.1` to `0.20.0`, and the drift log.
+12. Fill in the date fields in this ADR and set the status to Accepted in the same PR.
 
 ### Acceptance
 
@@ -53,6 +54,7 @@ If the inspector lags for more than two months after `bevy_egui` and Bevy are re
 | `Cargo.lock` | Exactly one `egui`, one `cpal`, one `wgpu` |
 | `cargo clippy -p game --features dev` | Passes with `-D warnings` |
 | `game-linux` job | Passes |
+| `scripts/draw_trace_xcheck.sh` | `PASS` for every scenario in both modes |
 | Controls checklist | Every row passes on the development Mac |
 | Docs | [DEPENDENCIES.md](../DEPENDENCIES.md) has no `0.19.1` doc links left |
 

@@ -3748,6 +3748,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "inspect_gltf"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "gltf",
+ "png",
+ "ron",
+ "rules",
+ "serde",
+]
+
+[[package]]
 name = "integer-sqrt"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -63,8 +63,8 @@ pub const SPHERE_SUBDIVISIONS: u32 = 1;
 /// vertices, so this is three times the triangle budget.
 pub const MAX_LOOK_VERTICES: usize = 600;
 
-/// What [`body_mesh`] draws for a `Visual::Scene` until M7 loads glTF, and
-/// for a kind with no visual.
+/// What [`body_mesh`] draws for a `Visual::Scene` without a `fallback`
+/// until the art pass loads glTF models, and for a kind with no visual.
 pub const FALLBACK_VISUAL: Visual = Visual::Primitive(Primitive::Capsule);
 
 /// `StandardMaterial::perceptual_roughness` for every unit (`docs/ART_STYLE.md`: matte).
@@ -153,9 +153,9 @@ pub struct UnitVisuals {
 
 impl UnitVisuals {
     /// The mesh for `kind`, built by [`body_mesh`] from its `Visual` and
-    /// `radius_tiles_x100`. A `Visual::Scene` falls back to
-    /// [`FALLBACK_VISUAL`] until M7. Also caches the look's height for
-    /// [`UnitVisuals::top_y`].
+    /// `radius_tiles_x100`. A `Visual::Scene` draws its `fallback` (else
+    /// [`FALLBACK_VISUAL`]) until the art pass loads models. Also caches the
+    /// look's height for [`UnitVisuals::top_y`].
     pub fn mesh(&mut self, kind: u16, rules: &Rules, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
         if let Some(mesh) = self.meshes.get(&kind) {
             return mesh.clone();
@@ -269,8 +269,9 @@ pub struct Look {
 impl Look {
     /// The look `visual` gives a unit of collision radius `radius`:
     /// `Primitive` sizes the shape from the radius (a capsule 3.4 radii
-    /// tall, everything else 2), `Body` takes its own height, `Scene` is
-    /// [`FALLBACK_VISUAL`] until M7.
+    /// tall, everything else 2), `Body` takes its own height, and `Scene`
+    /// is its `fallback` (a `Primitive` or a `Body`, `rules::Visuals`
+    /// checks), else [`FALLBACK_VISUAL`], until the art pass loads models.
     pub fn of(visual: &Visual, radius: f32) -> Look {
         let diameter = 2.0 * radius;
         match visual {
@@ -302,7 +303,9 @@ impl Look {
                 },
                 lying: *lying,
             },
-            Visual::Scene { .. } => Look::of(&FALLBACK_VISUAL, radius),
+            Visual::Scene { fallback, .. } => {
+                Look::of(fallback.as_deref().unwrap_or(&FALLBACK_VISUAL), radius)
+            }
         }
     }
 
@@ -571,7 +574,87 @@ mod tests {
         Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap()
     }
 
-    /// `(name, visual, radius)` of every repository unit kind's look.
+    /// The M4b unit looks, frozen as `data/visuals.ron` had them when M4b
+    /// signed them off, with each kind's collision radius in metres: the
+    /// look tests below measure these, not the live file, so an art-pass
+    /// edit of `visuals.ron` never fails a Rust test (art-pass decision
+    /// 17). `rules::Visuals::validate` keeps the live file's 1.4x rule.
+    const M4B_LOOKS: [(&str, Visual, f32); 8] = [
+        ("yeoman", Visual::Primitive(Primitive::Capsule), 0.35),
+        ("scribe", Visual::Primitive(Primitive::Cylinder), 0.35),
+        (
+            "skirmisher",
+            Visual::Body {
+                shape: Primitive::Cone,
+                height_tiles_x100: 150,
+                lying: false,
+            },
+            0.35,
+        ),
+        (
+            "shieldbearer",
+            Visual::Body {
+                shape: Primitive::Cuboid,
+                height_tiles_x100: 130,
+                lying: false,
+            },
+            0.40,
+        ),
+        (
+            "bowman",
+            Visual::Body {
+                shape: Primitive::Cylinder,
+                height_tiles_x100: 190,
+                lying: false,
+            },
+            0.35,
+        ),
+        (
+            "outrider",
+            Visual::Body {
+                shape: Primitive::Capsule,
+                height_tiles_x100: 180,
+                lying: true,
+            },
+            0.45,
+        ),
+        ("mangonel", Visual::Primitive(Primitive::Sphere), 0.50),
+        (
+            "supply_wain",
+            Visual::Body {
+                shape: Primitive::Cuboid,
+                height_tiles_x100: 60,
+                lying: false,
+            },
+            0.50,
+        ),
+    ];
+
+    /// `(name, visual, radius)` of the frozen [`M4B_LOOKS`].
+    fn m4b_looks() -> Vec<(String, Visual, f32)> {
+        M4B_LOOKS
+            .iter()
+            .map(|(name, visual, radius)| ((*name).to_string(), visual.clone(), *radius))
+            .collect()
+    }
+
+    /// A Scene look with `fallback`, as the art pass writes them.
+    fn scene(fallback: Option<Visual>) -> Visual {
+        Visual::Scene {
+            path: "models/x.glb".into(),
+            scale_x100: 100,
+            y_offset_tiles_x100: 0,
+            yaw_deg: 0,
+            nodes: Vec::new(),
+            parts: Vec::new(),
+            team: None,
+            fallback: fallback.map(Box::new),
+        }
+    }
+
+    /// `(name, visual, radius)` of every repository unit kind's look, as
+    /// the live `data/visuals.ron` has them (only for checks that hold for
+    /// any valid file).
     fn repo_looks(rules: &Rules) -> Vec<(String, Visual, f32)> {
         (0u16..)
             .zip(&rules.units)
@@ -586,10 +669,11 @@ mod tests {
             .collect()
     }
 
-    /// Every repository look plus every shape as a `Primitive`, upright and
-    /// lying `Body`s of each shape a `Body` may have, and a `Scene`.
-    fn every_look(rules: &Rules) -> Vec<(String, Visual, f32)> {
-        let mut looks = repo_looks(rules);
+    /// Every M4b look plus every shape as a `Primitive`, upright and lying
+    /// `Body`s of each shape a `Body` may have, and a `Scene` with and
+    /// without a fallback.
+    fn every_look() -> Vec<(String, Visual, f32)> {
+        let mut looks = m4b_looks();
         for shape in [
             Primitive::Capsule,
             Primitive::Cuboid,
@@ -617,15 +701,15 @@ mod tests {
                 ));
             }
         }
+        looks.push(("Scene".into(), scene(None), 0.35));
         looks.push((
-            "Scene".into(),
-            Visual::Scene {
-                path: "models/x.glb".into(),
-                scale_x100: 100,
-                y_offset_tiles_x100: 0,
-                yaw_deg: 0,
-            },
-            0.35,
+            "Scene with a lying fallback".into(),
+            scene(Some(Visual::Body {
+                shape: Primitive::Cylinder,
+                height_tiles_x100: 120,
+                lying: true,
+            })),
+            0.4,
         ));
         looks
     }
@@ -633,7 +717,7 @@ mod tests {
     #[test]
     fn primitive_meshes_stand_on_the_ground() {
         use bevy::camera::primitives::MeshAabb;
-        for (name, visual, radius) in every_look(&repo_rules()) {
+        for (name, visual, radius) in every_look() {
             let mesh = body_mesh(&visual, radius);
             let aabb = mesh.compute_aabb().expect("positions");
             let min_y = aabb.min().y;
@@ -649,7 +733,7 @@ mod tests {
     fn top_y_matches_the_mesh_aabb() {
         use bevy::camera::primitives::MeshAabb;
         let rules = repo_rules();
-        for (name, visual, radius) in every_look(&rules) {
+        for (name, visual, radius) in every_look() {
             let aabb = body_mesh(&visual, radius)
                 .compute_aabb()
                 .expect("positions");
@@ -668,8 +752,8 @@ mod tests {
             v.mesh(i, &rules, &mut meshes);
             assert_eq!(v.top_y(i), Some(look_top_y(&visual, radius)), "{name}");
         }
-        // The repository looks, as data/visuals.ron describes them.
-        let tops: Vec<(String, f32)> = repo_looks(&rules)
+        // The M4b looks, as data/visuals.ron described them.
+        let tops: Vec<(String, f32)> = m4b_looks()
             .into_iter()
             .map(|(name, visual, radius)| (name, look_top_y(&visual, radius)))
             .collect();
@@ -692,7 +776,7 @@ mod tests {
 
     #[test]
     fn looks_stay_under_600_vertices() {
-        for (name, visual, radius) in every_look(&repo_rules()) {
+        for (name, visual, radius) in every_look() {
             let mesh = body_mesh(&visual, radius);
             let n = mesh.count_vertices();
             assert!(n <= MAX_LOOK_VERTICES, "{name}: {n} vertices");
@@ -719,8 +803,7 @@ mod tests {
     #[test]
     fn every_unit_kind_has_its_own_silhouette() {
         use bevy::camera::primitives::MeshAabb;
-        let rules = repo_rules();
-        let looks: Vec<(String, Primitive, Vec3)> = repo_looks(&rules)
+        let looks: Vec<(String, Primitive, Vec3)> = m4b_looks()
             .into_iter()
             .map(|(name, visual, radius)| {
                 let aabb = body_mesh(&visual, radius)
@@ -730,7 +813,7 @@ mod tests {
                 (name, shape, Vec3::from(aabb.half_extents) * 2.0)
             })
             .collect();
-        assert_eq!(looks.len(), 8, "eight kinds in units.ron");
+        assert_eq!(looks.len(), 8, "the eight M4b kinds");
         for (i, (a, shape_a, size_a)) in looks.iter().enumerate() {
             for (b, shape_b, size_b) in &looks[i + 1..] {
                 if shape_a != shape_b {
@@ -749,8 +832,7 @@ mod tests {
     #[test]
     fn lying_bodies_point_along_facing() {
         use bevy::camera::primitives::MeshAabb;
-        let rules = repo_rules();
-        let lying: Vec<_> = every_look(&rules)
+        let lying: Vec<_> = every_look()
             .into_iter()
             .filter(|(_, visual, radius)| Look::of(visual, *radius).lying)
             .collect();
@@ -839,6 +921,37 @@ mod tests {
         assert_eq!(app.world().non_send::<SimHandle>().tick(), 25, "stalled");
         let after = *app.world().get::<Interp>(entity).unwrap();
         assert_eq!(before, after, "a stalled step must not advance Interp");
+    }
+
+    /// Until models load, a Scene unit draws its fallback (a `Primitive`
+    /// or a `Body`), and without one the presenter's capsule: the look, the
+    /// mesh and the cached height all follow it.
+    #[test]
+    fn a_scene_draws_its_fallback() {
+        use bevy::camera::primitives::MeshAabb;
+        let body = Visual::Body {
+            shape: Primitive::Cuboid,
+            height_tiles_x100: 130,
+            lying: false,
+        };
+        let with = scene(Some(body.clone()));
+        assert_eq!(Look::of(&with, 0.4), Look::of(&body, 0.4));
+        assert_eq!(look_top_y(&with, 0.4), 1.3);
+        assert_eq!(
+            Look::of(&scene(None), 0.35),
+            Look::of(&FALLBACK_VISUAL, 0.35)
+        );
+        let aabb = |v: &Visual| body_mesh(v, 0.4).compute_aabb().expect("positions");
+        assert_eq!(aabb(&with).half_extents, aabb(&body).half_extents);
+        // Through the cache: a rules whose Yeoman is a Scene with the
+        // Shieldbearer's M4b block as its fallback.
+        let mut rules = repo_rules();
+        rules.visuals.units.insert("yeoman".into(), with);
+        let mut meshes = Assets::<Mesh>::default();
+        let mut v = UnitVisuals::default();
+        v.mesh(0, &rules, &mut meshes);
+        let radius = rules.units[0].radius_tiles_x100 as f32 / 100.0;
+        assert_eq!(v.top_y(0), Some(look_top_y(&body, radius)));
     }
 
     #[test]

@@ -178,7 +178,7 @@ The `gestures` feature is not a Bevy default and is enabled explicitly in `crate
 | Limit on Metal | Consequence for Eonmark |
 | --- | --- |
 | No multi-draw-indirect and no GPU occlusion culling in Bevy; lower bindless limits | draw-call count matters; one shared mesh and material per kind, team colour through a small set of materials; dev-panel counter with a 500 budget |
-| `ClusteredDecal` unsupported on macOS and iOS | selection rings and move markers are retained gizmos, borders are a material extension on the ground mesh, not decals |
+| `ClusteredDecal` unsupported on macOS and iOS | selection rings and attrition diamonds are flat shared meshes (since the art pass) and move markers are retained gizmos, borders are a material extension on the ground mesh, not decals |
 | `PresentMode::Mailbox` unsupported; `AutoNoVsync` falls back to `Immediate` | `PresentMode::AutoVsync` (Fifo) is the shipped setting |
 | wgpu 29 Metal surfaces lack an explicit sRGB colour space on wide-gamut displays | the matte palette is judged on a P3 display and an sRGB screenshot; accent chroma stays conservative (see [../ART_STYLE.md](../ART_STYLE.md)) |
 | Apple GPUs are tile-based deferred renderers: MSAA resolves in tile memory cheaply, device-memory round trips are expensive | `Msaa::Sample4` is on; there is no post-processing beyond optional low SSAO, no bloom, no deferred G-buffer |

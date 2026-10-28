@@ -3,16 +3,21 @@
 //! Supply Wain, the annexation timer around a contested Town, and the
 //! annexation readout above the message line.
 //!
-//! - **Attrition indicator.** A flat diamond (a gizmo circle of 4 segments)
-//!   in `palette::ATTRITION`, the Yield Cap amber, under every unit whose
-//!   `exposed_ticks > 0`: the sim's own "bleeding" state, which does not
-//!   flicker at a pulse (`docs/design/attrition.md`). One retained-gizmo
-//!   entity per unit, keyed by `UnitId` and never a child of the unit
+//! - **Attrition indicator.** A flat diamond (a 4-segment annulus mesh,
+//!   `selection::ring_mesh`) in `palette::ATTRITION`, the Yield Cap amber,
+//!   under every unit whose `exposed_ticks > 0`: the sim's own "bleeding"
+//!   state, which does not flicker at a pulse (`docs/design/attrition.md`).
+//!   One entity per unit, keyed by `UnitId` and never a child of the unit
 //!   (`docs/IMPLEMENTER_NOTES.md` rule 16), placed every frame at the
 //!   unit's interpolated position, steady (nothing pulses,
-//!   `docs/ART_STYLE.md`). Its half-diagonal is
-//!   [`ATTRITION_MARKER_PER_UNIT_RADIUS`] unit radii, outside the selection
-//!   ring, so its corners show around the unit's feet.
+//!   `docs/ART_STYLE.md`). Since the art pass (its plan's decision 11,
+//!   rings and diamonds as shared meshes) every diamond shares one mesh
+//!   and one unlit material with no shadow, so 200 bleeding units are one
+//!   draw call, not 200 retained gizmos. It lies 5 mm under the selection
+//!   ring's plane ([`ATTRITION_Y`]), so the two never z-fight. Its
+//!   half-diagonal is [`ATTRITION_MARKER_PER_UNIT_RADIUS`] unit radii,
+//!   outside the selection ring, so its corners show around the unit's
+//!   feet.
 //! - **Supply ring.** A Timber circle (`palette::SUPPLY_RING`) of radius
 //!   `supply_radius_tiles + 0.5` around each selected unit of a kind that
 //!   `supplies`, centred on the tile the Wain stands on: the outer edge of
@@ -35,6 +40,7 @@ use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 use bevy::gizmos::config::GizmoLineConfig;
+use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::transform::TransformSystems;
@@ -46,15 +52,32 @@ use crate::economy_hud::{MESSAGE_GAP_PX, UiStrings};
 use crate::hud::{BOTTOM_BAR_HEIGHT_PX, HUD_FONT_PX, HudRoot, PADDING_PX, spawn_hud};
 use crate::palette;
 use crate::present::{Interp, UnitEntities, flat_on_ground, fx_to_f32, world_from_sim};
-use crate::selection::{RING_LINE_WIDTH_PX, RING_Y, Selection, prune_dead};
+use crate::selection::{
+    RING_LINE_WIDTH_PX, RING_Y, Selection, marker_material, prune_dead, ring_mesh,
+};
 use crate::sim_driver::{LOCAL_PLAYER, MatchOver, SimHandle};
 
 /// The attrition diamond's half-diagonal as a multiple of the unit's
 /// collision radius: outside the selection ring (1.4), so the diamond's
 /// corners show around the unit's feet at the camera's pitch.
 pub const ATTRITION_MARKER_PER_UNIT_RADIUS: f32 = 1.8;
-/// Segments of the attrition marker's circle: 4 makes it a diamond.
+/// Segments of the attrition marker's annulus: 4 makes it a diamond.
 pub const ATTRITION_MARKER_SIDES: u32 = 4;
+/// Height of the attrition diamond above the ground, metres: 5 mm below
+/// the selection ring's [`RING_Y`], so the ring is drawn on top where
+/// their bands overlap (about ±39° around each diagonal) instead of the
+/// two opaque meshes z-fighting in one plane, and above the debug grid
+/// (`ground::GRID_Y`). 5 mm is far above the depth precision at the
+/// camera's 60 m.
+pub const ATTRITION_Y: f32 = 0.025;
+
+// The flat layers from the ground up: grid lines, attrition diamonds,
+// selection rings, the placement ghost's outline.
+const _: () = assert!(
+    crate::ground::GRID_Y < ATTRITION_Y
+        && ATTRITION_Y < RING_Y
+        && RING_Y < crate::placement::GHOST_OUTLINE_Y
+);
 /// Segments of the supply ring (a 14.5 m circle).
 pub const SUPPLY_RING_RESOLUTION: u32 = 96;
 /// Segments of the annexation track and arc.
@@ -75,9 +98,13 @@ pub const ANNEX_READOUT_GAP_PX: f32 = 24.0;
 /// The shared marker shapes (unit size; entities scale their `Transform`).
 #[derive(Resource, Debug, Clone)]
 pub struct MarkerAssets {
-    /// A unit diamond laid flat, in `palette::ATTRITION`.
-    pub attrition: Handle<GizmoAsset>,
-    /// A unit circle laid flat, in `palette::SUPPLY_RING`.
+    /// The unit diamond laid flat (a 4-segment annulus), shared by every
+    /// attrition marker.
+    pub attrition_mesh: Handle<Mesh>,
+    /// Unlit `palette::ATTRITION`, shared by every attrition marker.
+    pub attrition_material: Handle<StandardMaterial>,
+    /// A unit circle laid flat, in `palette::SUPPLY_RING` (a retained
+    /// gizmo: only selected Wains have one).
     pub supply: Handle<GizmoAsset>,
 }
 
@@ -137,26 +164,32 @@ impl Plugin for MarkersPlugin {
     }
 }
 
-/// Builds the attrition diamond and the supply circle, both of radius 1,
-/// laid flat with `present::flat_on_ground()`.
-pub fn create_marker_assets(mut commands: Commands, mut assets: ResMut<Assets<GizmoAsset>>) {
-    commands.insert_resource(marker_assets(&mut assets));
+/// Builds the attrition diamond (mesh and material) and the supply circle,
+/// both of radius 1, laid flat.
+pub fn create_marker_assets(
+    mut commands: Commands,
+    mut gizmos: ResMut<Assets<GizmoAsset>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.insert_resource(marker_assets(&mut gizmos, &mut meshes, &mut materials));
 }
 
-/// The two shapes, added to `assets`.
-pub fn marker_assets(assets: &mut Assets<GizmoAsset>) -> MarkerAssets {
+/// The shapes, added to the asset stores.
+pub fn marker_assets(
+    gizmos: &mut Assets<GizmoAsset>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) -> MarkerAssets {
     let flat = Isometry3d::new(Vec3::ZERO, flat_on_ground());
-    let mut attrition = GizmoAsset::new();
-    attrition
-        .circle(flat, 1.0, palette::ATTRITION)
-        .resolution(ATTRITION_MARKER_SIDES);
     let mut supply = GizmoAsset::new();
     supply
         .circle(flat, 1.0, palette::SUPPLY_RING)
         .resolution(SUPPLY_RING_RESOLUTION);
     MarkerAssets {
-        attrition: assets.add(attrition),
-        supply: assets.add(supply),
+        attrition_mesh: meshes.add(ring_mesh(ATTRITION_MARKER_SIDES)),
+        attrition_material: materials.add(marker_material(palette::ATTRITION)),
+        supply: gizmos.add(supply),
     }
 }
 
@@ -247,9 +280,10 @@ pub fn sync_attrition_markers(
             continue;
         };
         let (pos, _) = interp.sample(t);
-        let transform = Transform::from_translation(Vec3::new(pos.x, RING_Y, pos.z)).with_scale(
-            Vec3::splat(fx_to_f32(unit.radius) * ATTRITION_MARKER_PER_UNIT_RADIUS),
-        );
+        let transform = Transform::from_translation(Vec3::new(pos.x, ATTRITION_Y, pos.z))
+            .with_scale(Vec3::splat(
+                fx_to_f32(unit.radius) * ATTRITION_MARKER_PER_UNIT_RADIUS,
+            ));
         match markers.0.get(&unit.id) {
             Some(marker) => {
                 if let Ok(mut current) = transforms.get_mut(*marker) {
@@ -261,11 +295,9 @@ pub fn sync_attrition_markers(
                     .spawn((
                         Name::new("Attrition marker"),
                         AttritionMarker(unit.id),
-                        Gizmo {
-                            handle: assets.attrition.clone(),
-                            line_config: line_config(),
-                            ..default()
-                        },
+                        Mesh3d(assets.attrition_mesh.clone()),
+                        MeshMaterial3d(assets.attrition_material.clone()),
+                        NotShadowCaster,
                         transform,
                     ))
                     .id();
@@ -593,17 +625,28 @@ mod tests {
     #[test]
     fn the_marker_shapes_are_a_flat_diamond_and_a_flat_circle() {
         let mut assets = Assets::<GizmoAsset>::default();
-        let handles = marker_assets(&mut assets);
-        let diamond = assets.get(&handles.attrition).unwrap();
+        let mut meshes = Assets::<Mesh>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let handles = marker_assets(&mut assets, &mut meshes, &mut materials);
+        let diamond = meshes.get(&handles.attrition_mesh).unwrap();
         let ring = assets.get(&handles.supply).unwrap();
-        // Four corners on the unit circle, flat on the ground: a diamond.
-        assert!(diamond.list_positions.is_empty());
+        // Four outer corners on the unit circle and four inner ones at
+        // RING_INNER_RATIO, flat on the ground and facing up: a diamond band.
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
+            diamond.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("float3 positions");
+        };
         let mut corners: Vec<Vec3> = Vec::new();
-        for p in diamond.strip_positions.iter().filter(|p| p.is_finite()) {
+        for p in positions.iter().map(|p| Vec3::from(*p)) {
             assert!(p.y.abs() < 1e-5, "flat on the ground: {p}");
-            assert!((p.length() - 1.0).abs() < 1e-4, "unit radius: {p}");
-            if !corners.iter().any(|c| c.distance(*p) < 1e-4) {
-                corners.push(*p);
+            let r = p.length();
+            assert!(
+                (r - 1.0).abs() < 1e-4 || (r - crate::selection::RING_INNER_RATIO).abs() < 1e-4,
+                "outer or inner radius: {p}"
+            );
+            if (r - 1.0).abs() < 1e-4 && !corners.iter().any(|c| c.distance(p) < 1e-4) {
+                corners.push(p);
             }
         }
         assert_eq!(
@@ -611,7 +654,24 @@ mod tests {
             ATTRITION_MARKER_SIDES as usize,
             "{corners:?}"
         );
-        let hue = LinearRgba::from(palette::ATTRITION);
+        // The corners lie on the x and z axes: a diamond, not a square.
+        for c in &corners {
+            assert!(c.x.abs() < 1e-4 || c.z.abs() < 1e-4, "{c}");
+        }
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(normals)) =
+            diamond.attribute(Mesh::ATTRIBUTE_NORMAL)
+        else {
+            panic!("float3 normals");
+        };
+        assert!(
+            normals
+                .iter()
+                .all(|n| (Vec3::from(*n) - Vec3::Y).length() < 1e-5)
+        );
+        // The Yield Cap amber, unlit: steady whatever the light.
+        let material = materials.get(&handles.attrition_material).unwrap();
+        assert_eq!(material.base_color, palette::ATTRITION);
+        assert!(material.unlit);
         let drawn = |positions: &[Vec3], colors: &[LinearRgba], want: LinearRgba| {
             positions
                 .iter()
@@ -619,7 +679,6 @@ mod tests {
                 .filter(|(p, _)| p.is_finite())
                 .all(|(_, c)| *c == want)
         };
-        assert!(drawn(&diamond.strip_positions, &diamond.strip_colors, hue));
         // The ring: a round circle of radius 1 in Timber.
         let points: Vec<Vec3> = ring
             .strip_positions
@@ -713,7 +772,10 @@ mod tests {
             (marker_pos.xz() - bowman_pos.xz()).length() < 0.6,
             "{marker_pos} under {bowman_pos}"
         );
-        assert_eq!(marker_pos.y, RING_Y);
+        assert_eq!(
+            marker_pos.y, ATTRITION_Y,
+            "under the selection ring's plane"
+        );
 
         // Select the Wain and a Skirmisher: one ring, the Wain's, of 14.5 m
         // around the centre of its tile.
@@ -800,5 +862,219 @@ mod tests {
             marked(&mut app).is_empty(),
             "no unit bleeds on neutral land"
         );
+    }
+
+    /// An app at tick 10 of `capture_seat`'s setup with its own stream:
+    /// P1 researches Harrying I and P0 spawns three Bowmen on P1's land
+    /// with no Wain, so all three bleed; P0's five Yeomen and the three
+    /// Bowmen are selected. Selection rings and attrition diamonds are
+    /// synced by the real systems.
+    fn rings_and_diamonds_app() -> App {
+        use crate::selection::{SelectionRings, create_ring_assets, sync_selection_rings};
+        use crate::sim_driver::{ScenarioInput, SimPlugin};
+        use sim::{Command, PlayerCommand};
+        use std::time::Duration;
+        let rules = rules();
+        let (setup, _, _) = sim::scenarios::by_name("capture_seat", &rules).unwrap();
+        let bowman = UnitKindId(
+            u16::try_from(rules.units.iter().position(|u| u.id == "bowman").unwrap()).unwrap(),
+        );
+        let harrying = sim::TechId(rules.tech_by_id("harrying_1").unwrap().0);
+        let stream = vec![(
+            0,
+            vec![
+                PlayerCommand::new(
+                    PlayerId(0),
+                    0,
+                    Command::DebugSpawn {
+                        owner: PlayerId(0),
+                        kind: bowman,
+                        // Nine tiles from P1's Seat: inside its border,
+                        // out of its shot.
+                        at: sim::FxVec2::from_ints(108, 56),
+                        count: 3,
+                    },
+                ),
+                PlayerCommand::new(
+                    PlayerId(1),
+                    0,
+                    Command::DebugResearch {
+                        owner: PlayerId(1),
+                        tech: harrying,
+                    },
+                ),
+            ],
+        )];
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(Assets::<GizmoAsset>::default())
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .init_resource::<Selection>()
+            .init_resource::<SelectionRings>()
+            .init_resource::<AttritionMarkers>()
+            .add_plugins((
+                SimPlugin::new(
+                    SimHandle::from_setup(setup, rules.clone()),
+                    Box::new(ScenarioInput::new(stream)),
+                ),
+                crate::present::PresentPlugin,
+            ))
+            .add_systems(Startup, (create_ring_assets, create_marker_assets))
+            .add_systems(
+                PostUpdate,
+                (prune_dead, sync_selection_rings, sync_attrition_markers).chain(),
+            );
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        while app.world().non_send::<SimHandle>().tick() < 10 {
+            app.update();
+        }
+        let bowmen: Vec<UnitId> = {
+            let sim = app.world().non_send::<SimHandle>();
+            bleeding(&sim.view(), LOCAL_PLAYER)
+        };
+        assert_eq!(bowmen.len(), 3, "the three Bowmen bleed: {bowmen:?}");
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .set((1..=5).map(UnitId).chain(bowmen));
+        app.update();
+        app
+    }
+
+    /// Art pass (its plan's decision 11, rings and diamonds as shared
+    /// meshes): every selection ring is the one shared ring mesh with the
+    /// one unlit material, and every attrition diamond the one diamond
+    /// mesh and material; none casts a shadow or is pickable.
+    #[test]
+    fn rings_and_diamonds_are_one_mesh_and_one_material_each() {
+        use crate::selection::{RingMesh, SelectionRing};
+        let mut app = rings_and_diamonds_app();
+        let ring = app.world().resource::<RingMesh>().clone();
+        let marker = app.world().resource::<MarkerAssets>().clone();
+        let world = app.world_mut();
+        let mut rings = world.query_filtered::<(
+            &Mesh3d,
+            &MeshMaterial3d<StandardMaterial>,
+            Has<bevy::light::NotShadowCaster>,
+            Has<Pickable>,
+        ), With<SelectionRing>>();
+        let rings: Vec<_> = rings.iter(world).collect();
+        assert_eq!(rings.len(), 8, "five Yeomen and three Bowmen");
+        for (mesh, material, no_shadow, pickable) in rings {
+            assert_eq!((&mesh.0, &material.0), (&ring.mesh, &ring.material));
+            assert!(no_shadow && !pickable);
+        }
+        let mut diamonds = world.query_filtered::<(
+            &Mesh3d,
+            &MeshMaterial3d<StandardMaterial>,
+            Has<bevy::light::NotShadowCaster>,
+            Has<Pickable>,
+        ), With<AttritionMarker>>();
+        let diamonds: Vec<_> = diamonds.iter(world).collect();
+        assert_eq!(diamonds.len(), 3, "one per bleeding Bowman");
+        for (mesh, material, no_shadow, pickable) in diamonds {
+            assert_eq!(
+                (&mesh.0, &material.0),
+                (&marker.attrition_mesh, &marker.attrition_material)
+            );
+            assert!(no_shadow && !pickable);
+        }
+        // No gizmo is left for either.
+        let mut gizmos = world.query_filtered::<(), (
+            With<Gizmo>,
+            Or<(With<SelectionRing>, With<AttritionMarker>)>,
+        )>();
+        assert_eq!(gizmos.iter(world).count(), 0);
+        let rings_mesh = world.resource::<Assets<Mesh>>().get(&ring.mesh).unwrap();
+        assert_eq!(
+            rings_mesh.count_vertices(),
+            2 * (crate::selection::RING_RESOLUTION as usize + 1),
+            "an annulus of RING_RESOLUTION segments"
+        );
+        let ring_material = world
+            .resource::<Assets<StandardMaterial>>()
+            .get(&ring.material)
+            .unwrap();
+        assert_eq!(ring_material.base_color, palette::SELECTION_RING);
+        assert!(ring_material.unlit);
+    }
+
+    /// A unit that is selected and bleeding has its ring and its diamond on
+    /// two planes, the ring on top. Their bands overlap for about ±39°
+    /// around each diagonal (the ring's band runs from 1.19 to 1.40 unit
+    /// radii, the diamond's from 1.08 to 1.27 there), and two opaque
+    /// meshes in one plane z-fight there: the amber speckles in the cream
+    /// band and shimmers as the unit moves.
+    #[test]
+    fn a_selected_bleeding_unit_draws_its_ring_above_its_diamond() {
+        use crate::selection::SelectionRing;
+        let mut app = rings_and_diamonds_app();
+        let world = app.world_mut();
+        let mut rings = world.query::<(&SelectionRing, &Transform)>();
+        let ring_y: std::collections::BTreeMap<UnitId, f32> = rings
+            .iter(world)
+            .map(|(r, t)| (r.0, t.translation.y))
+            .collect();
+        let mut diamonds = world.query::<(&AttritionMarker, &Transform)>();
+        let both: Vec<(UnitId, f32, f32)> = diamonds
+            .iter(world)
+            .filter_map(|(d, t)| ring_y.get(&d.0).map(|&ry| (d.0, ry, t.translation.y)))
+            .collect();
+        assert_eq!(both.len(), 3, "the three Bowmen are selected and bleed");
+        for (id, ring, diamond) in both {
+            assert!(
+                ring - diamond >= 0.004 && diamond > 0.0,
+                "{id:?}: ring at y {ring}, diamond at y {diamond}"
+            );
+        }
+    }
+
+    /// Rule 16: rings and diamonds are top-level entities keyed by
+    /// `UnitId`, never children of the units they mark, and they sit at
+    /// the unit's interpolated position on the ground, scaled from its
+    /// radius.
+    #[test]
+    fn rings_and_diamonds_have_no_parent() {
+        use crate::selection::{RING_RADIUS_PER_UNIT_RADIUS, SelectionRing};
+        let mut app = rings_and_diamonds_app();
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<(
+            Entity,
+            Has<ChildOf>,
+            &Transform,
+            Option<&SelectionRing>,
+            Option<&AttritionMarker>,
+        ), Or<(With<SelectionRing>, With<AttritionMarker>)>>();
+        let marks: Vec<_> = q
+            .iter(world)
+            .map(|(e, parent, t, r, d)| (e, parent, *t, r.map(|r| r.0), d.map(|d| d.0)))
+            .collect();
+        assert_eq!(marks.len(), 8 + 3);
+        let entities = world.resource::<UnitEntities>().0.clone();
+        let sim = world.non_send::<SimHandle>();
+        let view = sim.view();
+        for (entity, parent, transform, ring, diamond) in marks {
+            assert!(!parent, "{entity} has a parent");
+            let id = ring.or(diamond).expect("keyed by unit");
+            let unit = view.unit(id).expect("alive");
+            assert_ne!(Some(&entity), entities.get(&id), "not the unit itself");
+            let plane = if ring.is_some() { RING_Y } else { ATTRITION_Y };
+            assert_eq!(transform.translation.y, plane, "{entity}");
+            let per_radius = if ring.is_some() {
+                RING_RADIUS_PER_UNIT_RADIUS
+            } else {
+                ATTRITION_MARKER_PER_UNIT_RADIUS
+            };
+            let want = fx_to_f32(unit.radius) * per_radius;
+            assert!((transform.scale.x - want).abs() < 1e-5, "{entity}");
+        }
+        let mut units = world.query_filtered::<&Children, With<crate::present::UnitRef>>();
+        assert_eq!(units.iter(world).count(), 0, "units have no children here");
     }
 }

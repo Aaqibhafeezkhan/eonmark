@@ -17,7 +17,10 @@
 //! unfocused window runs Bevy's `reactive_low_power` 60 Hz update mode
 //! unless background mode switched to `continuous`, and a covered window is
 //! not presented at all on macOS, so both change what the frame times
-//! mean. With the arrival proxy on,
+//! mean. `window logical=<w>x<h> physical=<w>x<h> scale=<f>` (art pass) is
+//! the primary window's size as last seen, so a pasted run proves the size
+//! it measured at (`--window-size 1280x720` on a Retina display reads
+//! `physical=2560x1440 scale=2.0`). With the arrival proxy on,
 //! `arrived=<n>/<total> by tick <t>` counts units whose move order has
 //! completed and that hold a `Post` (the sim's own arrival state, what
 //! `UnitArrived` reported): `n` at exit, `t` the tick the count first
@@ -27,7 +30,7 @@
 //! into that circle, so it is informational for a single-point goal.
 //!
 //! With the fight window on (the `enemy_outpost` scenarios, M4b acceptance
-//! line 2), `fight frames=<n> seconds=<s> mean=<ms> p95=<ms> max=<ms>
+//! line 2, and `art_bench`, art pass; `app::prints_fight_lines`), `fight frames=<n> seconds=<s> mean=<ms> p95=<ms> max=<ms>
 //! fps=<f> ticks=<a>..<b> on_screen_max=<n> on_screen_min=<n>/<alive>
 //! units_at_first_hit=<p0>/<p1>` summarises only the frames of the 200 vs
 //! 200 fight: a frame counts when a `Hit` landed within the last
@@ -122,6 +125,31 @@ pub struct FrameStats {
     window_events: Vec<(&'static str, f64)>,
     /// The exit lines were printed.
     printed: bool,
+    /// The primary window's size as last sampled.
+    pub window_size: Option<WindowSize>,
+}
+
+/// A window's size: logical pixels, physical pixels and the scale factor
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSize {
+    /// Logical width and height.
+    pub logical: (f32, f32),
+    /// Physical width and height.
+    pub physical: (u32, u32),
+    /// Physical pixels per logical pixel.
+    pub scale: f32,
+}
+
+impl WindowSize {
+    /// The size of `window`.
+    pub fn of(window: &Window) -> Self {
+        Self {
+            logical: (window.width(), window.height()),
+            physical: (window.physical_width(), window.physical_height()),
+            scale: window.scale_factor(),
+        }
+    }
 }
 
 /// Mean, 95th percentile and maximum of the samples (milliseconds).
@@ -214,6 +242,21 @@ impl FrameStats {
             self.occluded_frames,
             events.join(",")
         )
+    }
+
+    /// The `window logical=... physical=... scale=...` line.
+    pub fn window_size_line(&self) -> String {
+        match self.window_size {
+            Some(s) => format!(
+                "window logical={}x{} physical={}x{} scale={:.1}",
+                s.logical.0.round(),
+                s.logical.1.round(),
+                s.physical.0,
+                s.physical.1,
+                s.scale
+            ),
+            None => "window logical=none physical=none scale=none".to_string(),
+        }
     }
 
     /// `true` once the exit lines were printed.
@@ -455,6 +498,9 @@ fn sample_frame(
         );
         stats.record_window(windows.single().is_ok_and(|w| w.focused));
     }
+    if let Ok(window) = windows.single() {
+        stats.window_size = Some(WindowSize::of(window));
+    }
 }
 
 /// Primary-window focus and occlusion changes, with their wall-clock time.
@@ -557,6 +603,7 @@ pub(crate) fn print_on_exit(
     println!("{STDOUT_PREFIX}{}", stats.rate_line());
     println!("{STDOUT_PREFIX}{}", stats.worst_line());
     println!("{STDOUT_PREFIX}{}", stats.window_line());
+    println!("{STDOUT_PREFIX}{}", stats.window_size_line());
     println!(
         "{STDOUT_PREFIX}ticks={} dropped_ticks={} stalled_ticks={} flushes={} (every {FLUSH_EVERY_TICKS} ticks)",
         sim.tick(),
@@ -607,6 +654,34 @@ mod tests {
         assert_eq!(
             s.worst_line(),
             "worst_ms=90.00@0.17s/f5 30.00@0.05s/f3 25.00@0.08s/f4"
+        );
+    }
+
+    /// The window size line reads the logical and physical sizes the
+    /// window reports (a 1280 x 720 window at scale 2 is 2560 x 1440).
+    #[test]
+    fn window_size_line_names_logical_physical_and_scale() {
+        let mut s = FrameStats::default();
+        assert_eq!(
+            s.window_size_line(),
+            "window logical=none physical=none scale=none"
+        );
+        // As winit reports a 1280 x 720 logical window on a Retina display.
+        let mut window = Window {
+            resolution: bevy::window::WindowResolution::new(2560, 1440)
+                .with_scale_factor_override(2.0),
+            ..default()
+        };
+        s.window_size = Some(WindowSize::of(&window));
+        assert_eq!(
+            s.window_size_line(),
+            "window logical=1280x720 physical=2560x1440 scale=2.0"
+        );
+        window.resolution = bevy::window::WindowResolution::new(1280, 800);
+        s.window_size = Some(WindowSize::of(&window));
+        assert_eq!(
+            s.window_size_line(),
+            "window logical=1280x800 physical=1280x800 scale=1.0"
         );
     }
 

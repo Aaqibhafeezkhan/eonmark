@@ -4,7 +4,8 @@
 //! library so integration tests (`tests/`) can drive the real `SimPlugin`.
 //!
 //! Module map (M2):
-//! - [`cli`]: hand-rolled argument parsing and data directory resolution.
+//! - [`cli`]: hand-rolled argument parsing and data and assets directory
+//!   resolution.
 //! - [`app`]: the windowed Bevy app and plugin wiring.
 //! - [`background`]: `--background` / `EONMARK_BACKGROUND=1` for automated
 //!   windowed runs (unfocused, below other windows; macOS hands focus back).
@@ -25,12 +26,16 @@
 //! - [`age_hud`]: the age readout and the Advance button on a strip under
 //!   the top bar (M4b), greyed by `SimView::check_advance_age`.
 //! - [`camera`]: the yaw-locked RTS camera.
-//! - [`ground`] and [`palette`]: the flat 128 x 128 m ground mesh and colours.
+//! - [`ground`] and [`palette`]: the flat 128 x 128 m ground mesh and
+//!   colours; the debug grid, off by default since the art pass (G).
 //! - [`headless`]: `--headless-run <ticks | replay>` on `MinimalPlugins`.
 //! - [`frame_stats`]: frame-time and arrival lines printed on exit
-//!   (`--scenario units200_auto`, the `enemy_outpost` scenarios, `--max-fps`);
-//!   for the `enemy_outpost` scenarios also the 200 vs 200 fight window
-//!   (M4b).
+//!   (`--scenario units200_auto`, the `enemy_outpost` scenarios, `art_bench`,
+//!   `--max-fps`, `--draw-stats`); for the `enemy_outpost` scenarios and
+//!   `art_bench` also the 200 vs 200 fight window (M4b).
+//! - [`draw_stats`]: the draw-call counter (art pass), rebuilt from Bevy's
+//!   public render-phase data in the render world; the dev panel row and
+//!   the `draws` and `triangles` exit lines (`--draw-stats`, `dev`).
 //! - [`markers`]: the attrition indicator under bleeding units, the supply
 //!   ring around a selected Supply Wain, the annexation timer around a
 //!   contested Town and the annexation readout (M5a).
@@ -39,7 +44,8 @@
 //! - [`menu`]: `AppState` (`Menu`, `Skirmish`) and the main menu a plain
 //!   launch opens on, with New Game and Quit (M5b).
 //! - [`director`]: camera and selection beats for
-//!   `--scenario enemy_outpost_walkthrough` (M4b); never issues a command.
+//!   `--scenario enemy_outpost_walkthrough` (M4b) and `art_bench`'s
+//!   select-all (art pass); never issues a command.
 //! - `macos_menu`: muda menu with the custom Cmd-Q item (macOS only).
 //! - `dev_tools`: FPS overlay, egui inspector (F12) and sim panel (`dev` only).
 #![forbid(unsafe_code)]
@@ -54,6 +60,7 @@ pub mod command_card;
 #[cfg(feature = "dev")]
 pub mod dev_tools;
 pub mod director;
+pub mod draw_stats;
 pub mod economy_hud;
 pub mod field;
 pub mod frame_stats;

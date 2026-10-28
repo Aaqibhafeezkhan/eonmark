@@ -5,14 +5,94 @@
 # Rules:
 #   1. Every file under assets/ (except the allowlist below) has a row in
 #      assets/ATTRIBUTION.md whose first column is the path relative to
-#      assets/, for example `fonts/Inter.ttf`.
+#      assets/, for example `fonts/InterVariable.ttf`.
 #   2. That row's License column is one of CC0-1.0, CC-BY-4.0, OFL-1.1.
 #   3. Every .ttf/.otf has a sibling OFL*.txt (OFL 1.1 requires the text).
 #   4. No single file is larger than 2 MB; assets/ totals under 300 MB.
+#   5. (art pass) Every row of tools/assets/sources.tsv with a dest is
+#      vendored byte for byte: the file under assets/ exists and its sha256
+#      is the row's pin. ATTRIBUTION.md says Modifications `none` (or
+#      `renamed from`) for these files, and this is what holds it to that;
+#      a deliberate change must update the row and its Modifications text.
+#      Checked only when the manifest exists under the root.
 # An empty or missing assets/ directory passes.
 #
-# Usage: scripts/check_assets.sh [repo-root]
+# --self-test proves the injection clause of ROADMAP M7's asset line: it
+# copies only assets/ into a temporary root, adds models/unattributed.glb,
+# and requires this script to exit 1 naming that path on stderr, then to
+# exit 0 once the file is removed again. It then proves rule 5 on a second
+# root holding assets/ and tools/assets/sources.tsv: one changed byte in a
+# pinned file must exit 1 naming that file, and the original bytes exit 0.
+#
+# Usage: scripts/check_assets.sh [repo-root | --self-test]
 set -euo pipefail
+
+if [ "${1:-}" = "--self-test" ]; then
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  repo="$(cd "$(dirname "$0")/.." && pwd)"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/root"
+  cp -R "$repo/assets" "$tmp/root/assets"
+  injected="models/unattributed.glb"
+  mkdir -p "$tmp/root/assets/models"
+  printf 'glTF' >"$tmp/root/assets/$injected"
+  set +e
+  "$self" "$tmp/root" >"$tmp/out" 2>"$tmp/err"
+  code=$?
+  set -e
+  if [ "$code" -ne 1 ]; then
+    echo "check_assets: self-test FAILED: an unattributed $injected gave exit $code, not 1" >&2
+    cat "$tmp/out" "$tmp/err" >&2
+    exit 1
+  fi
+  if ! grep -F "$injected" "$tmp/err"; then
+    echo "check_assets: self-test FAILED: stderr does not name $injected" >&2
+    cat "$tmp/err" >&2
+    exit 1
+  fi
+  rm "$tmp/root/assets/$injected"
+  if ! "$self" "$tmp/root"; then
+    echo "check_assets: self-test FAILED: the copy fails without the injected file" >&2
+    exit 1
+  fi
+  # Rule 5: a vendored file that no longer matches its pin.
+  manifest="tools/assets/sources.tsv"
+  pinned=""
+  if [ -f "$repo/$manifest" ]; then
+    mkdir -p "$tmp/pins/tools/assets"
+    cp -R "$repo/assets" "$tmp/pins/assets"
+    cp "$repo/$manifest" "$tmp/pins/$manifest"
+    pinned="$(awk -F'\t' '/^#/ { next } !header { header = 1; next } $1 != "" && $1 != "-" { print $1; exit }' "$repo/$manifest")"
+  fi
+  if [ -n "$pinned" ]; then
+    cp "$tmp/pins/assets/$pinned" "$tmp/original"
+    printf 'x' >>"$tmp/pins/assets/$pinned"
+    set +e
+    "$self" "$tmp/pins" >"$tmp/out" 2>"$tmp/err"
+    code=$?
+    set -e
+    if [ "$code" -ne 1 ]; then
+      echo "check_assets: self-test FAILED: a changed byte in $pinned gave exit $code, not 1" >&2
+      cat "$tmp/out" "$tmp/err" >&2
+      exit 1
+    fi
+    if ! grep -F "$pinned" "$tmp/err"; then
+      echo "check_assets: self-test FAILED: stderr does not name $pinned" >&2
+      cat "$tmp/err" >&2
+      exit 1
+    fi
+    cp "$tmp/original" "$tmp/pins/assets/$pinned"
+    if ! "$self" "$tmp/pins"; then
+      echo "check_assets: self-test FAILED: the copy fails with $pinned restored" >&2
+      exit 1
+    fi
+    echo "check_assets: self-test ok (an unattributed file fails with its path; removing it passes; a changed pinned file fails with its path; restoring it passes)"
+  else
+    echo "check_assets: self-test ok (an unattributed file fails with its path; removing it passes; no pinned file to change)"
+  fi
+  exit 0
+fi
 
 root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$root"
@@ -97,6 +177,38 @@ done < <(find "$assets_dir" -type f ! -name '.DS_Store' -print0 | sort -z)
 
 if [ "$total" -ge "$max_total_bytes" ]; then
   fail "assets/ totals $total bytes; the limit is $max_total_bytes (300 MB)"
+fi
+
+# --- rule 5: vendored files match their sha256 pins --------------------------
+manifest="tools/assets/sources.tsv"
+if [ -f "$manifest" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+  else
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+  fi
+  pins=0
+  header=1
+  while IFS=$'\t' read -r dest _url pin _rest; do
+    case "$dest" in '' | '#'*) continue ;; esac
+    if [ "$header" -eq 1 ]; then
+      header=0
+      continue
+    fi
+    [ "$dest" = "-" ] && continue
+    pins=$((pins + 1))
+    if [ ! -f "$assets_dir/$dest" ]; then
+      fail "$dest is pinned in $manifest but missing from $assets_dir/"
+      continue
+    fi
+    got="$(sha256 "$assets_dir/$dest")"
+    if [ "$got" != "$pin" ]; then
+      fail "$dest: sha256 $got does not match its pin $pin in $manifest; a vendored file stays byte for byte as shipped (ATTRIBUTION.md Modifications none): restore it (just fetch-assets) or record the change in its row and its Modifications text"
+    fi
+  done <"$manifest"
+  if [ "$status" -eq 0 ]; then
+    echo "check_assets: pins ok ($pins vendored files match $manifest)"
+  fi
 fi
 
 if [ "$status" -eq 0 ]; then

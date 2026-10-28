@@ -78,8 +78,10 @@ Primitive silhouettes (M2 to M7):
 | Buildings | `Cuboid` | Footprint from `buildings.ron` |
 | Town | `Cylinder` | Larger when it reaches the second radius tier |
 | Resource node | `Sphere` | Grain gold, timber, ore colours |
-| Selection ring, rally marker, move marker | Retained gizmo lines | Separate entities keyed by id, never children of moving units |
-| Attrition indicator, supply ring (M5a) | Retained gizmo lines | Same rule; a steady Yield Cap amber (#D29B3B) diamond under a unit bleeding on enemy land, a Timber ring around a selected Supply Wain; nothing pulses |
+| Selection ring | Flat annulus mesh, unlit (retained gizmo lines until the art pass) | Separate entities keyed by id, never children of moving units; one shared mesh and material for every ring, so any number of rings is one draw call |
+| Rally marker, move marker | Retained gizmo lines | Same rule |
+| Attrition indicator (M5a) | Flat 4-segment annulus mesh, unlit (retained gizmo lines until the art pass) | Same rule; a steady Yield Cap amber (#D29B3B) diamond under a unit bleeding on enemy land, one shared mesh and material for every diamond; nothing pulses |
+| Supply ring (M5a) | Retained gizmo lines | Same rule; a Timber ring around a selected Supply Wain; nothing pulses |
 | Annexation timer (M5a) | Immediate gizmo lines, 3 px | A #3A3A3F track circle just outside a contested Town and the attacker's team-colour arc filling clockwise from north |
 | Health bar | Flat quad entity | Same rule; unlit, a team-colour fill on a #3A3A3F track, no green-to-red, shown only while the target is damaged or selected (M4b, `health_bars.rs`) |
 
@@ -98,7 +100,7 @@ Unit looks (M4b, `data/visuals.ron`), one silhouette per kind. Width is the kind
 
 Two kinds share a shape only when they differ by at least 1.4 times on some axis (the Scribe's drum and the Bowman's post, the Shieldbearer's block and the Wain's low box, the Yeoman's upright pill and the Outrider's lying one); `present::tests::every_unit_kind_has_its_own_silhouette` checks it. The 40 m view is `--scenario unit_looks`: one unit of each kind per team in two rows 15 m apart, framed at 40 m unless `--camera` is given (`target/ci/eonmark --background --scenario unit_looks --exit-after-seconds 40 --screenshot-at 100:looks.png`; CI's render smoke test renders it on every PR). The owner chose single-shape silhouettes over multi-part looks on 2026-10-22 (ROADMAP M4b, Notes, decision 11); multi-part looks wait for the art pass. The looks themselves are signed off on the 40 m screenshot, and that sign-off is still pending: the owner's run on the Mac, with the P3 and sRGB check and the checklist below.
 
-The sign-off also looks at a crowd, because the lineup stands every unit alone 4 m from the next and cannot show how the looks pack in a fight: `target/ci/eonmark --background --scenario enemy_outpost --camera 100,32,40 --exit-after-seconds 60 --screenshot-at 250:crowd.png` (`just render-smoke out enemy_outpost 100,32,40 250` under Xvfb) frames the 200 vs 200 prologue at 40 m mid-fight. Every look is exactly its kind's collision diameter across except the Outrider's, whose lying pill is 1.8 m long against a 0.9 m diameter. Melee range is measured edge to edge (0.25 m for the Outrider) and the sim keeps units apart only by a soft push, so two Outriders holding on each other stand at most 1.15 m apart, centre to centre, while each pill reaches 0.9 m ahead of its centre: head-on they overlap by at least 0.65 m, and in a packed melee the pills visibly pass through each other. Shortening the pill is a data-only change, `height_tiles_x100` of `"outrider"` in `data/visuals.ron` (120 keeps a lying pill, cuts the head-on overlap to 0.05 m and still differs from the Yeoman's upright pill by 1.7 times along its length, and `present::tests::every_unit_kind_has_its_own_silhouette` passes with it, but reads closer to the Mangonel's 1.0 m ball); since `rules_version` 25 `visuals.ron` is not in `rules_hash` ([ADR 0003](adr/0003-visuals-outside-rules-hash.md)), so it needs no `rules_version` bump and no `just rerecord` (at M4b it needed both). The owner decides that trade at the sign-off.
+The sign-off also looks at a crowd, because the lineup stands every unit alone 4 m from the next and cannot show how the looks pack in a fight: `target/ci/eonmark --background --scenario enemy_outpost --camera 100,32,40 --exit-after-seconds 60 --screenshot-at 250:crowd.png` (`just render-smoke out enemy_outpost 100,32,40 250` under Xvfb) frames the 200 vs 200 prologue at 40 m mid-fight. Every look is exactly its kind's collision diameter across except the Outrider's, whose lying pill is 1.8 m long against a 0.9 m diameter. Melee range is measured edge to edge (0.25 m for the Outrider) and the sim keeps units apart only by a soft push, so two Outriders holding on each other stand at most 1.15 m apart, centre to centre, while each pill reaches 0.9 m ahead of its centre: head-on they overlap by at least 0.65 m, and in a packed melee the pills visibly pass through each other. Shortening the pill is a data-only change, `height_tiles_x100` of `"outrider"` in `data/visuals.ron` (120 keeps a lying pill, cuts the head-on overlap to 0.05 m and still differs from the Yeoman's upright pill by 1.7 times along its length, and `data-check`'s 1.4x silhouette check (`rules::Visuals::validate`; at M4b it was `present::tests::every_unit_kind_has_its_own_silhouette`, which since the art pass measures the frozen M4b looks) passes with it, but reads closer to the Mangonel's 1.0 m ball); since `rules_version` 25 `visuals.ron` is not in `rules_hash` ([ADR 0003](adr/0003-visuals-outside-rules-hash.md)), so it needs no `rules_version` bump and no `just rerecord` (at M4b it needed both). The owner decides that trade at the sign-off.
 
 Motion is procedural (bob, swing, scale pulse), not animation clips, in v0.1.
 
@@ -125,16 +127,16 @@ wgpu on a wide-gamut display can render colours more saturated than authored. Ev
 
 ## Primitives first, models by data
 
-Every unit kind is drawn through one `Visual` value from `data/visuals.ron`, keyed by its `units.ron` id (buildings are drawn by `crates/game/src/buildings.rs` until M7 moves them into the file; a building key fails `data-check` today):
+Every unit kind is drawn through one `Visual` value from `data/visuals.ron`, keyed by its `units.ron` id, and since the art pass every building kind too, keyed by its `buildings.ron` id (`Primitive(Cuboid)` is the M3b box `crates/game/src/buildings.rs` draws; slice 1 maps all eight kinds to it, so the look is unchanged):
 
 ```ron
 "yeoman": Primitive(Capsule),
 "skirmisher": Body(shape: Cone, height_tiles_x100: 150),
 "outrider": Body(shape: Capsule, height_tiles_x100: 180, lying: true),
-"mangonel": Scene(path: "models/mangonel.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0),
+"mangonel": Scene(path: "models/mangonel.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, fallback: Some(Primitive(Sphere))),
 ```
 
-`Visual::Primitive(shape)` draws a team-coloured primitive sized from the kind's radius (`Capsule`, `Cuboid`, `Cylinder`, `Sphere` or `Cone`). `Visual::Body(shape, height_tiles_x100, lying)` (M4b) draws the same primitive two radii wide with its own height in hundredths of a metre (20 to 400; never a `Sphere`); `lying: true` lays a `Capsule` or `Cylinder` along the unit's facing, that long and two radii tall. `Visual::Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` loads a glTF scene; the scale and offset are in hundredths and the yaw in whole degrees, so the file stays float-free. Swapping a cube for a model is a RON edit, never a Rust change, and since `rules_version` 25 it needs no `rules_version` bump or re-record either: `data-check` validates `visuals.ron`, but `rules_hash` leaves it out ([ADR 0003](adr/0003-visuals-outside-rules-hash.md)). M0 to M6 ship primitives only; M7 maps every kind to CC0 models and keeps the primitive look as the fallback. Anything drawn above a unit (the M4b health bar) takes its height from `present::look_top_y`, computed from the `Visual`, so the art pass changes that one function. Until M7 the presenter draws a `Scene` as the fallback `Primitive(Capsule)` (`present::FALLBACK_VISUAL`).
+`Visual::Primitive(shape)` draws a team-coloured primitive sized from the kind's radius (`Capsule`, `Cuboid`, `Cylinder`, `Sphere` or `Cone`). `Visual::Body(shape, height_tiles_x100, lying)` (M4b) draws the same primitive two radii wide with its own height in hundredths of a metre (20 to 400; never a `Sphere`); `lying: true` lays a `Capsule` or `Cylinder` along the unit's facing, that long and two radii tall. `Visual::Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` loads a glTF scene; the scale and offset are in hundredths and the yaw in whole degrees, so the file stays float-free. Swapping a cube for a model is a RON edit, never a Rust change, and since `rules_version` 25 it needs no `rules_version` bump or re-record either: `data-check` validates `visuals.ron`, but `rules_hash` leaves it out ([ADR 0003](adr/0003-visuals-outside-rules-hash.md)). M0 to M6 ship primitives only; M7 maps every kind to CC0 models and keeps the primitive look as the fallback. Anything drawn above a unit (the M4b health bar) takes its height from `present::look_top_y`, computed from the `Visual`, so the art pass changes that one function. Until models load (art-pass slice 3) the presenter draws a `Scene` as its `fallback`, else `Primitive(Capsule)` (`present::FALLBACK_VISUAL`), and a building `Scene` as the box. `data-check` holds the 1.4x silhouette rule over the live file's `Primitive` and `Body` looks (a Scene by its fallback), while the `present.rs` look tests measure the M4b looks frozen as `M4B_LOOKS`, so a look edit never fails a Rust test.
 
 ## glTF import rules
 
@@ -145,11 +147,11 @@ Every unit kind is drawn through one `Visual` value from `data/visuals.ron`, key
 | Forward | -Z |
 | Scale | 1 unit = 1 m; apply transforms before export |
 | Origin | base centre of the model |
-| Texture | one palette or gradient texture at most 256 px on a side; downsample KayKit 1024 atlases |
+| Texture | one palette or gradient texture at most 256 px on a side, except a pack's shared palette atlas, which ships as is (KayKit Hexagon's 1024 px `hexagons_medieval.png`, art-pass owner decision 5); baked characters are downsampled only when every face keeps its colour |
 | Contents | meshes and materials only; no embedded lights or cameras |
 | Naming | `kind_variant.glb`, lower case |
 | Loading | `GltfAssetLabel::Scene(0)` |
-| Inspection | `tools/inspect_gltf` prints scenes, meshes and bounds (M7) |
+| Inspection | `cargo run -p inspect_gltf --release -- inspect <file>` prints scenes, the node tree with transforms, meshes and primitives, images, skins, clips, rest bounds and a T-pose hint; `swatches`, `palette`, `bake` and `check` are described below |
 
 The glTF specification says +Z forward and Blender's default export writes -Z forward; kits differ in scale and origin. Normalize at import, record `scale`, `y_offset` and `yaw` in `visuals.ron`, and check the result at the standard camera.
 
@@ -165,7 +167,53 @@ The glTF specification says +Z forward and Blender's default export writes -Z fo
 
 Excluded: Quaternius (proprietary licence since 2026-08-28), CC-BY-SA, CC-BY-NC, GPL art, Sampling+, and any material from the inspiration's fan wiki.
 
-Each vendored file gets an `ATTRIBUTION.md` row: asset, author, source URL, licence, modifications, download date. In-house files are marked `original: yes` and are CC0. `scripts/check_assets.sh` fails CI if a non-allowlisted file lacks a row, exceeds 2 MB, or the total exceeds 300 MB. No Git LFS.
+Each vendored file gets an `ATTRIBUTION.md` row: asset, author, source URL, licence, modifications, download date. In-house files are marked `original: yes` and are CC0. `scripts/check_assets.sh` fails CI if a non-allowlisted file lacks a row, exceeds 2 MB, or the total exceeds 300 MB, and `scripts/check_assets.sh --self-test` proves that an unattributed file fails with its path. No Git LFS.
+
+### Where the art pass's files come from
+
+The pre-stream art pass ([ROADMAP.md](ROADMAP.md), "Art pass (pre-stream)") vendors KayKit Medieval Hexagon 1.0 (buildings, construction stages, rubble, flag, cart props and nature) and Inter 4.1, and bakes its units from KayKit Adventurers 1.0. Everything is fetched from `raw.githubusercontent.com` (the `KayKit-Game-Assets` organisation, which the owner confirmed as the source to use, and `rsms/inter` at tag `v4.1`), the only host that serves these files to the agent's VM: github.com pages, its git and API hosts, kenney.nl, itch.io and opengameart.org refuse, and KayKit Medieval Builder and Forest Nature are itch-only (404 on raw). So:
+
+- **Pins are sha256, not commits.** `tools/assets/sources.tsv` lists every remote file with its URL, sha256, licence, author and per-file GitHub page; `just fetch-assets` (`scripts/fetch_assets.sh`, maintainer-only, never in CI) fetches and checks the licence texts first (KayKit's `LICENSE.txt` must name `publicdomain/zero/1.0`, Inter's must be the SIL Open Font License 1.1, or it stops), then every other file into a download cache, verifies each pin and copies the vendored ones into `assets/` byte for byte. The vendored copies are the source of truth; a second run changes nothing. Offline, `scripts/check_assets.sh` (CI's check job and `just ci`) hashes every vendored file against its pin, so a file whose `ATTRIBUTION.md` row says Modifications `none` stays byte for byte as shipped: an edit fails CI naming the file until its row and its Modifications text record it. `.editorconfig` turns off whitespace trimming under `assets/`, since KayKit's licence texts end lines in tabs.
+- **Tool-only inputs stay in the cache.** The red KayKit variants exist only for `inspect_gltf swatches`, and the 3.6 MB rigged character files only for `inspect_gltf bake` (`just art-bake`, `tools/assets/bake.ron`); neither is committed.
+- **Licence texts are vendored with their own rows** (`models/kaykit_hexagon/LICENSE.txt`, `models/kaykit_adventurers/LICENSE.txt`, `fonts/OFL-Inter.txt`), and `inspect_gltf`'s `attribution_rows_match_the_sources` test holds `ATTRIBUTION.md` to `sources.tsv` and `bake.ron`.
+- **Kenney is deferred to M7** (UI Pack panels, Game Icons): its site is unreachable from the agent's VM, so the owner fetches it on the Mac then. The KenneyNL starter kits on raw GitHub are not used: no per-asset CC0 statement has been read there.
+
+### Budgets (measured in art slice 2)
+
+`inspect_gltf check data assets` (CI's check job) holds every Scene in `data/visuals.ron` to these limits. The file, texture and triangle limits were set from `inspect_gltf inspect` on every chosen source, each a little above the heaviest file it covers. The team-area floors were not measured: they are the plan's (its section 3.4), and most chosen buildings fall under them (below the table). Each `ok` line also prints `facing=`, the horizontal side with the most surface and its share (a hint for the rest-facing rule: units face +X after `yaw_deg`, buildings, sites and rubble +Z toward the camera; props print `-`); a share near 25% means no side dominates, and the 40 m screenshots decide.
+
+| Limit | Value | Heaviest measured |
+|---|---|---|
+| File | 2 MB | castle `.bin` 317,732 B |
+| Texture side | 256 px, except the shipped Hexagon atlas | `hexagons_medieval.png` 1024 x 1024 (owner decision 5); characters embed 1024 x 1024 |
+| Unit triangles | 5,500 (a note above 5,000) | Adventurers body plus kept items 4,005 (hooded Rogue) to 5,325 (Barbarian with two axes); Mangonel catapult nodes 1,326; Wain parts 668 |
+| Building triangles | 6,000 | castle 5,659 (under the plan's 12,000, so it stays) |
+| Site and rubble triangles | 1,500 | `building_stage_C` 1,218 |
+| Seat flag triangles | 100 | `flag_blue` 48 |
+| Interior prop triangles | 1,600 | `trees_B_large` 1,540 (the large trees stay) |
+| Edge prop triangles | 300 | `tree_single_B` 220 |
+| Team area | units 200‰, the Wain 80‰, buildings 100‰, the Seat flag 300‰ | Hexagon buildings 5‰ (mine) to 280‰ (church); flag 457‰ |
+
+The team area is the share of a model's surface whose faces sample its `team_swatches` rects. KayKit Hexagon's team texels are one rect of the shared atlas, `(17, 787, 91, 207)`, found by `inspect_gltf swatches` over the blue and red variants of every vendored building, the catapult tower and the flag; no non-team face samples it, and no neutral model (stages, rubble, nature, cart props) does either.
+
+**The chosen models against the team floors** (a trial `check` with the building mapping of the art-pass plan, every building `team: Some("kaykit_hexagon")`, slice 2):
+
+| Use | Model | Team area | Floor |
+|---|---|---|---|
+| town | `building_castle_blue` | 67‰ | 100‰, under |
+| lumber_yard | `building_lumbermill_blue` | 64‰ | 100‰, under |
+| ore_pit | `building_mine_blue` | 5‰ | 100‰, under |
+| muster_hall | `building_barracks_blue` | 84‰ | 100‰, under |
+| watchtower | `building_tower_A_blue` | 81‰ | 100‰, under |
+| engine_yard | `building_blacksmith_blue` | 91‰ | 100‰, under |
+| croft | `building_home_A_blue` | 258‰ | 100‰, passes |
+| scriptorium | `building_church_blue` | 280‰ | 100‰, passes |
+| mangonel (unit) | `building_tower_catapult_blue`, catapult nodes | about 25‰ | 200‰, under |
+| Seat flag | `flag_blue` | 457‰ | 300‰, passes |
+
+The rect cannot be widened: it is already every texel that differs between KayKit's blue and red variants, so these buildings simply carry little team surface. Until the owner chooses (ROADMAP "Art pass (pre-stream)", Notes), slice 3 cannot write those six buildings or the Mangonel as team Scenes and still have `check` print `ok` (AP3). The options: lower the building floor (and the Mangonel's) to the measured values; take a different model where the pack has one; or one of the plan's risk-17 levers, such as a `base_disc` (a shared team-coloured disc under the model, one mesh and one material per team).
+
+`inspect_gltf palette <file> [--grid 16]` prints the base texture's cell grid: each used cell's texel rect, mean colour and the nodes whose faces sample it. It is how a character's `team_swatches` rects are picked (art slice 4), since the Adventurers characters ship in one colour and have no red variant for `swatches` to diff.
 
 ## Screenshot sign-off checklist
 

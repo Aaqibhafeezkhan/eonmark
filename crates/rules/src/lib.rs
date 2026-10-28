@@ -17,7 +17,7 @@
 //! | `rules/ages.ron` | [`Ages`] |
 //! | `rules/factions.ron` | [`Factions`] |
 //! | `maps/*.ron` | [`map::MapDef`] |
-//! | `visuals.ron` | [`Visuals`] (how each unit kind is drawn; validated here, read by the game, not in [`Rules::rules_hash`]: ADR 0003) |
+//! | `visuals.ron` | [`Visuals`] (how each unit and building kind is drawn; validated here, read by the game, not in [`Rules::rules_hash`]: ADR 0003) |
 //! | `ai/personalities.ron`, `ai/build_orders/*.ron` | [`ai::AiRules`] (the bot's knobs and build orders, M5b; validated here, read by `crates/ai`) |
 //!
 //! Every error names the file and, when the data parsed, the field.
@@ -57,7 +57,9 @@ pub use modifiers::{ModOp, Modifier, StatPath, UnitSel};
 pub use resources::{Resource, Resources};
 pub use techs::{Tech, Techs};
 pub use units::{Counter, Defender, UnitClass, UnitKind, UnitRamp, Units};
-pub use visuals::{Primitive, Visual, Visuals};
+pub use visuals::{
+    DecorAt, DecorLook, Part, Primitive, Rubble, TeamSwatch, TerrainDecor, Visual, Visuals,
+};
 
 /// The time unit every income rate is authored in: per 30 s, in
 /// deciseconds. Not a tuning knob; [`Rules::income_period_ticks`] converts
@@ -314,8 +316,9 @@ pub struct Rules {
     /// Every map under `maps/`, keyed by name. Attached by [`Rules::load`].
     #[serde(skip_deserializing)]
     pub maps: BTreeMap<String, MapDef>,
-    /// Contents of `visuals.ron`: a [`Visual`] per unit kind id. Attached by
-    /// [`Rules::load`] and validated against `units`; read by the game crate's
+    /// Contents of `visuals.ron`: a [`Visual`] per unit and building kind id
+    /// and the art pass's tables. Attached by [`Rules::load`] and validated
+    /// against `units` and `buildings`; read by the game crate's
     /// presenter, never by the sim. `#[serde(skip)]`, not only
     /// `skip_deserializing`, so it is the one attached file left out of
     /// [`Rules::rules_hash`] (ADR 0003, `docs/adr/0003-visuals-outside-rules-hash.md`):
@@ -429,7 +432,9 @@ impl Rules {
 
         let visuals_path = dir.join("visuals.ron");
         rules.visuals = load_ron(&visuals_path)?;
-        rules.visuals.validate(&visuals_path, &rules.units)?;
+        rules
+            .visuals
+            .validate(&visuals_path, &rules.units, &rules.buildings)?;
 
         let maps_dir = dir.join("maps");
         rules.maps = map::load_dir(&maps_dir)?;
@@ -1711,6 +1716,14 @@ impl Rules {
         self.unit_kind(kind).and_then(|k| self.visuals.get(&k.id))
     }
 
+    /// The visual for a building kind index (the sim's `BuildingKindId.0`),
+    /// if the kind exists (art pass). `Rules::load` guarantees every kind
+    /// has one: `Primitive(Cuboid)` or a `Scene`.
+    pub fn building_visual(&self, kind: u16) -> Option<&Visual> {
+        self.building_kind(kind)
+            .and_then(|k| self.visuals.building(&k.id))
+    }
+
     /// Content hash of the loaded rules (match rules, resources, units and
     /// their counter table, buildings, techs, ages, factions, maps and the
     /// bot data under `ai/`); stored in replay headers so a changed RON file
@@ -2171,7 +2184,7 @@ mod tests {
     #[test]
     fn missing_visual_names_file_and_kind() {
         let dir = copied_data_dir("visual-missing");
-        std::fs::write(dir.join("visuals.ron"), "(units: {})").unwrap();
+        std::fs::write(dir.join("visuals.ron"), "(units: {}, buildings: {})").unwrap();
         let err = Rules::load(&dir).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("visuals.ron"), "{msg}");

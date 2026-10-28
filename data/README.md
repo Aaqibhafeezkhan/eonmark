@@ -22,7 +22,7 @@ reads these files; it never defines gameplay constants of its own.
 | `rules/factions.ron` | The factions and their Modifier rows (Freeholders, none) | `crates/rules/src/factions.rs` (`Factions`) | M4a |
 | `maps/plains_1v1.ron` | The one 128x128 mirrored two-player map | `crates/rules/src/map.rs` | M0 |
 | `rules/strings/en.ron` | UI strings: the message line's text for every command rejection, HUD labels and tooltips. Presentation only, outside `rules_hash` (see `crates/rules/src/strings.rs`) | written | M3b |
-| `visuals.ron` | How each unit kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere \| Cone)` and, from M4b, `Body(shape, height_tiles_x100, lying)` now, `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` from M7; keyed by unit kind id, every kind in `units.ron` must appear. Presentation only: validated by `Rules::load`, outside `rules_hash` since `rules_version` 25 ([ADR 0003](../docs/adr/0003-visuals-outside-rules-hash.md)) | `crates/rules/src/visuals.rs` (`Visuals`) | M2, M4b |
+| `visuals.ron` | How each unit and building kind is drawn: `Primitive(Capsule \| Cuboid \| Cylinder \| Sphere \| Cone)` and, from M4b, `Body(shape, height_tiles_x100, lying)`, and glTF `Scene`s from the art pass; keyed by unit kind id and (art pass) building kind id, every kind in `units.ron` and `buildings.ron` must appear; the art pass adds the sites, rubble, Seat flag, terrain props and team-colour swatches. Presentation only: validated by `Rules::load`, outside `rules_hash` since `rules_version` 25 ([ADR 0003](../docs/adr/0003-visuals-outside-rules-hash.md)) | `crates/rules/src/visuals.rs` (`Visuals`) | M2, M4b |
 | `ai/personalities.ron` | One row per bot personality: its build order and every knob of the bot (cadence, caps, site policies, army mix, waves, defence and recall); M5b ships `standard`. Loaded last by `Rules::load`, attached as `Rules::ai` and in `rules_hash`, so an edit needs a `rules_version` bump | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
 | `ai/build_orders/*.ron` | One build order per file, its `id` equal to the file stem; M5b ships `standard.ron`. In `rules_hash` like the personalities | `crates/rules/src/ai.rs` (`AiRules`) | M5b |
 | `ai/difficulty.ron` | Easy, Standard, Hard: income interval and aggression | not yet written | M6 |
@@ -43,10 +43,12 @@ was, from M2). Schema `crates/rules/src/visuals.rs`.
 
 | Field | Meaning |
 |-------|---------|
-| `units` | Map from unit kind id (`units.ron` `id`) to a `Visual`. Every kind must have an entry; an unknown key is an error naming `units["<id>"]`. |
+| `units` | Map from unit kind id (`units.ron` `id`) to a `Visual`. Every kind must have an entry; an unknown key is an error naming `units["<id>"]`. Two kinds of the same shape must differ by 1.4x in width, height or depth (one silhouette per kind). |
+| `buildings` | Map from building kind id (`buildings.ron` `id`) to `Primitive(Cuboid)`, the M3b team-coloured box over the footprint, or a `Scene` whose fallback is that box (art pass). Every kind must have an entry; an unknown key is an error naming `buildings["<id>"]`. |
 | `Primitive(Capsule)` / `Cuboid` / `Cylinder` / `Sphere` / `Cone` | One shared mesh per kind, sized from the kind's `radius_tiles_x100` (a Capsule 3.4 radii tall, the others 2 radii), tinted with the owner's team colour (M2; `Cone` from M4b). |
 | `Body(shape, height_tiles_x100, lying)` | The same primitive two radii wide with its own height in hundredths of a tile (M4b): `height_tiles_x100` in 20..=400, a `Capsule` at least two radii. `lying: true` (default `false`, `Capsule` or `Cylinder` only) lays it along the unit's facing, `height_tiles_x100` long and two radii tall. A `Body` is never a `Sphere`. Errors name `units["<id>"].shape`, `.lying` or `.height_tiles_x100`. |
-| `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` | glTF under `assets/` (`.glb` or `.gltf`), uniform scale in hundredths (1..=10000), vertical offset in hundredths of a tile, extra yaw in whole degrees (-360..=360). Parsed and validated now, used from M7. |
+| `Scene(path, scale_x100, y_offset_tiles_x100, yaw_deg)` | glTF under `assets/` (`.glb` or `.gltf`, relative, no `..`), uniform scale in hundredths (1..=10000), vertical offset in hundredths of a tile, extra yaw in whole degrees (-360..=360). Optional: `nodes` (node-name globs to keep), `parts` (more files in the same mesh, with an offset, scale and yaw), `team` (a `team_swatches` key whose rects are repainted in the owner's colour) and `fallback` (what is drawn while the model is missing: a `Primitive` or `Body` for a unit, `Primitive(Cuboid)` for a building). The game draws the fallback until art-pass slice 3 loads models; `sim-cli data-check` fails when the file is not under the assets directory. |
+| `team_swatches`, `sites`, `rubble`, `seat_flag`, `terrain` | Optional art-pass tables (all empty or default here): texel rects per swatch key; 1..=4 construction stages (default the M3b rising box); the wreck of a destroyed building and how long it stays (`ds`); the flag on every Seat; props on `forest`, `mountain` and `water` tiles (never `grass`) with densities, jitter and weighted looks. Field reference: [../docs/DATA_FORMAT.md](../docs/DATA_FORMAT.md). |
 
 The game draws every look low-poly and flat-shaded. A changed look leaves
 `rules_hash` alone, so it needs no `rules_version` bump and no `just
@@ -56,11 +58,17 @@ Anything the simulation or a bot reads does not belong in this file; it
 goes in a hashed file under `rules/` or `ai/`.
 
 ```ron
-(units: {
-  "yeoman": Primitive(Capsule),
-  "skirmisher": Body(shape: Cone, height_tiles_x100: 150),
-  "outrider": Body(shape: Capsule, height_tiles_x100: 180, lying: true),
-})
+(
+  units: {
+    "yeoman": Primitive(Capsule),
+    "skirmisher": Body(shape: Cone, height_tiles_x100: 150),
+    "outrider": Body(shape: Capsule, height_tiles_x100: 180, lying: true),
+  },
+  buildings: {
+    "town": Primitive(Cuboid),
+    "croft": Scene(path: "models/kaykit_hexagon/buildings/blue/building_home_A_blue.gltf", scale_x100: 100, y_offset_tiles_x100: 1, yaw_deg: 0, fallback: Some(Primitive(Cuboid))),
+  },
+)
 ```
 
 ## Conventions
@@ -82,8 +90,11 @@ cargo run -p sim-cli -- data-check data
 cargo test -p rules
 ```
 
-`data-check` exits 0 and prints the `rules_hash` on success. On failure it
-exits 1 and prints the file path, the span and the field, for example:
+`data-check` exits 0 and prints the `rules_hash` on success (and, since the
+art pass, checks that every glTF file `visuals.ron` names is under
+`assets/`; `--assets <dir>` points it elsewhere, `--no-assets` skips it).
+On failure it exits 1 and prints the file path, the span and the field, for
+example:
 
 ```text
 error: data/rules/rules.ron: 8:3-8:18: Unexpected field named `tick_rate_hertz` in `Rules`, expected one of `rules_version`, `tick_rate_hz`, ... instead

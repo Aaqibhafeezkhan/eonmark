@@ -50,10 +50,18 @@ enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
-    /// Load and validate everything under a data directory.
+    /// Load and validate everything under a data directory, and check that
+    /// every glTF file `visuals.ron` names exists under the assets directory.
     DataCheck {
         /// Path to the data directory (overrides --data).
         dir: Option<PathBuf>,
+        /// Assets directory the `visuals.ron` Scene paths are relative to
+        /// (default: `<data>/../assets`).
+        #[arg(long, conflicts_with = "no_assets")]
+        assets: Option<PathBuf>,
+        /// Skip the check that every Scene file exists.
+        #[arg(long)]
+        no_assets: bool,
     },
     /// Print per-tick hashes: of a replay's re-simulation (with sub-hashes
     /// every --every ticks) when a replay path is given, otherwise of the
@@ -181,7 +189,15 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Selftest { ticks, seed } => selftest(&cli.data, ticks, seed),
-        Cmd::DataCheck { dir } => data_check(dir.as_deref().unwrap_or(&cli.data)),
+        Cmd::DataCheck {
+            dir,
+            assets,
+            no_assets,
+        } => {
+            let dir = dir.as_deref().unwrap_or(&cli.data);
+            let assets = (!no_assets).then(|| assets.unwrap_or_else(|| default_assets_dir(dir)));
+            data_check(dir, assets.as_deref())
+        }
         Cmd::HashDump {
             replay: None,
             ticks,
@@ -309,13 +325,39 @@ fn selftest(data: &Path, ticks: u32, seed: u64) -> ExitCode {
     }
 }
 
-fn data_check(dir: &Path) -> ExitCode {
-    // UI strings are presentation data outside `Rules` (and `rules_hash`),
-    // checked here so a broken string file fails CI like any rules file.
-    match Rules::load(dir).and_then(|r| Ok((r, rules::strings::Strings::load(dir, "en")?))) {
-        Ok((r, _strings)) => {
+/// The assets directory `data-check` looks in by default: `assets/` beside
+/// the data directory (`data/../assets` in a checkout or a bundle).
+fn default_assets_dir(data: &Path) -> PathBuf {
+    data.join("..").join("assets")
+}
+
+/// `sim-cli data-check`: load and validate `dir`, then, unless `assets` is
+/// `None` (`--no-assets`), check that every Scene file `visuals.ron` names
+/// is a file under `assets`. Prints the `OK` line and exits 0, or one
+/// `error:` line naming the file and field and exits 1.
+fn data_check(dir: &Path, assets: Option<&Path>) -> ExitCode {
+    // UI strings and `visuals.ron` are presentation data outside
+    // `rules_hash`, checked here so a broken file fails CI like any rules
+    // file; the assets check makes a missing model a data error too.
+    let loaded = Rules::load(dir)
+        .and_then(|r| Ok((r, rules::strings::Strings::load(dir, "en")?)))
+        .and_then(|(r, _strings)| {
+            let models = match assets {
+                Some(assets) => r.visuals.check_files(&dir.join("visuals.ron"), assets)?,
+                None => r
+                    .visuals
+                    .scene_paths()
+                    .into_iter()
+                    .map(|(_, path)| path)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            };
+            Ok((r, models))
+        });
+    match loaded {
+        Ok((r, models)) => {
             println!(
-                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} ages={} techs={} side_techs={} factions={} personalities={} build_orders={} maps={} strings=en",
+                "OK rules_version={} rules_hash=0x{:016x} resources={} units={} buildings={} ages={} techs={} side_techs={} factions={} personalities={} build_orders={} maps={} strings=en visuals=units:{} buildings:{} terrain:{} models={models}{}",
                 r.rules_version,
                 r.rules_hash(),
                 r.resources.resources.len(),
@@ -327,7 +369,15 @@ fn data_check(dir: &Path) -> ExitCode {
                 r.factions.len(),
                 r.ai.personalities.len(),
                 r.ai.build_orders.len(),
-                r.maps.keys().cloned().collect::<Vec<_>>().join(",")
+                r.maps.keys().cloned().collect::<Vec<_>>().join(","),
+                r.visuals.units.len(),
+                r.visuals.buildings.len(),
+                r.visuals.terrain.len(),
+                if assets.is_some() {
+                    ""
+                } else {
+                    " (files not checked: --no-assets)"
+                }
             );
             ExitCode::SUCCESS
         }

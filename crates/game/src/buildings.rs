@@ -1,16 +1,20 @@
 //! Presentation of buildings and construction sites (M3b): one entity per
 //! `BuildingId`, mirrored from the `SimView` after every tick like units.
-//! Until the art pass a building is a matte team-coloured box covering its
-//! footprint; a site is the same box in a lighter scaffold colour that
-//! rises with its construction progress. One shared unit-cube mesh is
-//! scaled per building, with one material per `(team, site)`, so every
-//! building is one of a handful of draw calls. Buildings carry `Pickable`
-//! so they can be clicked (rule 16: only units and buildings are pickable).
+//! A building is drawn as its kind's `data/visuals.ron` entry
+//! (`rules::Rules::building_visual`, art pass): `Primitive(Cuboid)` is the
+//! M3b look, a matte team-coloured box covering its footprint, and a
+//! `Scene` draws that same box (its only allowed fallback) until the art
+//! pass loads models (slice 3). A site is the box in a lighter scaffold
+//! colour that rises with its construction progress. One shared unit-cube
+//! mesh is scaled per building ([`BuildingVisuals::mesh`]), with one
+//! material per `(team, site)`, so every building is one of a handful of
+//! draw calls. Buildings carry `Pickable` so they can be clicked (rule 16:
+//! only units and buildings are pickable).
 
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use rules::Rules;
+use rules::{Primitive, Rules, Visual};
 use sim::{Building, BuildingId, Construction};
 
 use crate::ground::HALF_EXTENT;
@@ -48,6 +52,20 @@ pub struct BuildingVisuals {
 }
 
 impl BuildingVisuals {
+    /// The mesh a building of a kind whose visual is `visual` is drawn
+    /// with: the shared unit cube ([`BuildingVisuals::cube`]) for
+    /// `Primitive(Cuboid)`, for a `Scene` (until models load, its fallback
+    /// is the box) and for a kind with no visual.
+    pub fn mesh(&mut self, visual: Option<&Visual>, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
+        match visual {
+            None
+            | Some(Visual::Primitive(Primitive::Cuboid))
+            | Some(Visual::Scene { .. })
+            | Some(Visual::Primitive(_))
+            | Some(Visual::Body { .. }) => self.cube(meshes),
+        }
+    }
+
     /// The unit cube every building scales, its base on the ground.
     pub fn cube(&mut self, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
         self.cube
@@ -159,7 +177,7 @@ pub fn sync_buildings(
                 }
             }
             None => {
-                let cube = visuals.cube(&mut meshes);
+                let mesh = visuals.mesh(rules.building_visual(b.kind.0), &mut meshes);
                 let kind = rules
                     .building_kind(b.kind.0)
                     .map_or("Building", |k| &k.name);
@@ -167,7 +185,7 @@ pub fn sync_buildings(
                     .spawn((
                         Name::new(format!("{kind} {}", b.id.0)),
                         BuildingRef(b.id),
-                        Mesh3d(cube),
+                        Mesh3d(mesh),
                         MeshMaterial3d(material),
                         transform,
                         Pickable::default(),
@@ -244,6 +262,50 @@ mod tests {
         assert_eq!(at(0), full * SITE_MIN_FRACTION);
         assert!((at(total / 2) - full * 0.5).abs() < 1e-4);
         assert_eq!(at(total), full);
+    }
+
+    /// Art pass, slice 1: every kind's `visuals.ron` entry is read, and a
+    /// `Primitive(Cuboid)` or a `Scene` (until models load) keeps the M3b
+    /// box: the one shared unit cube, scaled to the footprint and height.
+    #[test]
+    fn cuboid_visual_keeps_the_m3b_box() {
+        use bevy::camera::primitives::MeshAabb;
+        let mut rules = rules();
+        for i in 0..rules.buildings.len() {
+            let kind = u16::try_from(i).unwrap();
+            assert!(rules.building_visual(kind).is_some(), "kind {kind}");
+        }
+        let mut meshes = Assets::<Mesh>::default();
+        let mut visuals = BuildingVisuals::default();
+        let cube = visuals.cube(&mut meshes);
+        let town = town(&rules);
+        assert_eq!(
+            rules.building_visual(town),
+            Some(&Visual::Primitive(Primitive::Cuboid))
+        );
+        assert_eq!(visuals.mesh(rules.building_visual(town), &mut meshes), cube);
+        let scene = Visual::Scene {
+            path: "models/castle.gltf".into(),
+            scale_x100: 100,
+            y_offset_tiles_x100: 0,
+            yaw_deg: 0,
+            nodes: Vec::new(),
+            parts: Vec::new(),
+            team: None,
+            fallback: Some(Box::new(Visual::Primitive(Primitive::Cuboid))),
+        };
+        rules.visuals.buildings.insert("town".into(), scene.clone());
+        assert_eq!(rules.building_visual(town), Some(&scene));
+        assert_eq!(visuals.mesh(rules.building_visual(town), &mut meshes), cube);
+        assert_eq!(visuals.mesh(None, &mut meshes), cube);
+        assert_eq!(meshes.len(), 1, "one shared cube");
+        // The cube stands on the ground, one metre a side, so the
+        // transform's scale is the drawn size.
+        let aabb = meshes.get(&cube).unwrap().compute_aabb().unwrap();
+        assert_eq!(aabb.min().y, 0.0);
+        assert_eq!(Vec3::from(aabb.half_extents) * 2.0, Vec3::ONE);
+        let t = building_transform(&rules, &building(town, Construction::Complete));
+        assert_eq!(t.scale, Vec3::new(3.0, building_height(3, 3), 3.0));
     }
 
     #[test]

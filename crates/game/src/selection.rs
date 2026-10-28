@@ -1,6 +1,6 @@
 //! Unit selection (M2 decision 5): click, shift-add, double-click same
-//! kind on screen, screen-space drag box, control groups, and the retained
-//! gizmo rings and move markers.
+//! kind on screen, screen-space drag box, control groups, the selection
+//! rings and the retained-gizmo move markers.
 //!
 //! Picking rules (fixed on day one, `docs/design/ui.md`): `MeshPickingPlugin`
 //! with `MeshPickingSettings { require_markers: true }`, `MeshPickingCamera`
@@ -11,6 +11,14 @@
 //! by `UnitId`, never children of unit entities, so unit transforms stay
 //! flat and a despawned unit never drags a child with it.
 //!
+//! Since the art pass (its plan's decision 11, rings and diamonds as shared
+//! meshes) a selection ring is one shared flat
+//! annulus mesh ([`ring_mesh`], [`RingMesh`]) with one unlit material and
+//! no shadow, so every ring on screen is one draw call: a retained gizmo is
+//! drawn on its own (`docs/IMPLEMENTER_NOTES.md`, "Retained gizmos cost one
+//! draw each"), which made 200 selected units 200 draws. The move and
+//! attack markers stay gizmos: a few at a time.
+//!
 //! Input paths: a `Pointer<Click>` observer handles clicks that land on a
 //! unit (the mesh backend decides what was hit); the drag box and the
 //! click-on-empty-ground deselect read raw `ButtonInput<MouseButton>` and
@@ -20,6 +28,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use bevy::gizmos::config::GizmoLineConfig;
+use bevy::light::NotShadowCaster;
 use bevy::picking::events::{Click, Pointer};
 use bevy::picking::hover::HoverMap;
 use bevy::picking::mesh_picking::{MeshPickingCamera, MeshPickingPlugin, MeshPickingSettings};
@@ -54,8 +63,13 @@ pub const MOVE_MARKER_SECS: f32 = 0.6;
 pub const RING_Y: f32 = 0.03;
 /// Segments per ring circle.
 pub const RING_RESOLUTION: u32 = 48;
-/// Ring and marker line width, pixels (thin and calm, `docs/ART_STYLE.md`).
+/// Marker gizmo line width, pixels (thin and calm, `docs/ART_STYLE.md`).
 pub const RING_LINE_WIDTH_PX: f32 = 1.5;
+/// Inner radius of the ring and diamond meshes as a share of the outer:
+/// the band is 0.15 of the radius, 0.07 to 0.10 m on the shipped kinds
+/// (a ring of 1.4 times a 0.35 to 0.5 m radius), as thin as the old
+/// 1.5 px line at 40 m.
+pub const RING_INNER_RATIO: f32 = 0.85;
 
 /// The selected units or building, and the nine control groups.
 /// Render-side state: the sim knows nothing about selection. Units and a
@@ -227,8 +241,8 @@ pub struct LastClick {
     pub previous: Option<(Entity, f32)>,
 }
 
-/// A retained-gizmo ring under a selected unit; one entity per selected
-/// `UnitId`, tracked in [`SelectionRings`].
+/// The flat ring under a selected unit; one entity per selected `UnitId`,
+/// tracked in [`SelectionRings`], drawn with the shared [`RingMesh`].
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionRing(pub UnitId);
 
@@ -243,12 +257,10 @@ pub struct MoveMarker {
     pub expires_at: f32,
 }
 
-/// The `GizmoAsset`s shared by every ring and marker (unit radius;
+/// The `GizmoAsset`s shared by every move and attack marker (unit radius;
 /// entities scale their `Transform`).
 #[derive(Resource, Debug, Clone)]
 pub struct RingAssets {
-    /// Unit-radius circle in `palette::SELECTION_RING`.
-    pub selection: Handle<GizmoAsset>,
     /// Unit-radius circle in `palette::MOVE_MARKER`.
     pub marker: Handle<GizmoAsset>,
     /// The attack marker (M4b): the move marker's circle with two lines
@@ -260,6 +272,40 @@ pub struct RingAssets {
 /// Half the length of each of the attack marker's two crossing lines, as a
 /// fraction of the circle's radius along each axis (the ends stay inside).
 pub const ATTACK_CROSS_HALF: f32 = 0.6;
+
+/// The one mesh and the one material every selection ring is drawn with
+/// (the art-pass plan's decision 11, rings and diamonds as shared meshes):
+/// a unit annulus ([`ring_mesh`]) and an unlit
+/// `palette::SELECTION_RING`, so all rings are one bin, one draw.
+#[derive(Resource, Debug, Clone)]
+pub struct RingMesh {
+    /// The unit annulus of [`RING_RESOLUTION`] segments.
+    pub mesh: Handle<Mesh>,
+    /// Unlit `palette::SELECTION_RING`.
+    pub material: Handle<StandardMaterial>,
+}
+
+/// A flat annulus of outer radius 1 and inner radius [`RING_INNER_RATIO`]
+/// on the ground plane (y = 0, facing up), of `segments` segments: 48 for
+/// the selection ring, 4 for the attrition diamond, whose corners then lie
+/// on the x and z axes. Entities scale it by their `Transform`.
+pub fn ring_mesh(segments: u32) -> Mesh {
+    Annulus::new(RING_INNER_RATIO, 1.0)
+        .mesh()
+        .resolution(segments)
+        .build()
+        .rotated_by(flat_on_ground())
+}
+
+/// A flat marker's material: `color`, unlit (no shading, steady at any
+/// light), so the marker reads the same everywhere.
+pub fn marker_material(color: Color) -> StandardMaterial {
+    StandardMaterial {
+        base_color: color,
+        unlit: true,
+        ..default()
+    }
+}
 
 /// Picking, selection input, rings and markers.
 pub struct SelectionPlugin;
@@ -320,21 +366,26 @@ fn mark_picking_camera(
     }
 }
 
-/// Builds the shared ring assets: unit circles laid flat
+/// Builds the shared ring assets: the selection ring's mesh and material
+/// ([`RingMesh`]), and the markers' unit circle laid flat
 /// (`present::flat_on_ground()`), [`RING_RESOLUTION`] segments, and the
 /// attack marker's circle with a flat X inside ([`attack_marker_asset`]).
-fn create_ring_assets(mut commands: Commands, mut gizmo_assets: ResMut<Assets<GizmoAsset>>) {
+pub fn create_ring_assets(
+    mut commands: Commands,
+    mut gizmo_assets: ResMut<Assets<GizmoAsset>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.insert_resource(RingMesh {
+        mesh: meshes.add(ring_mesh(RING_RESOLUTION)),
+        material: materials.add(marker_material(palette::SELECTION_RING)),
+    });
     let flat = Isometry3d::new(Vec3::ZERO, flat_on_ground());
-    let mut selection = GizmoAsset::new();
-    selection
-        .circle(flat, 1.0, palette::SELECTION_RING)
-        .resolution(RING_RESOLUTION);
     let mut marker = GizmoAsset::new();
     marker
         .circle(flat, 1.0, palette::MOVE_MARKER)
         .resolution(RING_RESOLUTION);
     commands.insert_resource(RingAssets {
-        selection: gizmo_assets.add(selection),
         marker: gizmo_assets.add(marker),
         attack: gizmo_assets.add(attack_marker_asset()),
     });
@@ -748,18 +799,20 @@ pub fn prune_dead(sim: NonSend<SimHandle>, mut selection: ResMut<Selection>) {
     selection.prune_building(|id| view.building(id).map(|b| b.owner));
 }
 
-/// One ring entity per selected unit: spawn `(SelectionRing(id), Gizmo {
-/// handle: assets.selection, .. }, Transform)` for newly selected ids,
-/// despawn rings whose id left the selection, and every frame place each
-/// ring at the unit entity's interpolated position (`Interp::sample` with
-/// the overstep fraction) at [`RING_Y`], scaled by the kind's radius times
-/// [`RING_RADIUS_PER_UNIT_RADIUS`]. Rings are never children of units.
+/// One ring entity per selected unit: spawn `(SelectionRing(id),
+/// Mesh3d(ring.mesh), MeshMaterial3d(ring.material), NotShadowCaster,
+/// Transform)` for newly selected ids, despawn rings whose id left the
+/// selection, and every frame place each ring at the unit entity's
+/// interpolated position (`Interp::sample` with the overstep fraction) at
+/// [`RING_Y`], scaled by the kind's radius times
+/// [`RING_RADIUS_PER_UNIT_RADIUS`]. Rings are never children of units and
+/// are not `Pickable`.
 #[allow(clippy::too_many_arguments)] // Bevy system: each parameter is one resource or query
 pub fn sync_selection_rings(
     mut commands: Commands,
     selection: Res<Selection>,
     mut rings: ResMut<SelectionRings>,
-    assets: Option<Res<RingAssets>>,
+    assets: Option<Res<RingMesh>>,
     entities: Res<UnitEntities>,
     interps: Query<&Interp>,
     mut ring_transforms: Query<&mut Transform, With<SelectionRing>>,
@@ -804,11 +857,9 @@ pub fn sync_selection_rings(
                     .spawn((
                         Name::new("Selection ring"),
                         SelectionRing(*id),
-                        Gizmo {
-                            handle: assets.selection.clone(),
-                            line_config: ring_line_config(),
-                            ..default()
-                        },
+                        Mesh3d(assets.mesh.clone()),
+                        MeshMaterial3d(assets.material.clone()),
+                        NotShadowCaster,
                         transform,
                     ))
                     .id();
@@ -818,7 +869,7 @@ pub fn sync_selection_rings(
     }
 }
 
-/// Thin lines for rings and markers.
+/// Thin lines for the markers.
 fn ring_line_config() -> GizmoLineConfig {
     GizmoLineConfig {
         width: RING_LINE_WIDTH_PX,
@@ -866,7 +917,8 @@ fn spawn_marker(
 
 /// `debug` log of the frame and wall-clock time at which the first
 /// selection ring and the first move marker appeared: the first draw of a
-/// new kind of entity is where a synchronous pipeline compile would show,
+/// new kind of entity (the ring's unlit material, the marker's gizmo
+/// pipeline) is where a synchronous pipeline compile would show,
 /// so a long frame in `frame_stats`' `worst_ms` line can be matched
 /// against these (`RUST_LOG=info,game=debug`).
 fn log_first_gizmo_spawns(
@@ -1347,7 +1399,6 @@ mod tests {
         use bevy::ecs::system::RunSystemOnce;
         let mut world = World::new();
         world.insert_resource(RingAssets {
-            selection: Handle::default(),
             marker: Handle::default(),
             attack: Handle::default(),
         });

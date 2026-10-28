@@ -1,0 +1,3 @@
+# The art pass names the KayKit packs in docs; ".." keeps clippy's default
+# list of valid identifiers.
+doc-valid-idents = ["KayKit", ".."]

@@ -2,7 +2,10 @@
 //! Bevy's FPS overlay, the egui world inspector (hidden until F12) and a
 //! small sim panel. Since M5b the panel has one line per bot seat,
 //! `bot P1 standard: <ai::describe>` (the build-order window, the Military
-//! latch, the wave, the next wave tick and the defend latch).
+//! latch, the wave, the next wave tick and the defend latch). Since the art
+//! pass it has the draw-call counter (`crate::draw_stats`, on in every dev
+//! build): `draw calls  <last> (max <max>) / 500  ind <a> dir <b> sorted
+//! <c>`, in amber from 500 draws on (steady, never flashing).
 
 use std::time::Duration;
 
@@ -14,7 +17,9 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 
 use crate::camera::RtsCamera;
+use crate::draw_stats::DrawStats;
 use crate::health_bars::{HealthBar, HealthBars};
+use crate::palette;
 use crate::present::UnitVisuals;
 use crate::selection::Selection;
 use crate::sim_driver::{
@@ -68,6 +73,7 @@ fn sim_panel(
     cameras: Query<&RtsCamera>,
     bars: Res<HealthBars>,
     bar_entities: Query<(), With<HealthBar>>,
+    draws: Option<Res<DrawStats>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("Sim")
@@ -169,6 +175,17 @@ fn sim_panel(
                 ui.label("meshes / materials");
                 ui.monospace(format!("{meshes} / {materials}"));
                 ui.end_row();
+                if let Some(draws) = &draws {
+                    let summary = draws.summary();
+                    let mut text = egui::RichText::new(summary.panel_text()).monospace();
+                    if summary.over_budget() {
+                        let [r, g, b, _] = palette::HUD_AMBER.to_srgba().to_u8_array();
+                        text = text.color(egui::Color32::from_rgb(r, g, b));
+                    }
+                    ui.label("draw calls");
+                    ui.label(text);
+                    ui.end_row();
+                }
                 // Bars are lazy: a target has one only while it is damaged
                 // or selected, and two quad entities (track and fill).
                 ui.label("bar targets / entities");

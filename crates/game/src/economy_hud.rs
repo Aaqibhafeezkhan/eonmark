@@ -75,6 +75,7 @@ pub const HUD_KEYS: &[(&str, &[&str])] = &[
     ("tooltip.requires", &["name"]),
     // Selection panel.
     ("info.units", &["name", "count"]),
+    ("info.more_kinds", &["count"]),
     ("info.hp", &["count", "cap"]),
     ("info.site", &["count"]),
     ("info.seat", &["count"]),

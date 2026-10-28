@@ -1,0 +1,33 @@
+// Character bakes of the art pass (docs/ROADMAP.md, "Art pass
+// (pre-stream)"), run by `just art-bake` (`inspect_gltf bake`, see
+// tools/inspect_gltf/src/bake.rs). Each row poses a rigged KayKit
+// Adventurers character from the download cache (`just fetch-assets`; its
+// sources.tsv rows have dest `-`) at one moment of a clip, keeps the named
+// nodes, and writes a static GLB under assets/ whose asset.extras record the
+// ATTRIBUTION.md Modifications text.
+//
+// Row fields:
+//   out          output path under assets/; its file stem is the kind
+//                (`just art-bake --only shieldbearer`)
+//   src          source file name in the cache (Knight.glb, Rogue.glb, ...)
+//   texture      optional: a texture file in the cache to embed instead of
+//                the source's own image
+//   keep         node-name globs (`*` matches any run); a node is kept when
+//                a glob matches its own name
+//   pose         (clip: "Idle", at_ms: 0); STEP and LINEAR keys, CUBICSPLINE
+//                fails
+//   max_texture  largest side; a larger texture is halved until it fits, only
+//                when every face keeps its colour
+//   yaw_deg      optional, default 90: turns glTF's +Z front to +X
+//
+// Measured in slice 2 (`inspect_gltf inspect`): every character is a 41-joint
+// rig at rest in a T-pose (arm-span ratio 1.09 on the Knight), its clips are
+// LINEAR (76 on the Knight, including "Idle"), and its texture is a 1024x1024
+// PNG embedded in the .glb. Body plus kept items are 4,005 to 5,325
+// triangles. The rows are written in slice 4, e.g.
+//   (out: "models/kaykit_adventurers/shieldbearer.glb", src: "Knight.glb",
+//    keep: ["Knight_*", "Rectangle_Shield", "1H_Sword"],
+//    pose: (clip: "Idle", at_ms: 0), max_texture: 256),
+(
+  models: [],
+)

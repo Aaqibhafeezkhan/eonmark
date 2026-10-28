@@ -579,8 +579,8 @@ cargo test -p sim
 ```
 
 `data-check` prints
-`OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en`
-(the repository is at 25, so before the edit it prints `rules_version=25`;
+`OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:0 models=0`
+(the visuals counts follow `../visuals.ron`; the repository is at 25, so before the edit it prints `rules_version=25`;
 the hash is new because a file changed).
 `just rerecord` runs `scripts/rerecord_fixtures.sh`: it re-records every
 fixture under `crates/sim/tests/fixtures/` in release, writes each `.hash`

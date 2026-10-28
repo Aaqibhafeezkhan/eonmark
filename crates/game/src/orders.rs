@@ -1008,7 +1008,6 @@ mod tests {
             .init_resource::<ButtonInput<KeyCode>>()
             .insert_resource(select(selected))
             .insert_resource(RingAssets {
-                selection: Handle::default(),
                 marker: Handle::default(),
                 attack: Handle::default(),
             })

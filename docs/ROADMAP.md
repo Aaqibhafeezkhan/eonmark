@@ -78,7 +78,7 @@ A public, contributor-ready github.com/tonianev/eonmark that builds with one com
 
 ### Acceptance
 
-- [ ] `cargo run -p game --features dev` opens a 1280x800 window titled 'Eonmark' showing a flat matte ground plane, grid gizmo and FPS counter; two-finger scroll pans, pinch and wheel zoom, WASD pans; closing via the red button exits with code 0 (`echo $?`). **[owner]** Automated proxy passed 2026-10-06: the window opens at 1280x800 logical (1280x832 with title bar, Retina 2x) titled exactly `Eonmark`, shows the matte ground plane, 8-tile grid gizmo and FPS overlay, and `--exit-after-seconds 6` exits 0; all five camera input paths (`MouseScrollUnit::Pixel` pan, `MouseScrollUnit::Line` zoom, `PinchGesture`, WASD/arrows, edge scroll) are implemented and registered in `crates/game/src/camera.rs`. Remaining for the owner at the keyboard: two-finger pan, pinch, wheel, WASD, then the red button and `echo $?`.
+- [ ] `cargo run -p game --features dev` opens a 1280x800 window titled 'Eonmark' showing a flat matte ground plane, grid gizmo and FPS counter; two-finger scroll pans, pinch and wheel zoom, WASD pans; closing via the red button exits with code 0 (`echo $?`). **[owner]** Automated proxy passed 2026-10-06: the window opens at 1280x800 logical (1280x832 with title bar, Retina 2x) titled exactly `Eonmark`, shows the matte ground plane, 8-tile grid gizmo and FPS overlay, and `--exit-after-seconds 6` exits 0; all five camera input paths (`MouseScrollUnit::Pixel` pan, `MouseScrollUnit::Line` zoom, `PinchGesture`, WASD/arrows, edge scroll) are implemented and registered in `crates/game/src/camera.rs`. Remaining for the owner at the keyboard: two-finger pan, pinch, wheel, WASD, then the red button and `echo $?`. Note 2026-10-28: since the art pass (owner decision 11 under "Art pass (pre-stream)", Notes) the 8-tile debug grid is off by default; press G in the window, or pass `--grid`, to see it.
 - [x] `cargo run -p sim-cli -- selftest` runs 1000 scripted ticks twice on two threads, prints two identical xxh3 hashes and exits 0.
 - [x] `cargo run -p sim-cli -- data-check data/` exits 0; adding an unknown field to `data/rules/rules.ron` makes it exit 1 printing the file path and field name (unit test in `crates/rules`).
 - [x] `cargo tree -p sim -e normal | grep -E 'bevy|glam|wgpu|winit'` prints nothing (same for rules, ai, sim-cli); `cargo clippy -p sim --all-targets -- -D warnings` (and `-p rules`, `-p ai`) fails when `let x: f32 = 1.0;` is added (demonstrated in a scratch branch, documented in CONTRIBUTING).
@@ -339,6 +339,46 @@ A minimal but complete scripted bot (fixed build order to Masonry Age, worker ba
 ### Good first issues
 
 - Write a second AI build order RON (boom variant) and compare with play-bots (any OS). Filed as #48.
+
+### Estimate
+
+3 sessions.
+
+## Art pass (pre-stream): CC0 models, dressed terrain, a minimap and the draw-call counter
+
+Not a numbered milestone: the owner's decision of 2026-10-21 (Order of work, above) pulls M7's look items forward so the first gameplay stream, a match against the Standard bot, looks like a finished small game. Fog, menus and audio stay in M7, and M7's lines are ticked here only where this section says so, with their own output, never reworded.
+
+### Goal
+
+Readable at 40 m, calm, matte and low-poly, with team colours obvious and a minimap; 60 fps on the dev Mac with 400 units and two full Towns at under 500 draw calls.
+
+### Deliverables
+
+- rules: the `visuals.ron` schema for buildings, construction sites, rubble, the Seat flag, terrain props and team-colour swatches, with every validator; `sim-cli data-check` checks every model file exists under `assets/`.
+- sim: the `art_bench` stress scenario (two full Towns, 400 units fighting).
+- game: the asset root, `--window-size`, the debug grid off by default (`--grid`, G), the draw-call counter (`--draw-stats`, the dev panel), selection rings and attrition diamonds as shared meshes, KayKit Medieval Hexagon buildings, sites, rubble, Seat flag and terrain props, KayKit Adventurers units, a minimap without fog, the Inter font, ranged and melee hit feedback.
+- tools: `tools/inspect_gltf`, `scripts/fetch_assets.sh` with sha256 pins, `scripts/draw_trace_xcheck.sh`, `scripts/art_checks.sh`, `scripts/art_drive.sh`.
+- assets: KayKit (CC0) and Inter (OFL) with their licence texts and per-file `ATTRIBUTION.md` rows.
+
+### Notes
+
+- Owner decisions, 2026-10-26: the owner took the plan's default on all eleven questions. (1) `visuals.ron` leaves `rules_hash` first ([ADR 0003](adr/0003-visuals-outside-rules-hash.md), `rules_version` 25), so no later edit of the file needs a bump or a re-record. (2) KayKit Medieval Hexagon and KayKit Adventurers plus Inter 4.1 from `raw.githubusercontent.com`; Kenney stays in M7; the Croft is a cottage. (3) All eight unit kinds as models with static poses and a walk bob, or all eight keep their M4b looks for the stream, never a mix. (4) Team colour repaints the KayKit swatches at run time from `palette.rs`. (5) The Hexagon palette atlas is vendored as shipped. (6) Script-modified CC0 art is allowed under AI_CONTRIBUTIONS.md. (7) The minimap sits bottom-left at 192 px, north up, no fog. (8) The art pass ticks M7's `check_assets` and `data-check` lines only, annotates the minimap and fps lines and leaves them open for fog. (9) fps is measured on the owner's Mac; draw calls are gated under 500 on lavapipe in CI. (10) This section. (11) The debug grid is off by default, and dense forests, construction stages, rubble, the Seat flag, the walk bob and hit feedback are in, cut first if time runs short.
+- Decision numbers: "owner decision N" above is the owner's answer N. The art-pass plan (not in the repository) numbers its own design decisions separately, and code and docs cite those as "art-pass plan decision N"; for example plan decision 11 makes selection rings and attrition diamonds shared meshes, while owner decision 11 is the grid and the extras.
+- AP9's base (2026-10-28): no art-pass commit bumps `rules_version`. "The slice 1 bump" of the plan is ADR 0003's 24 → 25 (PR #51, `main` at `15f1616`), which landed before slice 1, so `<slice-1>` is `15f1616`: its tree equals `ad41df9`, where the art-pass branch starts, and a two-dot `git diff` compares trees, so `git diff --stat 15f1616..HEAD -- crates/sim/tests/fixtures` covers the whole pass before and after a rebase. Taking the first slice-1 commit instead would leave that commit's own changes out.
+- Pending with the owner before slice 3 (2026-10-28): the team-area floors. The plan's floors (buildings 100‰, units 200‰) were not measured, and six of the eight chosen Hexagon buildings fall under 100‰ (castle 67‰, lumbermill 64‰, mine 5‰, barracks 84‰, tower 81‰, blacksmith 91‰; only the cottage 258‰ and the church 280‰ pass), as do the Mangonel's catapult nodes (about 25‰ against 200‰). KayKit's team rect is already every texel that differs between its blue and red variants, so it cannot be widened. Until the owner chooses (lower the floors to the measured values, take a different model where the pack has one, or one of the plan's risk-17 levers such as a team-coloured `base_disc`), slice 3 cannot map those kinds as team Scenes and still pass AP3. The table is in [ART_STYLE.md](ART_STYLE.md), "Budgets".
+
+### Acceptance
+
+- [ ] **AP1. Assets policy (M7 acceptance line 3, verbatim).** "`scripts/check_assets.sh` passes: every non-allowlisted file under `assets/` has an `ATTRIBUTION.md` row with CC0-1.0, CC-BY-4.0 or OFL-1.1, every OFL font has a sibling license text, no file > 2 MB, total < 300 MB; injecting an unattributed file fails the script and it prints the unmatched path." Proof: `scripts/check_assets.sh` prints `check_assets: ok (<n> files, <b> bytes)`. `scripts/check_assets.sh --self-test` copies only `assets/` into a temp root, injects `models/unattributed.glb`, requires exit 1 and the path on stderr, then exit 0 once the file is removed. The allowlist is unchanged.
+- [ ] **AP2. Data (M7 acceptance line 4, verbatim).** "`sim-cli data-check` fails if any unit or building kind lacks a `visuals.ron` entry; swapping one entry back to `Primitive(Capsule)` requires no Rust change (walkthrough in `docs/ART_STYLE.md`)." Proof: negative tests in `crates/sim-cli/tests/data_check.rs` and `crates/rules/src/visuals.rs`; the scripted walkthrough swaps `"yeoman"` to `Primitive(Capsule)`; data-check is OK, `cargo nextest run --workspace` is green, `git diff --stat` shows only `data/visuals.ron`, `just verify` is OK on every fixture, and `rules_hash` is unchanged (ADR 0003).
+- [ ] **AP3. Models.** Every unit and building kind is drawn from a CC0 glTF through visuals.ron, and `cargo run -p inspect_gltf --release -- check data assets` prints `ok` for every Scene. It stays unticked while any kind is on its fallback. Baking twice is byte-identical.
+- [ ] **AP4. Draw calls.** `--scenario art_bench --draw-stats` (400 units, two full Towns, all P0 units selected) prints `draws … max < 500` and `fight_max < 500` under lavapipe. This is gated in `art_checks.sh` and in CI's render smoke, and re-read on the Mac with its `mode=`. The trace cross-check agrees in both modes.
+- [ ] **AP5 [owner, Mac]. fps.** `cargo run --release -p game -- --scenario art_bench --window-size 1280x720 --draw-stats` on the Retina display prints `window … physical=2560x1440`. With the window focused and the camera untouched, it holds ≥ 60 fps in the `fight` line with p95 ≤ 16.7 ms (M4b decision 2's form), and a `--max-fps 1000` headroom run is reported with the `triangles` line.
+- [ ] **AP6. Minimap without fog.** The minimap mirrors borders within one frame, a left click or drag moves the camera, a right click orders the selected units, and the view trapezoid is drawn. Proof: the minimap tests; `minimap_check: ok` from `scripts/art_drive.sh` (real X input under Xvfb, local); `paint_us p95 ≤ 500`. The owner checks it by hand on the Mac.
+- [ ] **AP7. Counter.** The dev panel shows the last frame's draws and the run's maximum against 500. Proof: the `draw_stats` tests, `draw_trace_xcheck.sh` agreeing in both modes, and `docs/screenshots/art-dev-panel.png`.
+- [ ] **AP8 [owner]. Sign-off.** `docs/screenshots/art-units-40m.png`, `art-town-40m.png`, `art-battle-60m.png` and `art-match-minimap.png` (1280 x 720) are signed off against the `ART_STYLE.md` checklist ("palette, no glow, readable at 40 m, matte HUD") plus the P3 and sRGB check. Proxy: `scripts/art_checks.sh` produces them under lavapipe with `--screenshot-at` (the M3b, M4b and M5a precedent), and the agent ticks every checklist row in the PR before tagging the owner.
+- [ ] **AP9. No sim change.** After the slice 1 bump, `git diff --stat <slice-1>..HEAD -- crates/sim/tests/fixtures` is empty and `just verify` is OK at every slice. (Note 2026-10-28: `<slice-1>` is `15f1616`; see Notes.)
+- [ ] **AP10. Click.** Every unit kind of both teams is selectable by a real click: `click_check: ok 16/16` from `scripts/art_drive.sh` (local, xdotool).
 
 ### Estimate
 

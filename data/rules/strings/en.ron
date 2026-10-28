@@ -60,6 +60,7 @@
     "tooltip.place": "Place {building}: left click inside your borders, right click or Esc to cancel",
     "tooltip.cancel_site": "Cancel construction and refund what was paid",
     "info.units": "{name} x{count}",
+    "info.more_kinds": "+{count} more kinds",
     "info.site": "Under construction, {count}%",
     "info.seat": "Seat, tier {count}",
     "info.town": "Town, tier {count}",

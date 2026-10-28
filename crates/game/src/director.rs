@@ -10,6 +10,11 @@
 //! Presentation only: the director writes `RtsCamera` and `Selection` and
 //! never pushes a command, so the session's replay is the scenario's stream
 //! and verifies like any other (`walkthrough_beats_change_only_the_view`).
+//!
+//! The art pass gives `--scenario art_bench` a one-beat director
+//! ([`art_bench_beats`]): at [`ART_BENCH_SELECT_TICK`] it selects every unit
+//! of the local player, so the draw-call counter measures 200 selection
+//! rings in the fight.
 //! Every beat tick derives from the scenario's own rules-derived beats
 //! ([`sim::scenarios::enemy_outpost_beats`]) and pub constants, so a data
 //! change that moves the walkthrough moves the director with it.
@@ -25,7 +30,7 @@ use crate::camera::RtsCamera;
 use crate::cli::CameraStart;
 use crate::ground::HALF_EXTENT;
 use crate::selection::Selection;
-use crate::sim_driver::SimHandle;
+use crate::sim_driver::{LOCAL_PLAYER, SimHandle};
 
 /// The walkthrough's Scriptorium: P0 places it first, during the build
 /// beat, after P1's tick-0 Watchtower (`BuildingId(4)` today).
@@ -72,6 +77,8 @@ pub enum BeatAction {
     SelectBuilding(BuildingId),
     /// Select these units (their rings and bars show).
     SelectUnits(Vec<UnitId>),
+    /// Select every unit the local player has at that tick.
+    SelectAllLocal,
     /// Deselect everything.
     Clear,
 }
@@ -148,6 +155,21 @@ pub fn walkthrough_beats(rules: &Rules) -> Vec<Beat> {
     beats
 }
 
+/// Tick at which `art_bench`'s director selects P0's whole army: after the
+/// charge (tick 20, applied at 22), with both armies still whole.
+pub const ART_BENCH_SELECT_TICK: u32 = 40;
+
+/// `art_bench`'s one beat: select every P0 unit at
+/// [`ART_BENCH_SELECT_TICK`], so the 200 selection rings are part of the
+/// draw count (art pass, `docs/design/ui.md`).
+pub fn art_bench_beats() -> Vec<Beat> {
+    vec![Beat {
+        tick: ART_BENCH_SELECT_TICK,
+        name: "select_all",
+        actions: vec![BeatAction::SelectAllLocal],
+    }]
+}
+
 /// The beat table and how far it has run.
 #[derive(Resource, Debug, Clone, PartialEq)]
 pub struct Director {
@@ -176,7 +198,8 @@ impl Director {
 }
 
 /// Runs the director: added by `app::run` for
-/// `--scenario enemy_outpost_walkthrough` only.
+/// `--scenario enemy_outpost_walkthrough` ([`walkthrough_beats`]) and
+/// `--scenario art_bench` ([`art_bench_beats`]).
 pub struct DirectorPlugin {
     /// The beats to run; `app::run` passes [`walkthrough_beats`].
     pub beats: Vec<Beat>,
@@ -213,6 +236,14 @@ fn run_director(
                 }
                 BeatAction::SelectBuilding(id) => selection.set_building(*id),
                 BeatAction::SelectUnits(ids) => selection.set(ids.iter().copied()),
+                BeatAction::SelectAllLocal => {
+                    let view = sim.view();
+                    selection.set(
+                        view.units()
+                            .filter(|u| u.owner == LOCAL_PLAYER)
+                            .map(|u| u.id),
+                    );
+                }
                 BeatAction::Clear => selection.clear(),
             }
         }
@@ -284,6 +315,52 @@ mod tests {
             (SCRIPTORIUM, MUSTER_HALL, ENGINE_YARD),
             (BuildingId(4), BuildingId(5), BuildingId(6))
         );
+    }
+
+    /// `art_bench`: at tick 40 the director selects all 200 of P0's units
+    /// (none of P1's) and pushes no command; nothing is selected before.
+    #[test]
+    fn art_bench_director_selects_every_p0_unit_at_tick_40() {
+        let rules = rules();
+        let beats = art_bench_beats();
+        assert_eq!(beats.len(), 1);
+        assert_eq!(beats[0].tick, ART_BENCH_SELECT_TICK);
+        // The charge is under way by then, and both armies are whole.
+        assert!(ART_BENCH_SELECT_TICK > scenarios::ART_BENCH_CHARGE_TICK + rules.cmd_delay_ticks);
+        let (setup, stream, _) = scenarios::by_name("art_bench", &rules).unwrap();
+        let handle = SimHandle::from_setup(setup, rules);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .init_resource::<Selection>()
+            .add_plugins((
+                SimPlugin::new(handle, Box::new(ScenarioInput::new(stream))),
+                DirectorPlugin { beats },
+            ));
+        app.world_mut().spawn(RtsCamera::default());
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        let tick = |app: &App| app.world().non_send::<SimHandle>().tick();
+        while tick(&app) < ART_BENCH_SELECT_TICK {
+            assert!(app.world().resource::<Selection>().is_empty(), "too early");
+            app.update();
+        }
+        app.update();
+        let selection = app.world().resource::<Selection>();
+        assert_eq!(selection.units.len(), 200);
+        let sim = app.world().non_send::<SimHandle>();
+        let view = sim.view();
+        assert!(
+            selection
+                .units
+                .iter()
+                .all(|id| view.unit(*id).is_some_and(|u| u.owner == LOCAL_PLAYER))
+        );
+        assert!(app.world().resource::<PendingCommands>().is_empty());
     }
 
     #[test]

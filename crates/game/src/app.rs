@@ -16,11 +16,22 @@
 //! (`AppState::Menu`); `--scenario`, `--skip-menu` and `--spectate` start in
 //! `AppState::Skirmish`. `--spectate --fast-forward-to <tick>` simulates up
 //! to that tick in [`build_match`], before the window opens.
+//!
+//! Art pass: `AssetPlugin` reads models from [`Cli::resolve_assets_dir`]
+//! (the repository's `assets/` under `cargo run`, not Bevy's default
+//! `crates/game/assets`), `--window-size` sets the window,
+//! `--grid` starts with the debug grid on, and `--draw-stats` (or a `dev`
+//! build) adds the draw-call counter (`crate::draw_stats`) with the
+//! frame-time lines. `EONMARK_WGPU_DISABLE` turns wgpu features off for the
+//! counter's trace cross-check.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bevy::app::AppExit;
+use bevy::asset::AssetMetaCheck;
 use bevy::prelude::*;
+use bevy::render::RenderPlugin;
+use bevy::render::settings::WgpuSettings;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow, WindowCloseRequested, WindowResolution};
 use rules::Rules;
@@ -39,7 +50,7 @@ use crate::sim_driver::{
 };
 use crate::{background, camera, ground, palette};
 
-/// Default logical window size.
+/// Default logical window size (`--window-size` overrides it).
 pub const WINDOW_SIZE: (u32, u32) = (1280, 800);
 
 /// Load `data/` for `cli`, or print why it failed.
@@ -160,9 +171,11 @@ pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputS
 /// on screen between the HUD bars (ROADMAP M4b acceptance line 2 measures
 /// that fight; the player pans home, Period jumps to an idle Yeoman);
 /// `capture_seat` (M5a) opens at 40 m over the ring of P1's Seat, where
-/// the Mangonels, the Skirmishers' posts and the annexation timer are.
-/// Every other scenario, and a skirmish, starts over the local player's
-/// first units (`present::focus_camera_on_first_units`).
+/// the Mangonels, the Skirmishers' posts and the annexation timer are;
+/// `art_bench` (art pass) opens at 60 m over P0's Town and the fight east
+/// of it ([`ART_BENCH_FRAMING`]). Every other scenario, and a skirmish,
+/// starts over the local player's first units
+/// (`present::focus_camera_on_first_units`).
 pub fn default_framing(scenario: Option<&str>) -> Option<CameraStart> {
     match scenario? {
         "unit_looks" => Some(CameraStart {
@@ -180,14 +193,42 @@ pub fn default_framing(scenario: Option<&str>) -> Option<CameraStart> {
             y: 64.0,
             zoom: 40.0,
         }),
+        "art_bench" => Some(ART_BENCH_FRAMING),
         _ => None,
     }
 }
 
-/// `true` for the scenarios whose prologue is the M4b 200 vs 200 fight:
-/// they print the frame-time lines on exit.
-pub fn is_enemy_outpost(scenario: Option<&str>) -> bool {
-    scenario.is_some_and(|s| s.starts_with("enemy_outpost"))
+/// `art_bench`'s framing: P0's Town (24, 64) and the armies east of it
+/// (x 34-59) at the camera's longest zoom.
+pub const ART_BENCH_FRAMING: CameraStart = CameraStart {
+    x: 40.0,
+    y: 64.0,
+    zoom: 60.0,
+};
+
+/// `true` for the scenarios that measure a 200 vs 200 fight and print the
+/// frame-time lines with the fight window on exit: the `enemy_outpost` pair
+/// (M4b, whose prologue is that fight) and `art_bench` (art pass).
+pub fn prints_fight_lines(scenario: Option<&str>) -> bool {
+    scenario.is_some_and(|s| s.starts_with("enemy_outpost") || s == "art_bench")
+}
+
+/// The wgpu settings of the session: the defaults, with the features named
+/// by `EONMARK_WGPU_DISABLE` ([`crate::draw_stats::WGPU_DISABLE_ENV`])
+/// turned off when it is set. `None` keeps Bevy's own `RenderPlugin`.
+///
+/// # Errors
+///
+/// An unknown feature name.
+pub fn wgpu_settings(disable: Option<&str>) -> Result<Option<WgpuSettings>, String> {
+    let Some(value) = disable.filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let features = crate::draw_stats::parse_disabled_features(value)?;
+    Ok(Some(WgpuSettings {
+        disabled_features: Some(features),
+        ..default()
+    }))
 }
 
 /// `--exit-after-seconds`: wall-clock deadline for smoke tests.
@@ -264,9 +305,24 @@ pub fn run(cli: &Cli) -> AppExit {
         let (_, stream) = scenarios::units200_auto(&rules);
         (scenarios::EAST, spawn_total(&stream))
     });
-    // The walkthrough's director beats come from the rules too (M4b).
-    let director_beats = (cli.scenario.as_deref() == Some("enemy_outpost_walkthrough"))
-        .then(|| crate::director::walkthrough_beats(&rules));
+    // The walkthrough's director beats come from the rules too (M4b);
+    // `art_bench` selects every P0 unit once (art pass).
+    let director_beats = match cli.scenario.as_deref() {
+        Some("enemy_outpost_walkthrough") => Some(crate::director::walkthrough_beats(&rules)),
+        Some("art_bench") => Some(crate::director::art_bench_beats()),
+        _ => None,
+    };
+    let wgpu = match wgpu_settings(
+        std::env::var(crate::draw_stats::WGPU_DISABLE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(settings) => settings,
+        Err(message) => {
+            eprintln!("eonmark: {message}");
+            return AppExit::from_code(2);
+        }
+    };
     let strings = match rules::strings::Strings::load(cli.resolve_data_dir(), "en") {
         Ok(s) => s,
         Err(err) => {
@@ -290,24 +346,46 @@ pub fn run(cli: &Cli) -> AppExit {
     };
 
     let background = cli.background_mode();
+    let (width, height) = cli.window_size.unwrap_or(WINDOW_SIZE);
     let mut window = Window {
         // The title stays "Eonmark" (ROADMAP M0 acceptance); the seed,
         // tick and hash readout lives in the `dev` Sim panel.
         title: "Eonmark".into(),
         // Logical size: winit reads this as a LogicalSize at creation.
-        resolution: WindowResolution::new(WINDOW_SIZE.0, WINDOW_SIZE.1),
+        resolution: WindowResolution::new(width, height),
         present_mode,
         ..default()
     };
     if background {
         background::configure_window(&mut window);
     }
+    // Models load from the repository's (or the bundle's) assets/; shaders
+    // are embedded and need no asset root. No `.meta` files are vendored.
+    let assets = cli.resolve_assets_dir();
+    let assets = std::path::absolute(&assets).unwrap_or(assets);
 
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(window),
-        ..default()
-    }));
+    let plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(window),
+            ..default()
+        })
+        .set(AssetPlugin {
+            file_path: assets.to_string_lossy().into_owned(),
+            meta_check: AssetMetaCheck::Never,
+            ..default()
+        });
+    match wgpu {
+        Some(settings) => app.add_plugins(plugins.set(RenderPlugin {
+            render_creation: settings.into(),
+            ..default()
+        })),
+        None => app.add_plugins(plugins),
+    };
+    // Logged only now: `LogPlugin` (in `DefaultPlugins`) installs the
+    // tracing subscriber, and an event before it is dropped.
+    // `scripts/render_smoke.sh` requires this line.
+    info!("assets: {}", assets.display());
     // Display sleep or a screen lock must not end the session.
     app.add_plugins(MonitorLossPlugin);
     if background {
@@ -326,6 +404,8 @@ pub fn run(cli: &Cli) -> AppExit {
     {
         app.insert_resource(camera::StartFraming(start));
     }
+    // Art pass: the debug grid is off unless asked for (G toggles it).
+    app.insert_resource(ground::ShowGrid(cli.grid));
     app.add_plugins(
         SimPlugin::new(handle, input)
             .recording(Some(replay_path))
@@ -354,7 +434,8 @@ pub fn run(cli: &Cli) -> AppExit {
         crate::outcome::OutcomeOverlayPlugin,
     ));
 
-    // Presentation only: frames and selects the walkthrough's beats.
+    // Presentation only: frames and selects the walkthrough's beats, or
+    // selects `art_bench`'s army.
     if let Some(beats) = director_beats {
         app.add_plugins(crate::director::DirectorPlugin { beats });
     }
@@ -387,14 +468,17 @@ pub fn run(cli: &Cli) -> AppExit {
     // Frame-time lines on exit: the `units200_auto` owner proxy (with the
     // arrival count for its scripted move to EAST), the `enemy_outpost`
     // scenarios' 200 vs 200 prologue (M4b, with the fight window of
-    // acceptance line 2) and any `--max-fps` run, whose achieved rate they
-    // document.
-    let outpost = is_enemy_outpost(cli.scenario.as_deref());
-    if units200_auto || outpost || cli.max_fps.is_some() {
-        app.add_plugins(FrameStatsPlugin {
-            arrival,
-            fight: outpost,
-        });
+    // acceptance line 2) and `art_bench`'s fight (art pass), any
+    // `--max-fps` run, whose achieved rate they document, and any
+    // `--draw-stats` run.
+    let fight = prints_fight_lines(cli.scenario.as_deref());
+    let draw_stats = cli.draw_stats || cfg!(feature = "dev");
+    if units200_auto || fight || cli.max_fps.is_some() || draw_stats {
+        app.add_plugins(FrameStatsPlugin { arrival, fight });
+    }
+    // The draw-call counter (art pass): `--draw-stats` and every dev build.
+    if draw_stats {
+        app.add_plugins(crate::draw_stats::DrawStatsPlugin);
     }
 
     if let Some(secs) = cli.close_window_after_seconds {
@@ -609,12 +693,17 @@ mod tests {
             (framing.y - (min_y + max_y) / 2.0).abs() <= 1.0,
             "{min_y}..{max_y}"
         );
-        // Nothing else is framed by default but the enemy_outpost pair and
-        // capture_seat (`capture_seat_is_framed_on_the_seats_ring`).
+        // Nothing else is framed by default but the enemy_outpost pair,
+        // capture_seat (`capture_seat_is_framed_on_the_seats_ring`) and
+        // art_bench (`art_bench_is_framed_on_the_town_and_the_fight`).
         for name in scenarios::NAMES.iter().filter(|n| {
             !matches!(
                 **n,
-                "unit_looks" | "enemy_outpost" | "enemy_outpost_walkthrough" | "capture_seat"
+                "unit_looks"
+                    | "enemy_outpost"
+                    | "enemy_outpost_walkthrough"
+                    | "capture_seat"
+                    | "art_bench"
             )
         }) {
             assert_eq!(default_framing(Some(name)), None, "{name}");
@@ -691,8 +780,8 @@ mod tests {
             Some(framing)
         );
         assert!((ZOOM_MIN..=ZOOM_MAX).contains(&framing.zoom));
-        assert!(is_enemy_outpost(Some("enemy_outpost_walkthrough")));
-        assert!(!is_enemy_outpost(Some("unit_looks")) && !is_enemy_outpost(None));
+        assert!(prints_fight_lines(Some("enemy_outpost_walkthrough")));
+        assert!(!prints_fight_lines(Some("unit_looks")) && !prints_fight_lines(None));
         // Centred on the battle: within a tile of the middle of the groups.
         let centres: Vec<(i32, i32)> = scenarios::OUTPOST_BATTLE_P0_CENTRES
             .iter()
@@ -779,6 +868,108 @@ mod tests {
         for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
             on_screen(centre + Vec3::new(dx, 0.0, dz) * radius, "timer circle");
         }
+    }
+
+    /// The fight lines: the `enemy_outpost` pair and `art_bench`, nothing
+    /// else.
+    #[test]
+    fn prints_fight_lines_covers_art_bench() {
+        for name in scenarios::NAMES {
+            let want = matches!(
+                name,
+                "enemy_outpost" | "enemy_outpost_walkthrough" | "art_bench"
+            );
+            assert_eq!(prints_fight_lines(Some(name)), want, "{name}");
+        }
+        assert!(!prints_fight_lines(None));
+    }
+
+    /// `art_bench` opens at 60 m on P0's Town and the fight: at tick 40,
+    /// when the director selects the army, P0's Seat and every armed unit
+    /// of both armies project inside the window between the HUD bars.
+    #[test]
+    fn art_bench_is_framed_on_the_town_and_the_fight() {
+        use crate::camera::{ZOOM_MAX, ZOOM_MIN};
+        struct NoAi;
+        impl sim::AiController for NoAi {
+            fn think(
+                &mut self,
+                _: sim::PlayerId,
+                _: &sim::SimView<'_>,
+                _: &mut sim::AiMemory,
+            ) -> Vec<sim::Command> {
+                Vec::new()
+            }
+        }
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let framing = default_framing(Some("art_bench")).expect("framed");
+        assert_eq!(framing, ART_BENCH_FRAMING);
+        assert!((ZOOM_MIN..=ZOOM_MAX).contains(&framing.zoom));
+        assert!(CameraStart::parse("40,64,60").is_ok_and(|c| c == framing));
+        let (camera, transform, visible) = framed_camera(framing);
+        let (setup, stream, _) = scenarios::by_name("art_bench", &rules).unwrap();
+        let mut sim = sim::Sim::new(setup, rules.clone(), Box::new(NoAi));
+        let is_armed = |kind: u16| rules.unit_kind(kind).is_some_and(|k| k.attack.is_some());
+        // Every armed unit of both armies: the start units of armed kinds
+        // (none while the Yeoman is unarmed) and each side's
+        // `ART_BENCH_ARMY` rows of armed kinds, all read from the rules.
+        let start_armed = sim.view().units().filter(|u| is_armed(u.kind.0)).count();
+        let per_side: usize = scenarios::ART_BENCH_ARMY
+            .iter()
+            .filter(|(id, _)| {
+                rules
+                    .units
+                    .iter()
+                    .position(|k| k.id == *id)
+                    .and_then(|i| u16::try_from(i).ok())
+                    .is_some_and(is_armed)
+            })
+            .map(|&(_, n)| usize::from(n))
+            .sum();
+        assert!(per_side > 0, "art_bench fields armed units");
+        for t in 0..crate::director::ART_BENCH_SELECT_TICK {
+            sim.step(scenarios::commands_at(&stream, t));
+        }
+        let view = sim.view();
+        let on_screen = |p: Vec3, what: &str| {
+            let at = camera.world_to_viewport(&transform, p).expect("in front");
+            assert!(visible.contains(at), "{what}: {p} at {at} is off screen");
+        };
+        let seat = view.building(sim::BuildingId(1)).expect("P0's Seat");
+        on_screen(
+            crate::present::world_from_sim(view.map().center_of(seat.tile), 0.0),
+            "P0's Seat",
+        );
+        let mut armed = 0;
+        for u in view.units() {
+            if is_armed(u.kind.0) {
+                armed += 1;
+                on_screen(crate::present::world_from_sim(u.pos, 0.0), "armed unit");
+            }
+        }
+        assert_eq!(
+            armed,
+            start_armed + 2 * per_side,
+            "every armed unit of both armies"
+        );
+    }
+
+    /// `EONMARK_WGPU_DISABLE`: unset or empty keeps Bevy's settings, a
+    /// feature name disables it, a typo is an error.
+    #[test]
+    fn wgpu_disable_names_features() {
+        assert!(wgpu_settings(None).unwrap().is_none());
+        assert!(wgpu_settings(Some(" ")).unwrap().is_none());
+        let settings = wgpu_settings(Some("indirect_first_instance"))
+            .unwrap()
+            .expect("settings");
+        assert_eq!(
+            settings.disabled_features,
+            Some(bevy::render::settings::WgpuFeatures::INDIRECT_FIRST_INSTANCE)
+        );
+        assert!(wgpu_settings(Some("no_such_feature")).is_err());
     }
 
     fn launch(args: &[&str]) -> Cli {

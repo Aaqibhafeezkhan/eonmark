@@ -17,14 +17,17 @@ This document lists every third-party crate Eonmark uses, the version it is pinn
 | `objc2`, `objc2-app-kit` | 0.6.5, 0.3.2 | Background mode on macOS (`crates/game/src/background.rs`): `NSApplication::setActivationPolicy(Accessory)`, `NSWorkspace::frontmostApplication` and `NSRunningApplication::activateWithOptions` to hand focus back after winit activates the app | `game`, under `[target.'cfg(target_os = "macos")'.dependencies]`, since M2 | Requirements `0.6.5` / `0.3.2` in `[workspace.dependencies]` with `default-features = false`: the exact versions muda already pulls in, so `Cargo.lock` gained no package (the `cargo tree -d` set is unchanged; winit 0.30 keeps its own objc2 0.5.3 / objc2-app-kit 0.2.2 pair as before). Features `std`, `NSApplication`, `NSResponder`, `NSRunningApplication`, `NSWorkspace`. Every call used is a safe fn in objc2-app-kit 0.3.2 (checked in the registry source on 2026-10-07), so the workspace `unsafe_code = "deny"` and the crate's `forbid(unsafe_code)` stand. |
 | `directories` | 6.0.0 | `ProjectDirs::from("com", "tonianev", "Eonmark").data_dir().join("replays")` for the replay directory (`sim_driver::default_replay_dir`) | `game`, in use since M2 (replay recorder thread) | Requirement `6` in `[workspace.dependencies]`. `--replay-dir <path>` overrides it so CI and `scripts/m2_checks.sh` write to a temp dir; when the platform has no data directory the fallback is `./replays`. |
 | `fixed` | 1.31.0 | `I32F32` fixed-point numerics for positions, speeds, ranges | `sim` | `serde` feature. MSRV 1.93. Deliberately has no trig; the sim uses none. |
-| `serde` | 1.0.229 | Serialization of state, commands, rules | `sim`, `rules` | `derive` feature. |
+| `serde` | 1.0.229 | Serialization of state, commands, rules; `tools/inspect_gltf` reads `bake.ron` and writes glTF JSON with it | `sim`, `rules`, `inspect_gltf` | `derive` feature. |
 | `postcard` | 1.1.3 | Canonical binary encoding for replays, snapshots and the hash input | `sim`, `rules` | Stable wire format since 1.0. `alloc` feature. |
 | `xxhash-rust` | 0.8.19 | `xxh3_64` state hash, sub-hashes and `rules_hash` | `sim`, `rules` | `xxh3` feature. |
 | `rand_pcg` | 0.10.2 | The one `Pcg32` stored inside `Sim` and hashed | `sim` | `serde` feature. |
 | `rand_core` | 0.10.1 | `SeedableRng` for the Pcg32 | `sim` | A 0.9.x copy also appears transitively under dev-dependencies; it does not reach the sim's normal graph. |
-| `ron` | 0.12.2 | Parsing `data/**/*.ron` | `rules`; declared by `sim` for M1 map tables | Published 2026-06-22. `crates/sim/Cargo.toml` lists `ron`, `pathfinding` and `proptest` under `[package.metadata.cargo-machete] ignored` until M1 uses them. |
+| `ron` | 0.12.2 | Parsing `data/**/*.ron`, and `tools/assets/bake.ron` in `inspect_gltf` | `rules`, `inspect_gltf`; declared by `sim` for M1 map tables | Published 2026-06-22. `crates/sim/Cargo.toml` lists `ron`, `pathfinding` and `proptest` under `[package.metadata.cargo-machete] ignored` until M1 uses them. |
 | `thiserror` | 2.0.21 | `rules::Error` | `rules` | A 1.x copy appears transitively under Bevy; harmless. |
-| `clap` | 4.6.7 | `sim-cli` argument parsing | `sim-cli` | `derive` feature. |
+| `clap` | 4.6.7 | `sim-cli` and `inspect_gltf` argument parsing | `sim-cli`, `inspect_gltf` | `derive` feature. |
+| `gltf` (+ `gltf-json`, `gltf-derive`) | `=1.4.1` | `tools/inspect_gltf` (art pass): parse and validate glTF and GLB files, read accessors, skins and animations through the `utils` reader, and write the bake's GLB through the `gltf::json` serde re-export | `inspect_gltf`; Bevy's `bevy_gltf` pulls the same version for the game | Declared with `default-features = false` and `features = ["utils", "names", "extras"]`: the default `import` feature would pull `base64` 0.13 and `urlencoding`, which are not in `Cargo.lock`; the tool reads GLB blobs and relative `.bin` and image URIs itself, and `extras` lets the bake record its Modifications text in `asset.extras`. Pinned `=` to the version Bevy 0.19.1 resolves, so adding the tool added only the `inspect_gltf` package to `Cargo.lock`. |
+| `png` | 0.18.1 | `inspect_gltf`: decode base textures (any colour type, expanded to RGBA8) and encode the bake's embedded texture | `inspect_gltf`; Bevy's image stack pulls the same version | Requirement `0.18`. The tool uses no `image` crate and no `glam`: its 4x4, quaternion and normal-matrix maths are hand-written and unit-tested (`tools/inspect_gltf/src/math.rs`). |
+| `rules` (workspace) | path | `inspect_gltf check` loads `data/` with `rules::Rules::load` to read `visuals.ron`, unit radii and building footprints | `sim`, `ai`, `sim-cli`, `game`, `inspect_gltf` | Engine-free; CI's boundary loop covers `inspect_gltf` too. |
 
 ## Dev-dependencies
 
@@ -86,8 +89,8 @@ Never `docs.rs/bevy/latest` and never `bevyengine/bevy/tree/main`. Prefer a loca
 # Exactly one Bevy in the graph (two would mean an ecosystem crate pulled 0.20).
 test "$(cargo tree -i bevy_ecs --depth 0 | wc -l)" -eq 1
 
-# The engine never reaches the sim side.
-for c in sim rules ai sim-cli; do
+# The engine never reaches the sim side or the asset tool.
+for c in sim rules ai sim-cli inspect_gltf; do
   if cargo tree -p "$c" -e normal | grep -E 'bevy|glam|wgpu|winit'; then exit 1; fi
 done
 
