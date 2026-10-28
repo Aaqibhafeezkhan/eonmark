@@ -53,9 +53,10 @@ use bevy::window::{CursorIcon, PrimaryWindow, SystemCursorIcon};
 use rules::Rules;
 use sim::{BuildingId, BuildingKindId, Command, FxVec2, RejectReason, SimView, TargetId, UnitId};
 
-use crate::buildings::{BuildingRef, building_transform};
+use crate::buildings::{BuildingRef, building_top_y, footprint_centre};
 use crate::camera::RtsCamera;
 use crate::hud::{PointerOverUi, WorldInputSet};
+use crate::models::ModelLibrary;
 use crate::present::{UnitRef, sim_from_world, world_from_sim};
 use crate::selection::{RingAssets, Selection, spawn_attack_marker, spawn_move_marker};
 use crate::sim_driver::{LOCAL_PLAYER, PendingCommands, SimHandle};
@@ -388,17 +389,22 @@ pub fn context_order(
 }
 
 /// Where an attack marker for `target` goes: a unit's position on the
-/// ground, or the roof of a building's box over its footprint centre (a
-/// site's box at its current height). A building is an opaque box standing
-/// on the ground, so a marker at its ground centre would be drawn inside it
-/// and depth-tested away.
-pub fn target_point(view: &SimView<'_>, rules: &Rules, target: TargetId) -> Option<Vec3> {
+/// ground, or the top of a building over its footprint centre
+/// (`buildings::building_top_y`: its model's top, a site's current stage,
+/// or the M3b box's roof). A building is opaque and stands on the ground,
+/// so a marker at its ground centre would be drawn inside it and
+/// depth-tested away.
+pub fn target_point(
+    view: &SimView<'_>,
+    rules: &Rules,
+    models: Option<&ModelLibrary>,
+    target: TargetId,
+) -> Option<Vec3> {
     match target {
         TargetId::Unit(id) => view.unit(id).map(|u| world_from_sim(u.pos, 0.0)),
-        TargetId::Building(id) => view.building(id).map(|b| {
-            let t = building_transform(rules, b);
-            t.translation + Vec3::Y * t.scale.y
-        }),
+        TargetId::Building(id) => view
+            .building(id)
+            .map(|b| footprint_centre(rules, b) + Vec3::Y * building_top_y(rules, b, models)),
     }
 }
 
@@ -424,6 +430,7 @@ pub fn issue_pointer_orders(
     mut pending: ResMut<PendingCommands>,
     mut attacks: ResMut<IssuedAttacks>,
     ring_assets: Option<Res<RingAssets>>,
+    models: Option<Res<ModelLibrary>>,
     time: Res<Time>,
     mut commands: Commands,
 ) {
@@ -468,7 +475,8 @@ pub fn issue_pointer_orders(
                 match attacked {
                     Some(t) => {
                         attacks.record(seq, t);
-                        (seq, target_point(&view, rules, t).unwrap_or(hit), true)
+                        let at = target_point(&view, rules, models.as_deref(), t);
+                        (seq, at.unwrap_or(hit), true)
                     }
                     None => (seq, hit, false),
                 }
@@ -903,35 +911,94 @@ mod tests {
     }
 
     /// Where the attack marker goes: a unit's position on the ground, a
-    /// building's roof over its footprint centre. Buildings are opaque
-    /// boxes standing on the ground, so a marker at their ground centre
-    /// would be drawn inside the box and never seen.
+    /// building's top over its footprint centre (`building_top_y`). A
+    /// building is opaque and stands on the ground, so a marker at its
+    /// ground centre would be drawn inside it and never seen. Without
+    /// models the top is the M3b box's roof (a site's at its progress);
+    /// with a Town model ready it is that model's top, not the box's.
     #[test]
     fn attack_marker_points_sit_on_the_target() {
+        use crate::buildings::building_transform;
+        use crate::models::{Geometry, ModelKey, finish_geometry};
         let sim = arena();
         let (view, rules) = (sim.view(), sim.rules());
         let unit = view.unit(UnitId(13)).unwrap();
         assert_eq!(
-            target_point(&view, rules, TargetId::Unit(UnitId(13))),
+            target_point(&view, rules, None, TargetId::Unit(UnitId(13))),
             Some(world_from_sim(unit.pos, 0.0))
         );
         // P1's 1 x 1 Watchtower, P0's rising Scriptorium site, P1's Seat.
         for id in [5, 3, 2] {
             let b = view.building(BuildingId(id)).unwrap();
             let t = building_transform(rules, b);
-            let p = target_point(&view, rules, TargetId::Building(BuildingId(id))).unwrap();
+            let p = target_point(&view, rules, None, TargetId::Building(BuildingId(id))).unwrap();
             assert_eq!(
                 (p.x, p.z),
                 (t.translation.x, t.translation.z),
                 "over the footprint centre of {id}"
             );
-            assert!(
-                p.y >= t.translation.y + t.scale.y,
-                "on the roof of {id}: {p} vs {t:?}"
+            assert_eq!(
+                p.y,
+                t.translation.y + t.scale.y,
+                "on the roof of {id}'s box: {p} vs {t:?}"
             );
         }
+        // A Town drawn as a 4.25 m model: the marker sits on its top,
+        // well above the box's roof.
+        let mut with_model = rules.clone();
+        let castle = rules::Visual::Scene {
+            path: "m/castle.gltf".into(),
+            scale_x100: 100,
+            y_offset_tiles_x100: 0,
+            yaw_deg: 0,
+            x_offset_tiles_x100: 0,
+            z_offset_tiles_x100: 0,
+            nodes: vec![],
+            parts: vec![],
+            team: None,
+            fallback: None,
+            banner_at: None,
+            seat_flag_at: None,
+        };
+        with_model
+            .visuals
+            .buildings
+            .insert("town".into(), castle.clone());
+        let mut meshes = Assets::<Mesh>::default();
+        let model = finish_geometry(
+            Geometry {
+                positions: vec![[-1.0, 0.0, -1.0], [1.0, 4.25, 1.0], [0.0, 0.0, 1.0]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                uvs: vec![[0.0, 0.0]; 3],
+                indices: vec![0, 1, 2],
+                textures: vec![],
+                base_color: None,
+            },
+            1,
+            &mut meshes,
+        );
+        let mut lib = ModelLibrary::default();
+        lib.insert_ready(ModelKey::of(&castle).unwrap(), model, Handle::default());
+        let seat = view.building(BuildingId(2)).unwrap();
+        let box_roof = building_transform(rules, seat).scale.y;
+        let p = target_point(
+            &view,
+            &with_model,
+            Some(&lib),
+            TargetId::Building(BuildingId(2)),
+        )
+        .unwrap();
+        assert_eq!(p.y, 4.25, "the model's top");
+        assert!(p.y > box_roof + 1.0, "not the box's roof {box_roof}");
         assert_eq!(
-            target_point(&view, rules, TargetId::Building(BuildingId(99))),
+            (p.x, p.z),
+            (
+                building_transform(rules, seat).translation.x,
+                building_transform(rules, seat).translation.z
+            )
+        );
+        assert_eq!(
+            target_point(&view, rules, None, TargetId::Building(BuildingId(99))),
             None
         );
     }
@@ -1119,7 +1186,7 @@ mod tests {
                 Some(target),
                 "remembered under its seq"
             );
-            let at = target_point(&view, rules, target).unwrap();
+            let at = target_point(&view, rules, None, target).unwrap();
             assert_eq!(
                 markers(&mut app),
                 [("Attack marker".to_string(), at + Vec3::Y * RING_Y)],

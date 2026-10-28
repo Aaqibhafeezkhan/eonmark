@@ -18,10 +18,14 @@
 //! `assets/`; the art pass (`docs/ROADMAP.md`, "Art pass (pre-stream)")
 //! gives it `nodes`, `parts`, a `team` swatch and a `fallback`, and adds
 //! the `buildings`, `sites`, `rubble`, `seat_flag`, `terrain` and
-//! `team_swatches` tables. Until its models load (art slice 3) the game
-//! draws a Scene's fallback. Every number is an integer: fields ending in
-//! `_x100` are hundredths, `_permille` thousandths, `_pct` percent, `_ds`
-//! deciseconds and `yaw_deg` whole degrees, following `docs/DATA_FORMAT.md`.
+//! `team_swatches` tables; art slice 3 adds the Scene's x/z offsets, the
+//! team `banner` (owner decision 12 of the art pass) and the [`Mount`]s
+//! that place it and the Seat flag. The game draws building, site, rubble,
+//! flag and prop Scenes as merged models since slice 3 (units from slice
+//! 4), a Scene's fallback while its model is missing. Every number is an
+//! integer: fields ending in `_x100` are hundredths, `_permille`
+//! thousandths, `_pct` percent, `_ds` deciseconds and `yaw_deg` whole
+//! degrees, following `docs/DATA_FORMAT.md`.
 
 use crate::{BuildingKind, Error, UnitKind};
 use serde::{Deserialize, Serialize};
@@ -78,7 +82,9 @@ pub enum Visual {
     /// A glTF model under the assets directory, merged into one mesh at
     /// load (art pass). Rest facing: a unit faces +X after `yaw_deg`;
     /// buildings, sites and rubble put their front toward +Z (toward the
-    /// camera); props have no facing.
+    /// camera); props have no facing. The model is turned by `yaw_deg`,
+    /// scaled by `scale_x100`, then moved by the three offsets (world
+    /// axes), and the result is baked into the merged mesh.
     Scene {
         /// Path relative to the assets directory, ending in `.glb` or
         /// `.gltf`, with no `..` and no leading `/` or `\`
@@ -86,11 +92,21 @@ pub enum Visual {
         path: String,
         /// Uniform scale in hundredths (`100` is 1.0), 1..=[`MAX_SCALE_X100`].
         scale_x100: u32,
-        /// Vertical offset in tiles, hundredths (`-5` sinks the model 5 cm).
+        /// Vertical offset in tiles, hundredths (`-5` sinks the model 5 cm),
+        /// within ±[`MAX_OFFSET_X100`].
         y_offset_tiles_x100: i32,
         /// Extra yaw applied to the model for its rest facing, degrees,
         /// within -360..=360.
         yaw_deg: i32,
+        /// Offset along +X in tiles, hundredths, within ±[`MAX_OFFSET_X100`]
+        /// (art slice 3): centres a model whose file is off-centre, after
+        /// the yaw and the scale. Defaults to 0.
+        #[serde(default)]
+        x_offset_tiles_x100: i32,
+        /// Offset along +Z (toward the camera) in tiles, hundredths, as
+        /// `x_offset_tiles_x100`. Defaults to 0.
+        #[serde(default)]
+        z_offset_tiles_x100: i32,
         /// Node-name globs (`*` matches any run of characters) of the nodes
         /// to keep; empty keeps every node. At most [`MAX_NODE_GLOBS`],
         /// none empty.
@@ -112,7 +128,43 @@ pub enum Visual {
         /// skipped when their model fails.
         #[serde(default)]
         fallback: Option<Box<Visual>>,
+        /// Where this building's or unit's team banner ([`Visuals::banner`])
+        /// stands (owner decision 12 of the art pass: team buildings and
+        /// the Mangonel), and only with a `banner` model. `None` draws no
+        /// banner.
+        #[serde(default)]
+        banner_at: Option<Mount>,
+        /// Where the Seat flag ([`Visuals::seat_flag`]) stands on a Seat:
+        /// Town kinds only, and only with a `seat_flag` model. `None` puts
+        /// the flag on the ground at the footprint's north-east corner.
+        #[serde(default)]
+        seat_flag_at: Option<Mount>,
     },
+}
+
+/// Where a team banner or the Seat flag stands on a building (art slice
+/// 3): placed from the footprint's centre on the ground, after the
+/// building's own model placement, in world axes (+Z toward the camera).
+/// On a unit (art slice 4, the Mangonel's banner) the offset is from the
+/// unit's position on the ground in the unit's own axes (+X its facing),
+/// so the banner turns and moves with it. The banner or flag model is
+/// turned by `yaw_deg` and scaled by `scale_x100` there; its own Scene
+/// placement (centring offsets, yaw) applies first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// `(x, y, z)` in hundredths of a tile from the footprint centre (a
+    /// unit's position) on the ground: `x` and `z` within
+    /// ±[`MAX_MOUNT_REACH_X100`], `y` in 0..=[`MAX_MOUNT_HEIGHT_X100`].
+    pub offset_x100: (i32, i32, i32),
+    /// Uniform scale of the banner or flag model, hundredths,
+    /// 1..=[`MAX_SCALE_X100`]; defaults to 100.
+    #[serde(default = "default_scale_x100")]
+    pub scale_x100: u32,
+    /// Yaw about the vertical axis, degrees, within -360..=360; defaults
+    /// to 0.
+    #[serde(default)]
+    pub yaw_deg: i32,
 }
 
 /// One more glTF file composited into a [`Visual::Scene`]'s mesh, placed
@@ -232,13 +284,29 @@ pub struct Visuals {
     /// The wreck of a destroyed building; `None` leaves nothing.
     #[serde(default)]
     pub rubble: Option<Rubble>,
-    /// The flag on every Seat (a Scene); `None` draws none.
+    /// The flag on every Seat (a Scene), standing where the Town's
+    /// `seat_flag_at` says; `None` draws none.
     #[serde(default)]
     pub seat_flag: Option<Visual>,
+    /// The team banner every complete building and every unit with a
+    /// `banner_at` carries (owner decision 12 of the art pass): a Scene
+    /// with a `team` swatch and no fallback, drawn as one shared mesh with
+    /// one material per team. `None` draws none, and then no building or
+    /// unit may name a `banner_at`.
+    #[serde(default)]
+    pub banner: Option<Visual>,
     /// Props per impassable terrain, keyed `forest`, `mountain` or
     /// `water` ([`DECOR_TERRAINS`]); a terrain without an entry is bare.
     #[serde(default)]
     pub terrain: BTreeMap<String, TerrainDecor>,
+    /// How far every neutral model (a Scene with no `team`: terrain props,
+    /// construction sites, rubble) is desaturated toward grey, permille,
+    /// 0..=1000 (default 0, the texture as shipped). The same lever as a
+    /// swatch's `desaturate_permille` for the texels outside its team
+    /// rects, so a prop's colour never outshouts the team colours
+    /// (`docs/ART_STYLE.md`, palette).
+    #[serde(default)]
+    pub neutral_desaturate_permille: u32,
 }
 
 fn default_sites() -> Vec<Visual> {
@@ -254,7 +322,9 @@ impl Default for Visuals {
             sites: default_sites(),
             rubble: None,
             seat_flag: None,
+            banner: None,
             terrain: BTreeMap::new(),
+            neutral_desaturate_permille: 0,
         }
     }
 }
@@ -268,6 +338,19 @@ pub const MIN_BODY_HEIGHT_X100: u32 = 20;
 /// Upper bound on a [`Visual::Body`]'s `height_tiles_x100` (4 m, a unit
 /// four tiles tall or long is a data error).
 pub const MAX_BODY_HEIGHT_X100: u32 = 400;
+
+/// Largest Scene offset on any axis, hundredths of a tile (5 m; the
+/// furthest a pack's model sits from its origin is the catapult's 1.40 m).
+pub const MAX_OFFSET_X100: i32 = 500;
+
+/// Largest horizontal reach of a [`Mount`] from the footprint centre,
+/// hundredths of a tile: the corner of a 3x3 footprint (1.5 m) plus half
+/// a large banner (its mount point is the banner's centre, its pole stands
+/// to one side).
+pub const MAX_MOUNT_REACH_X100: i32 = 300;
+
+/// Highest [`Mount`], hundredths of a tile (8 m, above any building).
+pub const MAX_MOUNT_HEIGHT_X100: i32 = 800;
 
 /// Most `parts` a Scene composites.
 pub const MAX_PARTS: usize = 8;
@@ -336,14 +419,51 @@ pub fn check_asset_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the node name `name` matches the glob `pattern` of a Scene's
+/// `nodes` (or `bake.ron`'s `keep`): `*` matches any run of characters
+/// (including none), every other character matches itself, and the whole
+/// name must match. The game's model merge (`crates/game/src/models.rs`)
+/// and `tools/inspect_gltf` share this one definition.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    // Where the last `*` was and the name position it was tried against.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Whether a node called `name` is kept by `globs` ([`glob_match`]; an
+/// empty list keeps every node). A glob matches a node's own name only:
+/// keeping a node keeps its mesh, not its children.
+pub fn keeps_node(globs: &[String], name: &str) -> bool {
+    globs.is_empty() || globs.iter().any(|g| glob_match(g, name))
+}
+
 /// Who a Scene is drawn for, which decides its `team` and `fallback`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SceneUse {
     /// A unit: any team; the fallback is a Primitive or a Body.
     Unit,
     /// A building or a site: the fallback is absent or `Primitive(Cuboid)`.
-    /// `neutral` (a site) takes no team.
-    Footprint { neutral: bool },
+    /// `neutral` (a site) takes no team and no mounts; `town` (a Town
+    /// kind) may name a `seat_flag_at`.
+    Footprint { neutral: bool, town: bool },
     /// A prop, the rubble or the Seat flag: no fallback; `neutral` (props,
     /// rubble) takes no team.
     Decor { neutral: bool },
@@ -403,7 +523,8 @@ impl Visuals {
                     "no building kind with this id in buildings.ron",
                 ));
             }
-            self.check_footprint_look(path, &field, visual, false)?;
+            let town = buildings.iter().any(|k| &k.id == id && k.town);
+            self.check_footprint_look(path, &field, visual, false, town)?;
         }
         if self.sites.is_empty() || self.sites.len() > MAX_SITE_STAGES {
             return Err(Error::invalid(
@@ -413,7 +534,7 @@ impl Visuals {
             ));
         }
         for (i, visual) in self.sites.iter().enumerate() {
-            self.check_footprint_look(path, &format!("sites[{i}]"), visual, true)?;
+            self.check_footprint_look(path, &format!("sites[{i}]"), visual, true, false)?;
         }
         if let Some(rubble) = &self.rubble {
             if !(1..=MAX_RUBBLE_DS).contains(&rubble.ds) {
@@ -428,8 +549,25 @@ impl Visuals {
         if let Some(flag) = &self.seat_flag {
             self.check_decor_scene(path, "seat_flag", flag, false)?;
         }
+        if let Some(banner) = &self.banner {
+            self.check_decor_scene(path, "banner", banner, false)?;
+            if let Visual::Scene { team: None, .. } = banner {
+                return Err(Error::invalid(
+                    path,
+                    "banner.team",
+                    "the team banner needs a team swatch: Some(\"<team_swatches key>\")",
+                ));
+            }
+        }
         for (key, decor) in &self.terrain {
             self.check_terrain(path, key, decor)?;
+        }
+        if self.neutral_desaturate_permille > 1000 {
+            return Err(Error::invalid(
+                path,
+                "neutral_desaturate_permille",
+                "must be at most 1000",
+            ));
         }
         for (key, swatch) in &self.team_swatches {
             check_swatch(path, key, swatch)?;
@@ -473,18 +611,26 @@ impl Visuals {
 
     /// A building's or a site's look: `Primitive(Cuboid)` or a `Scene`
     /// (neutral for a site) whose fallback is absent or `Primitive(Cuboid)`.
+    /// `town` is a Town kind, which may name a `seat_flag_at`.
     fn check_footprint_look(
         &self,
         path: &Path,
         field: &str,
         visual: &Visual,
         site: bool,
+        town: bool,
     ) -> Result<(), Error> {
         match visual {
             Visual::Primitive(Primitive::Cuboid) => Ok(()),
-            Visual::Scene { .. } => {
-                self.check_scene(path, field, visual, SceneUse::Footprint { neutral: site })
-            }
+            Visual::Scene { .. } => self.check_scene(
+                path,
+                field,
+                visual,
+                SceneUse::Footprint {
+                    neutral: site,
+                    town,
+                },
+            ),
             _ => Err(Error::invalid(
                 path,
                 field,
@@ -523,12 +669,16 @@ impl Visuals {
         let Visual::Scene {
             path: scene,
             scale_x100,
+            y_offset_tiles_x100,
             yaw_deg,
+            x_offset_tiles_x100,
+            z_offset_tiles_x100,
             nodes,
             parts,
             team,
             fallback,
-            ..
+            banner_at,
+            seat_flag_at,
         } = visual
         else {
             return Ok(());
@@ -536,6 +686,62 @@ impl Visuals {
         check_asset_path(scene).map_err(|m| Error::invalid(path, &sub(field, "path"), m))?;
         check_scale(path, &sub(field, "scale_x100"), *scale_x100)?;
         check_yaw(path, &sub(field, "yaw_deg"), *yaw_deg)?;
+        for (name, offset) in [
+            ("x_offset_tiles_x100", *x_offset_tiles_x100),
+            ("y_offset_tiles_x100", *y_offset_tiles_x100),
+            ("z_offset_tiles_x100", *z_offset_tiles_x100),
+        ] {
+            if !(-MAX_OFFSET_X100..=MAX_OFFSET_X100).contains(&offset) {
+                return Err(Error::invalid(
+                    path,
+                    &sub(field, name),
+                    format!("must be within -{MAX_OFFSET_X100}..={MAX_OFFSET_X100}"),
+                ));
+            }
+        }
+        // Owner decision 12 of the art pass: team buildings and units (the
+        // Mangonel, art slice 4) carry the banner; sites, rubble, props and
+        // flags are neutral or are banners themselves.
+        let carrier = matches!(
+            usage,
+            SceneUse::Footprint { neutral: false, .. } | SceneUse::Unit
+        );
+        if let Some(mount) = banner_at {
+            let field = sub(field, "banner_at");
+            if !carrier {
+                return Err(Error::invalid(
+                    path,
+                    &field,
+                    "only a building or a unit carries a team banner",
+                ));
+            }
+            if self.banner.is_none() {
+                return Err(Error::invalid(
+                    path,
+                    &field,
+                    "names where the banner stands, but there is no banner model (set banner: Some(Scene(...)))",
+                ));
+            }
+            check_mount(path, &field, mount)?;
+        }
+        if let Some(mount) = seat_flag_at {
+            let field = sub(field, "seat_flag_at");
+            if !matches!(usage, SceneUse::Footprint { town: true, .. }) {
+                return Err(Error::invalid(
+                    path,
+                    &field,
+                    "only a Town kind carries the Seat flag",
+                ));
+            }
+            if self.seat_flag.is_none() {
+                return Err(Error::invalid(
+                    path,
+                    &field,
+                    "names where the Seat flag stands, but there is no seat_flag model",
+                ));
+            }
+            check_mount(path, &field, mount)?;
+        }
         check_nodes(path, &sub(field, "nodes"), nodes)?;
         if parts.len() > MAX_PARTS {
             return Err(Error::invalid(
@@ -555,7 +761,7 @@ impl Visuals {
         if let Some(key) = team {
             let neutral = matches!(
                 usage,
-                SceneUse::Footprint { neutral: true } | SceneUse::Decor { neutral: true }
+                SceneUse::Footprint { neutral: true, .. } | SceneUse::Decor { neutral: true }
             );
             if neutral {
                 return Err(Error::invalid(
@@ -699,7 +905,8 @@ impl Visuals {
 
     /// Every Scene path in the file with the field that names it
     /// (`buildings["town"].path`, `units["supply_wain"].parts[0].path`), in
-    /// file order: units, buildings, sites, rubble, Seat flag, terrain.
+    /// file order: units, buildings, sites, rubble, Seat flag, banner,
+    /// terrain.
     /// `sim-cli data-check` checks that each exists under the assets
     /// directory ([`Visuals::check_files`]).
     pub fn scene_paths(&self) -> Vec<(String, &str)> {
@@ -718,6 +925,9 @@ impl Visuals {
         }
         if let Some(flag) = &self.seat_flag {
             push_scene_paths(&mut out, "seat_flag", flag);
+        }
+        if let Some(banner) = &self.banner {
+            push_scene_paths(&mut out, "banner", banner);
         }
         for (key, decor) in &self.terrain {
             for (i, look) in decor.looks.iter().enumerate() {
@@ -880,6 +1090,24 @@ fn check_yaw(path: &Path, field: &str, yaw_deg: i32) -> Result<(), Error> {
         return Err(Error::invalid(path, field, "must be within -360..=360"));
     }
     Ok(())
+}
+
+/// A [`Mount`]: `x` and `z` within ±[`MAX_MOUNT_REACH_X100`], `y` in
+/// 0..=[`MAX_MOUNT_HEIGHT_X100`], the scale and the yaw in range.
+fn check_mount(path: &Path, field: &str, mount: &Mount) -> Result<(), Error> {
+    let (x, y, z) = mount.offset_x100;
+    let reach = -MAX_MOUNT_REACH_X100..=MAX_MOUNT_REACH_X100;
+    if !reach.contains(&x) || !reach.contains(&z) || !(0..=MAX_MOUNT_HEIGHT_X100).contains(&y) {
+        return Err(Error::invalid(
+            path,
+            &sub(field, "offset_x100"),
+            format!(
+                "({x}, {y}, {z}): x and z must be within -{MAX_MOUNT_REACH_X100}..={MAX_MOUNT_REACH_X100} of the footprint centre and y within 0..={MAX_MOUNT_HEIGHT_X100}"
+            ),
+        ));
+    }
+    check_scale(path, &sub(field, "scale_x100"), mount.scale_x100)?;
+    check_yaw(path, &sub(field, "yaw_deg"), mount.yaw_deg)
 }
 
 fn check_nodes(path: &Path, field: &str, nodes: &[String]) -> Result<(), Error> {
@@ -1568,6 +1796,13 @@ mod tests {
         ] {
             rejects(&file(YEOMAN, CUBOID, &swatch(rects, desaturate)), field);
         }
+        // The neutral models' desaturation is a permille too.
+        let neutral = |permille: u32| format!("{SWATCH}, neutral_desaturate_permille: {permille}");
+        check(&file(YEOMAN, CUBOID, &neutral(1000))).unwrap();
+        rejects(
+            &file(YEOMAN, CUBOID, &neutral(1001)),
+            "neutral_desaturate_permille",
+        );
         // Sites, rubble and props are neutral; a building or the flag may
         // take a team.
         let scene_team = r#"Scene(path: "m/s.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("hex"))"#;
@@ -1898,5 +2133,306 @@ mod tests {
         std::fs::create_dir_all(assets.join("m/castle.gltf")).unwrap();
         assert!(v.check_files(Path::new("v.ron"), &assets).is_err());
         let _ = std::fs::remove_dir_all(&assets);
+    }
+
+    /// Art slice 3: the x/z offsets centre an off-centre model and every
+    /// offset stays within ±5 m, each rejected under its own field.
+    #[test]
+    fn scene_offsets_centre_a_model_and_stay_in_range() {
+        let unit = |extra: &str| {
+            format!(
+                r#""yeoman": Scene(path: "m/y.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0{extra})"#
+            )
+        };
+        let v = parse(&file(
+            &unit(", x_offset_tiles_x100: -14, z_offset_tiles_x100: 11"),
+            CUBOID,
+            "",
+        ))
+        .unwrap();
+        v.validate(Path::new("v.ron"), &kinds(), &town()).unwrap();
+        let Some(Visual::Scene {
+            x_offset_tiles_x100,
+            z_offset_tiles_x100,
+            ..
+        }) = v.get("yeoman")
+        else {
+            panic!("a Scene");
+        };
+        assert_eq!((*x_offset_tiles_x100, *z_offset_tiles_x100), (-14, 11));
+        // Both default to 0.
+        let bare = parse(&file(&unit(""), CUBOID, "")).unwrap();
+        assert!(matches!(
+            bare.get("yeoman"),
+            Some(Visual::Scene {
+                x_offset_tiles_x100: 0,
+                z_offset_tiles_x100: 0,
+                ..
+            })
+        ));
+        for axis in ["x", "z"] {
+            check(&file(
+                &unit(&format!(", {axis}_offset_tiles_x100: {MAX_OFFSET_X100}")),
+                CUBOID,
+                "",
+            ))
+            .unwrap();
+            check(&file(
+                &unit(&format!(", {axis}_offset_tiles_x100: -{MAX_OFFSET_X100}")),
+                CUBOID,
+                "",
+            ))
+            .unwrap();
+            let err = rejects(
+                &file(
+                    &unit(&format!(
+                        ", {axis}_offset_tiles_x100: {}",
+                        MAX_OFFSET_X100 + 1
+                    )),
+                    CUBOID,
+                    "",
+                ),
+                &format!(r#"units["yeoman"].{axis}_offset_tiles_x100"#),
+            );
+            assert!(err.contains("within"), "{err}");
+        }
+        rejects(
+            &file(
+                &unit("").replace(
+                    "y_offset_tiles_x100: 0",
+                    &format!("y_offset_tiles_x100: -{}", MAX_OFFSET_X100 + 1),
+                ),
+                CUBOID,
+                "",
+            ),
+            r#"units["yeoman"].y_offset_tiles_x100"#,
+        );
+        // A building, a site, a prop and the flags follow the same rule.
+        let far = r#"Scene(path: "m/s.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, z_offset_tiles_x100: 501)"#;
+        rejects(
+            &file(YEOMAN, far, ""),
+            r#"buildings["town"].z_offset_tiles_x100"#,
+        );
+        rejects(
+            &file(YEOMAN, CUBOID, &format!("sites: [{far}]")),
+            "sites[0].z_offset_tiles_x100",
+        );
+        rejects(
+            &file(YEOMAN, CUBOID, &format!("seat_flag: Some({far})")),
+            "seat_flag.z_offset_tiles_x100",
+        );
+        // A float is a parse error.
+        assert!(parse(&file(&unit(", x_offset_tiles_x100: 0.5"), CUBOID, "")).is_err());
+    }
+
+    /// Owner decision 12 of the art pass: the team banner is one model
+    /// (`banner`, a team Scene), placed per building by its Scene's
+    /// `banner_at`; the Seat flag stands where a Town kind's
+    /// `seat_flag_at` says. Each rule is rejected under its own field.
+    #[test]
+    fn banner_and_seat_flag_mounts_are_data_and_checked() {
+        let castle = |extra: &str| {
+            format!(
+                r#"Scene(path: "m/castle.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("hex"){extra})"#
+            )
+        };
+        let flag = r#"Scene(path: "m/flag.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 90, team: Some("hex"))"#;
+        let banner = format!("{SWATCH}, banner: Some({flag})");
+        let both = format!("{banner}, seat_flag: Some({flag})");
+        let towns = || {
+            vec![BuildingKind {
+                town: true,
+                ..building("town")
+            }]
+        };
+        let check_towns = |text: &str| {
+            parse(text)
+                .map_err(|e| format!("parse: {e}"))?
+                .validate(Path::new("v.ron"), &kinds(), &towns())
+                .map_err(|e| e.to_string())
+        };
+        let mounted = castle(
+            ", banner_at: Some((offset_x100: (90, 40, 95), scale_x100: 400, yaw_deg: 15)), seat_flag_at: Some((offset_x100: (0, 480, -20)))",
+        );
+        let text = file(YEOMAN, &mounted, &both);
+        check_towns(&text).unwrap();
+        let v = parse(&text).unwrap();
+        let Some(Visual::Scene {
+            banner_at: Some(b),
+            seat_flag_at: Some(f),
+            ..
+        }) = v.building("town")
+        else {
+            panic!("both mounts parse");
+        };
+        assert_eq!(
+            (b.offset_x100, b.scale_x100, b.yaw_deg),
+            ((90, 40, 95), 400, 15)
+        );
+        assert_eq!(
+            (f.offset_x100, f.scale_x100, f.yaw_deg),
+            ((0, 480, -20), 100, 0),
+            "a mount's scale defaults to 100 and its yaw to 0"
+        );
+        assert!(v.banner.is_some());
+        assert!(
+            v.scene_paths()
+                .iter()
+                .any(|(f, p)| f == "banner.path" && *p == "m/flag.gltf"),
+            "data-check looks for the banner's file"
+        );
+
+        // A banner_at needs the banner model; a seat_flag_at the flag.
+        let err = check_towns(&file(
+            YEOMAN,
+            &castle(", banner_at: Some((offset_x100: (0, 0, 0)))"),
+            SWATCH,
+        ))
+        .unwrap_err();
+        assert!(
+            err.starts_with(r#"v.ron: buildings["town"].banner_at: "#)
+                && err.contains("no banner model"),
+            "{err}"
+        );
+        let err = check_towns(&file(
+            YEOMAN,
+            &castle(", seat_flag_at: Some((offset_x100: (0, 0, 0)))"),
+            &banner,
+        ))
+        .unwrap_err();
+        assert!(
+            err.starts_with(r#"v.ron: buildings["town"].seat_flag_at: "#)
+                && err.contains("no seat_flag model"),
+            "{err}"
+        );
+        // Only a Town kind carries the Seat flag (the helper's "town" is
+        // not one), and only buildings and units carry banners (a unit
+        // since art slice 4: the Mangonel's, owner decision 12).
+        let err = rejects(
+            &file(
+                YEOMAN,
+                &castle(", seat_flag_at: Some((offset_x100: (0, 0, 0)))"),
+                &both,
+            ),
+            r#"buildings["town"].seat_flag_at"#,
+        );
+        assert!(err.contains("only a Town kind"), "{err}");
+        let unit = r#""yeoman": Scene(path: "m/y.glb", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, banner_at: Some((offset_x100: (-40, 0, 30), scale_x100: 300)))"#;
+        check(&file(unit, CUBOID, &banner)).unwrap();
+        let v = parse(&file(unit, CUBOID, &banner)).unwrap();
+        let Some(Visual::Scene {
+            banner_at: Some(m), ..
+        }) = v.units.get("yeoman")
+        else {
+            panic!("a unit's banner_at parses");
+        };
+        assert_eq!((m.offset_x100, m.scale_x100), ((-40, 0, 30), 300));
+        // A unit's banner needs the banner model too, and its mount the
+        // same ranges.
+        let err = rejects(&file(unit, CUBOID, SWATCH), r#"units["yeoman"].banner_at"#);
+        assert!(err.contains("no banner model"), "{err}");
+        rejects(
+            &file(
+                &unit.replace("(-40, 0, 30)", "(-301, 0, 30)"),
+                CUBOID,
+                &banner,
+            ),
+            r#"units["yeoman"].banner_at.offset_x100"#,
+        );
+        let site = r#"Scene(path: "m/s.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, banner_at: Some((offset_x100: (0, 0, 0))))"#;
+        rejects(
+            &file(YEOMAN, CUBOID, &format!("{banner}, sites: [{site}]")),
+            "sites[0].banner_at",
+        );
+        rejects(
+            &file(
+                YEOMAN,
+                CUBOID,
+                &format!("{banner}, rubble: Some((visual: {site}, ds: 300))"),
+            ),
+            "rubble.visual.banner_at",
+        );
+        // The mount's own ranges.
+        for (mount, field) in [
+            ("(offset_x100: (301, 0, 0))", "offset_x100"),
+            ("(offset_x100: (0, 0, -301))", "offset_x100"),
+            ("(offset_x100: (0, -1, 0))", "offset_x100"),
+            ("(offset_x100: (0, 801, 0))", "offset_x100"),
+            ("(offset_x100: (0, 0, 0), scale_x100: 0)", "scale_x100"),
+            ("(offset_x100: (0, 0, 0), yaw_deg: 361)", "yaw_deg"),
+        ] {
+            let err = check_towns(&file(
+                YEOMAN,
+                &castle(&format!(", banner_at: Some({mount})")),
+                &banner,
+            ))
+            .unwrap_err();
+            assert!(
+                err.starts_with(&format!(r#"v.ron: buildings["town"].banner_at.{field}: "#)),
+                "{mount}: {err}"
+            );
+        }
+        for edge in [
+            "(offset_x100: (300, 800, -300), scale_x100: 10000, yaw_deg: -360)",
+            "(offset_x100: (-300, 0, 300))",
+        ] {
+            check_towns(&file(
+                YEOMAN,
+                &castle(&format!(", banner_at: Some({edge})")),
+                &banner,
+            ))
+            .unwrap_or_else(|e| panic!("{edge}: {e}"));
+        }
+        // The banner model is a team Scene without a fallback.
+        let err = rejects(
+            &file(
+                YEOMAN,
+                CUBOID,
+                &format!(
+                    "{SWATCH}, banner: Some({})",
+                    flag.replace(r#", team: Some("hex")"#, "")
+                ),
+            ),
+            "banner.team",
+        );
+        assert!(err.contains("team swatch"), "{err}");
+        rejects(
+            &file(YEOMAN, CUBOID, &format!("{SWATCH}, banner: Some({CUBOID})")),
+            "banner",
+        );
+        rejects(
+            &file(
+                YEOMAN,
+                CUBOID,
+                &format!(
+                    "{SWATCH}, banner: Some({})",
+                    flag.replace(
+                        r#"Some("hex"))"#,
+                        r#"Some("hex"), fallback: Some(Primitive(Cuboid)))"#
+                    )
+                ),
+            ),
+            "banner.fallback",
+        );
+        rejects(
+            &file(
+                YEOMAN,
+                CUBOID,
+                &format!(
+                    "{SWATCH}, banner: Some({})",
+                    flag.replace(r#"Some("hex")"#, r#"Some("adv")"#)
+                ),
+            ),
+            "banner.team",
+        );
+        // Unknown mount fields are parse errors.
+        assert!(
+            parse(&file(
+                YEOMAN,
+                &castle(", banner_at: Some((offset_x100: (0, 0, 0), size: 3))"),
+                &banner
+            ))
+            .is_err()
+        );
     }
 }

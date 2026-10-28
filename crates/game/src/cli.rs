@@ -13,8 +13,9 @@
 //! wall-clock seed (`app::match_seed`).
 //! The art pass adds `--assets-dir <dir>` ([`Cli::resolve_assets_dir`], also
 //! `EONMARK_ASSETS`), `--window-size <W>x<H>`, `--grid` (the debug grid,
-//! off by default; G toggles it) and `--draw-stats` (the draw-call counter,
-//! `crate::draw_stats`).
+//! off by default; G toggles it), `--draw-stats` (the draw-call counter,
+//! `crate::draw_stats`) and `--click-check` (every unit selectable by a
+//! real click, `crate::click_check`).
 //! Parsing is complete and tested here.
 
 use std::path::{Path, PathBuf};
@@ -81,6 +82,11 @@ Options:
                                and print `frame_stats: draws ...` and `frame_stats:
                                triangles ...` on exit (always on in dev builds, which
                                also show it in the Sim panel).
+  --click-check                With --scenario unit_looks: at tick 60 print a
+                               `click_check: target ...` pixel for every unit, judge
+                               each primary click against the next target, then print
+                               `click_check: ok <n>/<n>` (exit 0) or `click_check: FAIL
+                               ...` (exit 1). A driver clicks with real X input.
   -h, --help                   Show this text.
 
 Data directory resolution order:
@@ -216,6 +222,9 @@ pub struct Cli {
     pub grid: bool,
     /// `--draw-stats` (art pass): count draw calls and print the exit lines.
     pub draw_stats: bool,
+    /// `--click-check` (art pass): print every unit's click target and
+    /// judge real clicks against them (`crate::click_check`).
+    pub click_check: bool,
 }
 
 impl Default for Cli {
@@ -244,6 +253,7 @@ impl Default for Cli {
             window_size: None,
             grid: false,
             draw_stats: false,
+            click_check: false,
         }
     }
 }
@@ -332,6 +342,7 @@ impl Cli {
                 }
                 "--grid" => cli.grid = true,
                 "--draw-stats" => cli.draw_stats = true,
+                "--click-check" => cli.click_check = true,
                 "--scenario" => {
                     let name = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
                     if name.is_empty() || name.starts_with("--") {
@@ -414,6 +425,7 @@ impl Cli {
                 (cli.window_size.is_some(), "--window-size"),
                 (cli.grid, "--grid"),
                 (cli.draw_stats, "--draw-stats"),
+                (cli.click_check, "--click-check"),
                 (cli.fast_forward_to.is_some(), "--fast-forward-to"),
                 (
                     cli.new_game_after_seconds.is_some(),
@@ -424,6 +436,12 @@ impl Cli {
                     return Err(format!("{flag} needs a window; drop --headless-run"));
                 }
             }
+        }
+        if cli.click_check && cli.headless_run.is_none() && cli.scenario.is_none() {
+            return Err(
+                "--click-check judges clicks on a scenario's units; add --scenario unit_looks"
+                    .into(),
+            );
         }
         if cli.spectate && cli.scenario.is_some() {
             return Err("--spectate builds its own match; drop --scenario".into());
@@ -677,6 +695,7 @@ mod tests {
                 window_size: None,
                 grid: false,
                 draw_stats: false,
+                click_check: false,
             })
         );
         let Parsed::Run(cli) = parsed else {
@@ -913,9 +932,10 @@ mod tests {
         );
     }
 
-    /// The art pass's flags: `--assets-dir`, `--window-size`, `--grid` and
-    /// `--draw-stats` parse, the size is checked, and the three that need a
-    /// window refuse `--headless-run`.
+    /// The art pass's flags: `--assets-dir`, `--window-size`, `--grid`,
+    /// `--draw-stats` and `--click-check` parse, the size is checked, the
+    /// four that need a window refuse `--headless-run`, and `--click-check`
+    /// needs a scenario.
     #[test]
     fn art_flags_parse() {
         assert_eq!(
@@ -953,10 +973,21 @@ mod tests {
         assert!(parse(&["--window-size"]).is_err());
         assert!(parse(&["--assets-dir"]).is_err());
         assert!(parse(&["--assets-dir", ""]).is_err());
+        assert_eq!(
+            parse(&["--scenario", "unit_looks", "--click-check"]),
+            Ok(Parsed::Run(Cli {
+                scenario: Some("unit_looks".into()),
+                click_check: true,
+                ..Cli::default()
+            }))
+        );
+        let err = parse(&["--click-check"]).unwrap_err();
+        assert!(err.contains("--scenario unit_looks"), "{err}");
         for flag in [
             vec!["--window-size", "1280x720"],
             vec!["--grid"],
             vec!["--draw-stats"],
+            vec!["--click-check"],
         ] {
             let mut args = vec!["--headless-run", "10"];
             args.extend(flag.iter().copied());

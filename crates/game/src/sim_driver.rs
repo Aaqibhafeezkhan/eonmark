@@ -28,8 +28,9 @@
 //! outcome. A replay never freezes; it plays to its recorded end.
 //!
 //! M5b: `step_sim` runs only while [`match_running`] (no `AppState`
-//! resource, as in headless runs and most tests, or `AppState::Skirmish`),
-//! so the sim does not step while the main menu is open; the fixed clock
+//! resource, as in headless runs and most tests, or `AppState::Skirmish`,
+//! and since the art pass once every glTF model has settled), so the sim
+//! does not step while the main menu is open or models load; the fixed clock
 //! still spends its time with the system skipped, so the first frame after
 //! New Game steps one tick, not a burst. The recorder is lazy: the plugin
 //! keeps the replay's path in [`PendingRecording`] and `step_sim` spawns
@@ -912,9 +913,15 @@ pub fn local_player_is_human(seat: Option<Res<LocalSeat>>) -> bool {
 
 /// Run condition (M5b): the match runs, so `step_sim` steps. `true` with no
 /// [`AppState`] at all (headless runs and tests without states) and in
-/// `AppState::Skirmish`; `false` while the main menu is open.
-pub fn match_running(state: Option<Res<State<AppState>>>) -> bool {
-    state.is_none_or(|s| *s.get() == AppState::Skirmish)
+/// `AppState::Skirmish`; `false` while the main menu is open. Art pass
+/// (slice 3): also `false` until every glTF model is ready or has failed
+/// (`models::models_settled`; always true without a `ModelLibrary`), so
+/// nothing the sim spawns is drawn before its model can be.
+pub fn match_running(
+    state: Option<Res<State<AppState>>>,
+    models: Option<Res<crate::models::ModelLibrary>>,
+) -> bool {
+    state.is_none_or(|s| *s.get() == AppState::Skirmish) && crate::models::models_settled(models)
 }
 
 /// `ProjectDirs::from("com", "tonianev", "Eonmark").data_dir()/replays`, or
@@ -1901,6 +1908,46 @@ mod tests {
     fn advance(app: &mut App, by: Duration) {
         app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(by));
         app.update();
+    }
+
+    /// Art pass (slice 3): while any glTF model is still loading the sim
+    /// does not step (the load gate in `match_running`); once every model
+    /// is ready or has failed it steps as usual, from tick 1.
+    #[test]
+    fn the_sim_waits_for_models_to_settle() {
+        use crate::models::{ModelKey, ModelLibrary};
+        let mut app = fixed_clock_app(Box::new(LocalInput));
+        let key = ModelKey {
+            path: "models/castle.gltf".into(),
+            nodes: Vec::new(),
+            parts: Vec::new(),
+            scale_x100: 100,
+            yaw_deg: 0,
+            offset_x100: (0, 0, 0),
+        };
+        let mut lib = ModelLibrary::default();
+        lib.insert_loading(key.clone(), vec![(key.path.clone(), Handle::default())]);
+        app.insert_resource(lib);
+        for _ in 0..4 {
+            advance(&mut app, Duration::from_millis(250));
+        }
+        assert_eq!(
+            app.world().non_send::<SimHandle>().tick(),
+            0,
+            "the sim waits while a model loads"
+        );
+        assert!(!app.world().resource::<SimStepped>().0);
+        app.world_mut()
+            .resource_mut::<ModelLibrary>()
+            .fail(&key, "test");
+        advance(&mut app, Duration::from_millis(50));
+        assert_eq!(
+            app.world().non_send::<SimHandle>().tick(),
+            1,
+            "one tick, no burst"
+        );
+        advance(&mut app, Duration::from_millis(100));
+        assert_eq!(app.world().non_send::<SimHandle>().tick(), 3);
     }
 
     #[test]

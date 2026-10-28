@@ -15,6 +15,20 @@
 //! [`sim_from_world`] are the only two conversion points; orders and
 //! selection use them too.
 //!
+//! Since art slice 4 a kind whose look is a `Visual::Scene` with a ready
+//! model (`crate::models`) draws that merged model, with its texture
+//! repainted for the owner's team ([`UnitVisuals::mesh_with`],
+//! [`UnitVisuals::material_with`]); a kind whose model failed, and every
+//! kind in headless runs and tests, draws the Scene's `fallback`. Units of
+//! a kind and team share one mesh and one material, so 400 units stay a
+//! few dozen draws. A Scene with a `banner_at` (the Mangonel, owner
+//! decision 12 of the art pass) carries the team banner as a top-level
+//! [`UnitBanner`] entity that follows it every frame, never a child (rule
+//! 16). Walking units bob ([`Gait`]): civilians, infantry and cavalry lift
+//! by up to [`GAIT_LIFT_M`] once per [`GAIT_STRIDE_M`] of ground covered,
+//! siege and support units roll; the bob is presentation only, read from
+//! the interpolated pose and never fed back to the sim.
+//!
 //! When the local player's first units appear, the camera focus jumps once
 //! to their centroid ([`focus_camera_on_first_units`]) so a scenario that
 //! spawns at the west start is on screen from the first frame.
@@ -26,15 +40,18 @@
 //! the match, after [`sync_lifecycle`] advanced it.
 
 use std::collections::HashMap;
-use std::f32::consts::FRAC_PI_2;
+use std::f32::consts::{FRAC_PI_2, PI};
 
+use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
-use rules::{Primitive, Rules, Visual};
+use rules::{Primitive, Rules, UnitClass, Visual};
 use sim::{Fx, FxVec2, UnitId};
 
+use crate::buildings::{DrawAssets, mount_transform};
 use crate::camera::RtsCamera;
 use crate::ground::HALF_EXTENT;
+use crate::models::{Model, ModelLibrary};
 use crate::palette;
 use crate::sim_driver::{LOCAL_PLAYER, MatchOver, SimHandle, SimSystems, sim_stepped};
 
@@ -64,8 +81,19 @@ pub const SPHERE_SUBDIVISIONS: u32 = 1;
 pub const MAX_LOOK_VERTICES: usize = 600;
 
 /// What [`body_mesh`] draws for a `Visual::Scene` without a `fallback`
-/// until the art pass loads glTF models, and for a kind with no visual.
+/// whose model is not ready (headless runs, tests, a failed load), and for
+/// a kind with no visual.
 pub const FALLBACK_VISUAL: Visual = Visual::Primitive(Primitive::Capsule);
+
+/// Height of the walk bob at mid-step, metres (art pass plan 4.3).
+pub const GAIT_LIFT_M: f32 = 0.05;
+/// Ground a walking unit covers per step, metres: the bob lifts once per
+/// stride.
+pub const GAIT_STRIDE_M: f32 = 0.6;
+/// How fast a unit that stopped finishes the step it was in, metres of
+/// stride per second, so it settles on the ground instead of freezing
+/// mid-air (and nothing bobs at rest or after the outcome).
+pub const GAIT_SETTLE_M_PER_S: f32 = 1.2;
 
 /// `StandardMaterial::perceptual_roughness` for every unit (`docs/ART_STYLE.md`: matte).
 pub const MATTE_ROUGHNESS: f32 = 0.95;
@@ -135,6 +163,77 @@ impl Interp {
     }
 }
 
+/// The walk bob of a civilian, infantry or cavalry unit ([`has_gait`]):
+/// the step phase advances by the ground the unit's interpolated pose
+/// covers each frame, and [`Gait::step`] gives the lift. Presentation
+/// only: it reads the render pose and never feeds the sim.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct Gait {
+    /// Distance into the current stride, metres, in `0..GAIT_STRIDE_M`.
+    pub phase: f32,
+    /// The pose the last frame drew (height ignored).
+    pub last: Vec3,
+}
+
+impl Gait {
+    /// A unit standing at `pos`.
+    pub fn at(pos: Vec3) -> Self {
+        Self {
+            phase: 0.0,
+            last: pos,
+        }
+    }
+
+    /// Advance to this frame's pose `pos`, `dt` seconds after the last,
+    /// and return the lift in metres: [`gait_lift`] of the phase after
+    /// adding the horizontal distance moved, or, when the unit did not
+    /// move, after finishing its step at [`GAIT_SETTLE_M_PER_S`] (a unit
+    /// at rest ends on the ground).
+    pub fn step(&mut self, pos: Vec3, dt: f32) -> f32 {
+        let moved = Vec2::new(pos.x - self.last.x, pos.z - self.last.z).length();
+        self.last = pos;
+        if moved > 1e-5 {
+            self.phase = (self.phase + moved).rem_euclid(GAIT_STRIDE_M);
+        } else if self.phase > 0.0 {
+            let next = self.phase + GAIT_SETTLE_M_PER_S * dt.max(0.0);
+            self.phase = if next >= GAIT_STRIDE_M { 0.0 } else { next };
+        }
+        gait_lift(self.phase)
+    }
+}
+
+/// The lift at `phase` metres into a stride: `GAIT_LIFT_M * |sin|`, zero
+/// at each footfall (phase 0) and highest mid-step.
+pub fn gait_lift(phase: f32) -> f32 {
+    GAIT_LIFT_M * (phase * PI / GAIT_STRIDE_M).sin().abs()
+}
+
+/// Whether units of `class` walk (and bob): civilians, infantry and
+/// cavalry do; siege engines and the supply wain roll.
+pub fn has_gait(class: UnitClass) -> bool {
+    matches!(
+        class,
+        UnitClass::Civilian | UnitClass::Infantry | UnitClass::Cavalry
+    )
+}
+
+/// A unit's team banner (owner decision 12 of the art pass: the Mangonel
+/// carries one): a top-level entity, never the unit's child (rule 16),
+/// placed every frame at the unit's pose times `local`, the Scene's
+/// `banner_at` mount in the unit's own axes ([`sync_transforms`]).
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct UnitBanner {
+    /// The unit carrying it.
+    pub unit: UnitId,
+    /// The mount, in the unit's frame (+X its facing).
+    pub local: Transform,
+}
+
+/// On a unit entity: the [`UnitBanner`] entity it carries, despawned with
+/// it.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriesBanner(pub Entity);
+
 /// The render-side mirror: which entity shows which sim unit. Rings, bars
 /// and markers are keyed by `UnitId` elsewhere; this is the only map from
 /// id to the unit's own entity.
@@ -143,22 +242,75 @@ pub struct UnitEntities(pub HashMap<UnitId, Entity>);
 
 /// Shared mesh per unit kind and material per `(kind, team)`, created on
 /// first use so draw calls stay low (one batch per combination), and the
-/// height of each kind's look ([`look_top_y`]), cached with its mesh.
+/// height of each kind's look ([`look_top_y`], or its model's top), cached
+/// with its mesh.
 #[derive(Resource, Default)]
 pub struct UnitVisuals {
     meshes: HashMap<u16, Handle<Mesh>>,
     top_y: HashMap<u16, f32>,
+    /// The ready model each kind is drawn as (art slice 4); a kind drawn as
+    /// its fallback look has none.
+    models: HashMap<u16, Model>,
     materials: HashMap<(u16, u8), Handle<StandardMaterial>>,
 }
 
 impl UnitVisuals {
-    /// The mesh for `kind`, built by [`body_mesh`] from its `Visual` and
-    /// `radius_tiles_x100`. A `Visual::Scene` draws its `fallback` (else
-    /// [`FALLBACK_VISUAL`]) until the art pass loads models. Also caches the
-    /// look's height for [`UnitVisuals::top_y`].
+    /// The mesh for `kind` with no model library: its fallback look
+    /// ([`UnitVisuals::mesh_with`] with `None`).
     pub fn mesh(&mut self, kind: u16, rules: &Rules, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
+        self.mesh_with(kind, rules, meshes, None)
+    }
+
+    /// The mesh for `kind`: the merged model of its `Visual::Scene` when
+    /// `models` holds it ready (art slice 4: scale, yaw and offsets are
+    /// baked in, so the unit's transform stays translation and facing),
+    /// else [`body_mesh`] of its look (a Scene's `fallback`, else
+    /// [`FALLBACK_VISUAL`]) sized from `radius_tiles_x100`. Also caches the
+    /// look's height (the higher of the model's top and the top of the team
+    /// banner the kind carries, or [`look_top_y`]) for
+    /// [`UnitVisuals::top_y`]. Cached on first use; the load gate
+    /// (`models::models_settled`) makes that first use come after every
+    /// model has settled, so no kind caches its fallback while its model
+    /// is still loading.
+    pub fn mesh_with(
+        &mut self,
+        kind: u16,
+        rules: &Rules,
+        meshes: &mut Assets<Mesh>,
+        models: Option<&ModelLibrary>,
+    ) -> Handle<Mesh> {
         if let Some(mesh) = self.meshes.get(&kind) {
             return mesh.clone();
+        }
+        if let Some(model) = rules
+            .visual(kind)
+            .and_then(|visual| models.and_then(|lib| lib.model(visual)))
+        {
+            // A carried banner counts (the Mangonel's stands far above its
+            // catapult): the bar rides over it, so the cloth between the
+            // camera and the unit never covers the bar.
+            let banner_top = match rules.visual(kind) {
+                Some(Visual::Scene {
+                    banner_at: Some(mount),
+                    ..
+                }) => rules
+                    .visuals
+                    .banner
+                    .as_ref()
+                    .and_then(|b| models.and_then(|lib| lib.model(b)))
+                    .map(|b| {
+                        mount.offset_x100.1 as f32 / 100.0
+                            + b.top_y() * mount.scale_x100 as f32 / 100.0
+                    }),
+                _ => None,
+            };
+            self.top_y.insert(
+                kind,
+                banner_top.map_or(model.top_y(), |t| t.max(model.top_y())),
+            );
+            self.meshes.insert(kind, model.mesh.clone());
+            self.models.insert(kind, model.clone());
+            return model.mesh.clone();
         }
         let radius = rules
             .unit_kind(kind)
@@ -171,32 +323,62 @@ impl UnitVisuals {
     }
 
     /// Height above the ground of the top of `kind`'s look, in metres, once
-    /// [`UnitVisuals::mesh`] has built it (every kind on screen has). The
-    /// one place anything drawn above a unit takes its height from, so the
-    /// art pass changes only [`look_top_y`].
+    /// [`UnitVisuals::mesh`] has built it (every kind on screen has): the
+    /// model's top, or its carried banner's when that stands higher, since
+    /// art slice 4, else [`look_top_y`] of the fallback look. The one place
+    /// anything drawn above a unit takes its height from.
     pub fn top_y(&self, kind: u16) -> Option<f32> {
         self.top_y.get(&kind).copied()
     }
 
-    /// The matte team-coloured material for `(kind, team)`.
+    /// The matte team-coloured material for `(kind, team)` with no model
+    /// library ([`UnitVisuals::material_with`] with `None`).
     pub fn material(
         &mut self,
         kind: u16,
         team: u8,
         materials: &mut Assets<StandardMaterial>,
     ) -> Handle<StandardMaterial> {
-        self.materials
-            .entry((kind, team))
-            .or_insert_with(|| {
-                materials.add(StandardMaterial {
-                    base_color: palette::team_color(team),
-                    perceptual_roughness: MATTE_ROUGHNESS,
-                    reflectance: MATTE_REFLECTANCE,
-                    metallic: 0.0,
-                    ..default()
-                })
-            })
-            .clone()
+        self.material_with(kind, team, None, materials, None, None)
+    }
+
+    /// The material for `(kind, team)`: for a kind drawn as its model
+    /// ([`UnitVisuals::mesh_with`] first), the library's material for the
+    /// model's texture repainted with `swatch` (its Scene's `team`) for
+    /// `team`, shared with every model on that texture; otherwise the matte
+    /// team colour. Cached per `(kind, team)`.
+    pub fn material_with(
+        &mut self,
+        kind: u16,
+        team: u8,
+        swatch: Option<&str>,
+        materials: &mut Assets<StandardMaterial>,
+        models: Option<&mut ModelLibrary>,
+        images: Option<&mut Assets<Image>>,
+    ) -> Handle<StandardMaterial> {
+        if let Some(handle) = self.materials.get(&(kind, team)) {
+            return handle.clone();
+        }
+        let handle = match (self.models.get(&kind), models, images) {
+            (Some(model), Some(lib), Some(images)) => {
+                lib.material(model, swatch.map(|k| (k, team)), images, materials)
+            }
+            _ => materials.add(StandardMaterial {
+                base_color: palette::team_color(team),
+                perceptual_roughness: MATTE_ROUGHNESS,
+                reflectance: MATTE_REFLECTANCE,
+                metallic: 0.0,
+                ..default()
+            }),
+        };
+        self.materials.insert((kind, team), handle.clone());
+        handle
+    }
+
+    /// Whether `kind` is drawn as its model (after
+    /// [`UnitVisuals::mesh_with`] found it ready).
+    pub fn is_model(&self, kind: u16) -> bool {
+        self.models.contains_key(&kind)
     }
 
     /// Number of distinct meshes and materials created so far (dev panel
@@ -271,7 +453,9 @@ impl Look {
     /// `Primitive` sizes the shape from the radius (a capsule 3.4 radii
     /// tall, everything else 2), `Body` takes its own height, and `Scene`
     /// is its `fallback` (a `Primitive` or a `Body`, `rules::Visuals`
-    /// checks), else [`FALLBACK_VISUAL`], until the art pass loads models.
+    /// checks), else [`FALLBACK_VISUAL`]: what a Scene kind draws when its
+    /// model is not ready (art slice 4 draws ready models instead,
+    /// [`UnitVisuals::mesh_with`]).
     pub fn of(visual: &Visual, radius: f32) -> Look {
         let diameter = 2.0 * radius;
         match visual {
@@ -405,19 +589,22 @@ impl Plugin for PresentPlugin {
 /// After every tick: for each unit in `sim.view().units()`, update its
 /// [`Interp`] (`advance` to the new pose) or spawn a new entity when the id
 /// is not in [`UnitEntities`] (`Mesh3d`, `MeshMaterial3d`, `Transform`,
-/// `UnitRef`, `Interp::at`, `Pickable::default()`, `Name`); despawn every
-/// entity whose id is no longer in the view and drop it from the map. Runs
-/// in `FixedUpdate` after [`SimSystems::Step`] so it sees every tick even
-/// when several run in one frame, and only in iterations that stepped
-/// ([`sim_stepped`]): a stalled or cap-dropped fixed step leaves `Interp`
-/// alone so the render lerp finishes instead of snapping.
+/// `UnitRef`, `Interp::at`, `Pickable::default()`, `Name`, plus a [`Gait`]
+/// for a walking kind and a [`UnitBanner`] entity for a kind whose Scene
+/// names a `banner_at`); despawn every entity whose id is no longer in the
+/// view, with its banner, and drop it from the map. Runs in `FixedUpdate`
+/// after [`SimSystems::Step`] so it sees every tick even when several run
+/// in one frame, and only in iterations that stepped ([`sim_stepped`]): a
+/// stalled or cap-dropped fixed step leaves `Interp` alone so the render
+/// lerp finishes instead of snapping.
+#[allow(clippy::too_many_arguments)] // Bevy system: each parameter is one resource or query
 pub fn sync_lifecycle(
     sim: NonSend<SimHandle>,
     mut entities: ResMut<UnitEntities>,
     mut visuals: ResMut<UnitVisuals>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut assets: DrawAssets,
     mut interps: Query<&mut Interp>,
+    carriers: Query<&CarriesBanner>,
     mut commands: Commands,
 ) {
     let view = sim.view();
@@ -432,20 +619,43 @@ pub fn sync_lifecycle(
                 }
             }
             None => {
-                let mesh = visuals.mesh(unit.kind.0, rules, &mut meshes);
-                let material = visuals.material(unit.kind.0, unit.owner.0, &mut materials);
-                let entity = commands
-                    .spawn((
-                        Name::new(format!("Unit {}", unit.id.0)),
-                        UnitRef(unit.id),
-                        Interp::at(pos, yaw),
-                        Mesh3d(mesh),
-                        MeshMaterial3d(material),
-                        Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
-                        Pickable::default(),
-                    ))
-                    .id();
-                entities.0.insert(unit.id, entity);
+                let kind = unit.kind.0;
+                let (mesh, material) =
+                    unit_look(&mut visuals, &mut assets, rules, kind, unit.owner.0);
+                let transform =
+                    Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw));
+                let mut entity = commands.spawn((
+                    Name::new(format!("Unit {}", unit.id.0)),
+                    UnitRef(unit.id),
+                    Interp::at(pos, yaw),
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material),
+                    transform,
+                    Pickable::default(),
+                ));
+                if rules.unit_kind(kind).is_some_and(|k| has_gait(k.class)) {
+                    entity.insert(Gait::at(pos));
+                }
+                let id = entity.id();
+                if let Some((mesh, material, local)) =
+                    unit_banner(&visuals, &mut assets, rules, kind, unit.owner.0)
+                {
+                    let banner = commands
+                        .spawn((
+                            Name::new(format!("Banner of unit {}", unit.id.0)),
+                            UnitBanner {
+                                unit: unit.id,
+                                local,
+                            },
+                            Mesh3d(mesh),
+                            MeshMaterial3d(material),
+                            transform.mul_transform(local),
+                            NotShadowCaster,
+                        ))
+                        .id();
+                    commands.entity(id).insert(CarriesBanner(banner));
+                }
+                entities.0.insert(unit.id, id);
             }
         }
     }
@@ -454,11 +664,78 @@ pub fn sync_lifecycle(
             if view.unit(*id).is_some() {
                 true
             } else {
+                if let Ok(banner) = carriers.get(*entity) {
+                    commands.entity(banner.0).despawn();
+                }
                 commands.entity(*entity).despawn();
                 false
             }
         });
     }
+}
+
+/// The shared mesh and material a unit of `kind` owned by `team` is drawn
+/// with: its kind's ready model in the team's repaint of the model's
+/// texture, else its fallback look in the matte team colour
+/// ([`UnitVisuals::mesh_with`], [`UnitVisuals::material_with`]).
+pub fn unit_look(
+    visuals: &mut UnitVisuals,
+    assets: &mut DrawAssets,
+    rules: &Rules,
+    kind: u16,
+    team: u8,
+) -> (Handle<Mesh>, Handle<StandardMaterial>) {
+    let mesh = visuals.mesh_with(kind, rules, &mut assets.meshes, assets.models.as_deref());
+    let swatch = match rules.visual(kind) {
+        Some(Visual::Scene {
+            team: Some(key), ..
+        }) => Some(key.as_str()),
+        _ => None,
+    };
+    let material = visuals.material_with(
+        kind,
+        team,
+        swatch,
+        &mut assets.materials,
+        assets.models.as_deref_mut(),
+        assets.images.as_deref_mut(),
+    );
+    (mesh, material)
+}
+
+/// The team banner a unit of `kind` owned by `team` carries, when its kind
+/// is drawn as its model and its Scene names a `banner_at` and the banner
+/// model is ready: the banner's mesh (shared with every building's
+/// banner), its team material and the mount in the unit's frame.
+pub fn unit_banner(
+    visuals: &UnitVisuals,
+    assets: &mut DrawAssets,
+    rules: &Rules,
+    kind: u16,
+    team: u8,
+) -> Option<(Handle<Mesh>, Handle<StandardMaterial>, Transform)> {
+    if !visuals.is_model(kind) {
+        return None;
+    }
+    let Some(Visual::Scene {
+        banner_at: Some(mount),
+        ..
+    }) = rules.visual(kind)
+    else {
+        return None;
+    };
+    let banner = rules.visuals.banner.as_ref()?;
+    let model = assets.models.as_deref()?.model(banner)?.clone();
+    let swatch = match banner {
+        Visual::Scene {
+            team: Some(key), ..
+        } => Some((key.as_str(), team)),
+        _ => None,
+    };
+    let lib = assets.models.as_deref_mut()?;
+    let images = assets.images.as_deref_mut()?;
+    let material = lib.material(&model, swatch, images, &mut assets.materials);
+    Some((model.mesh, material, mount_transform(Vec3::ZERO, mount)))
 }
 
 /// Once, in the fixed step that decided the match ([`MatchOver`] was just
@@ -474,17 +751,37 @@ pub fn settle_at_outcome(mut interps: Query<&mut Interp>) {
 }
 
 /// Every frame: `transform.translation, yaw = interp.sample(fixed.overstep_fraction())`,
-/// `transform.rotation = Quat::from_rotation_y(yaw)`. Runs in `PostUpdate`
-/// before transform propagation so the frame renders the interpolated pose.
+/// lifted by the unit's [`Gait`] when it has one, and
+/// `transform.rotation = Quat::from_rotation_y(yaw)`; a unit's
+/// [`UnitBanner`] follows at the unit's transform times its mount. Runs in
+/// `PostUpdate` before transform propagation so the frame renders the
+/// interpolated pose.
 pub fn sync_transforms(
     fixed: Res<Time<Fixed>>,
-    mut units: Query<(&Interp, &mut Transform), With<UnitRef>>,
+    time: Res<Time>,
+    mut units: Query<
+        (
+            &Interp,
+            &mut Transform,
+            Option<&mut Gait>,
+            Option<&CarriesBanner>,
+        ),
+        With<UnitRef>,
+    >,
+    mut banners: Query<(&UnitBanner, &mut Transform), Without<UnitRef>>,
 ) {
     let t = fixed.overstep_fraction();
-    for (interp, mut transform) in &mut units {
+    let dt = time.delta_secs();
+    for (interp, mut transform, gait, banner) in &mut units {
         let (pos, yaw) = interp.sample(t);
-        transform.translation = pos;
+        let lift = gait.map_or(0.0, |mut g| g.step(pos, dt));
+        transform.translation = pos + Vec3::Y * lift;
         transform.rotation = Quat::from_rotation_y(yaw);
+        if let Some(banner) = banner
+            && let Ok((mount, mut placed)) = banners.get_mut(banner.0)
+        {
+            *placed = transform.mul_transform(mount.local);
+        }
     }
 }
 
@@ -645,10 +942,14 @@ mod tests {
             scale_x100: 100,
             y_offset_tiles_x100: 0,
             yaw_deg: 0,
+            x_offset_tiles_x100: 0,
+            z_offset_tiles_x100: 0,
             nodes: Vec::new(),
             parts: Vec::new(),
             team: None,
             fallback: fallback.map(Box::new),
+            banner_at: None,
+            seat_flag_at: None,
         }
     }
 
@@ -968,5 +1269,448 @@ mod tests {
         assert_ne!(m0, m1);
         assert_eq!(v.material(0, 0, &mut materials), m0);
         assert_eq!(v.counts(), (1, 2));
+    }
+
+    /// An 8x8 texture, the team rect at (0, 0, 4, 4).
+    fn atlas() -> Image {
+        use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+        Image::new(
+            Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![200; 8 * 8 * 4],
+            TextureFormat::Rgba8UnormSrgb,
+            bevy::asset::RenderAssetUsages::default(),
+        )
+    }
+
+    /// `visual` (a Scene) put in `lib` as a ready model `top` m tall.
+    fn ready(
+        lib: &mut ModelLibrary,
+        visual: &Visual,
+        top: f32,
+        meshes: &mut Assets<Mesh>,
+        images: &mut Assets<Image>,
+    ) -> Model {
+        use crate::models::{Geometry, ModelKey, content_hash, finish_geometry};
+        let image = atlas();
+        let hash = content_hash(&image);
+        let handle = images.add(image);
+        let model = finish_geometry(
+            Geometry {
+                positions: vec![[-0.3, 0.0, -0.3], [0.3, top, 0.3], [0.0, 0.0, 0.3]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                uvs: vec![[0.1, 0.1]; 3],
+                indices: vec![0, 1, 2],
+                textures: vec![],
+                base_color: None,
+            },
+            hash,
+            meshes,
+        );
+        lib.insert_ready(ModelKey::of(visual).unwrap(), model.clone(), handle);
+        model
+    }
+
+    /// A team Scene at `path` with `fallback` and an optional banner mount.
+    fn team_scene(path: &str, fallback: Visual, banner_at: Option<rules::Mount>) -> Visual {
+        match scene(Some(fallback)) {
+            Visual::Scene {
+                scale_x100,
+                y_offset_tiles_x100,
+                yaw_deg,
+                x_offset_tiles_x100,
+                z_offset_tiles_x100,
+                nodes,
+                parts,
+                fallback,
+                seat_flag_at,
+                ..
+            } => Visual::Scene {
+                path: path.into(),
+                scale_x100,
+                y_offset_tiles_x100,
+                yaw_deg,
+                x_offset_tiles_x100,
+                z_offset_tiles_x100,
+                nodes,
+                parts,
+                team: Some("adv".into()),
+                fallback,
+                banner_at,
+                seat_flag_at,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// The repository rules with every unit kind its M4b look (no test
+    /// reads the live looks), then the Yeoman and the Mangonel as team
+    /// Scenes (the Mangonel with a banner mount), the Scribe as a Scene
+    /// whose model never loads, the team banner model, a swatch, and a
+    /// library with the Yeoman's, the Mangonel's and the banner's models
+    /// ready.
+    struct UnitFixture {
+        rules: Rules,
+        lib: ModelLibrary,
+        meshes: Assets<Mesh>,
+        images: Assets<Image>,
+        yeoman: Model,
+        mangonel: Model,
+        banner: Model,
+        mount: rules::Mount,
+    }
+
+    fn unit_fixture() -> UnitFixture {
+        let mut rules = repo_rules();
+        for (name, visual, _) in m4b_looks() {
+            rules.visuals.units.insert(name, visual);
+        }
+        rules.visuals.team_swatches.insert(
+            "adv".into(),
+            rules::TeamSwatch {
+                rects: vec![(0, 0, 4, 4)],
+                desaturate_permille: 0,
+            },
+        );
+        let mount = rules::Mount {
+            offset_x100: (-40, 0, 40),
+            scale_x100: 300,
+            yaw_deg: 0,
+        };
+        let yeoman = team_scene("m/yeoman.glb", Visual::Primitive(Primitive::Capsule), None);
+        let mangonel = team_scene(
+            "m/catapult.gltf",
+            Visual::Primitive(Primitive::Sphere),
+            Some(mount.clone()),
+        );
+        let scribe = team_scene("m/scribe.glb", Visual::Primitive(Primitive::Cylinder), None);
+        let banner = team_scene("m/flag.gltf", Visual::Primitive(Primitive::Cuboid), None);
+        let banner = match banner {
+            Visual::Scene { .. } => {
+                let mut b = banner;
+                if let Visual::Scene { fallback, .. } = &mut b {
+                    *fallback = None;
+                }
+                b
+            }
+            other => other,
+        };
+        rules.visuals.units.insert("yeoman".into(), yeoman.clone());
+        rules
+            .visuals
+            .units
+            .insert("mangonel".into(), mangonel.clone());
+        rules.visuals.units.insert("scribe".into(), scribe);
+        rules.visuals.banner = Some(banner.clone());
+        let (mut meshes, mut images) = (Assets::default(), Assets::default());
+        let mut lib = ModelLibrary::new(&rules.visuals);
+        let yeoman = ready(&mut lib, &yeoman, 1.3, &mut meshes, &mut images);
+        let mangonel = ready(&mut lib, &mangonel, 0.8, &mut meshes, &mut images);
+        let banner = ready(&mut lib, &banner, 0.28, &mut meshes, &mut images);
+        UnitFixture {
+            rules,
+            lib,
+            meshes,
+            images,
+            yeoman,
+            mangonel,
+            banner,
+            mount,
+        }
+    }
+
+    /// An app that runs [`PresentPlugin`] on `art_bench` (195 units a
+    /// side of every kind, the `AttackMove` at tick 20) with the fixture's
+    /// rules and ready models, one tick per update after the first.
+    fn unit_app(f: UnitFixture) -> App {
+        use crate::sim_driver::{ScenarioInput, SimPlugin};
+        use bevy::time::TimeUpdateStrategy;
+        let (setup, stream, _) =
+            sim::scenarios::by_name("art_bench", &f.rules).expect("a scenario");
+        let handle = SimHandle::from_setup(setup, f.rules);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::ZERO,
+            ))
+            .insert_resource(f.meshes)
+            .insert_resource(f.images)
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(f.lib)
+            .add_plugins(SimPlugin::new(handle, Box::new(ScenarioInput::new(stream))))
+            .add_plugins(PresentPlugin);
+        app.update();
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(50),
+        ));
+        app
+    }
+
+    fn run_ticks(app: &mut App, n: u32) {
+        let target = app.world().non_send::<SimHandle>().tick() + n;
+        for _ in 0..1000 {
+            if app.world().non_send::<SimHandle>().tick() >= target {
+                return;
+            }
+            app.update();
+        }
+        panic!("tick {target} not reached");
+    }
+
+    /// `(kind id, owner, entity)` of every unit on the map.
+    fn unit_entities(app: &App) -> Vec<(String, u8, Entity)> {
+        let sim = app.world().non_send::<SimHandle>();
+        let view = sim.view();
+        let rules = sim.rules();
+        let map = &app.world().resource::<UnitEntities>().0;
+        view.units()
+            .map(|u| {
+                (
+                    rules.unit_kind(u.kind.0).unwrap().id.clone(),
+                    u.owner.0,
+                    map[&u.id],
+                )
+            })
+            .collect()
+    }
+
+    /// Art slice 4: a kind whose model is ready draws it, every unit of a
+    /// kind shares that one mesh, and every unit of a kind and team one
+    /// material, the model's texture repainted for the team (the
+    /// library's, shared with every model on that texture); the cached
+    /// top is the model's. A kind whose model never loaded draws its
+    /// fallback look in the plain team colour. The Mangonel carries the
+    /// team banner as a top-level entity that follows it as it moves and
+    /// turns, and goes when it dies.
+    #[test]
+    fn units_of_a_kind_and_team_share_the_model_mesh_and_material() {
+        let f = unit_fixture();
+        let (yeoman_mesh, mangonel_mesh) = (f.yeoman.mesh.clone(), f.mangonel.mesh.clone());
+        let banner_mesh = f.banner.mesh.clone();
+        let mount = f.mount.clone();
+        let mut app = unit_app(f);
+        run_ticks(&mut app, 8);
+        let units = unit_entities(&app);
+        assert_eq!(units.len(), 400, "both armies stand");
+        let mut q = app.world_mut().query::<(Entity, &UnitBanner)>();
+        let banners: Vec<(Entity, UnitBanner)> =
+            q.iter(app.world()).map(|(e, b)| (e, *b)).collect();
+        let mesh_of = |e: Entity| app.world().get::<Mesh3d>(e).unwrap().0.clone();
+        let material_of = |e: Entity| {
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(e)
+                .unwrap()
+                .0
+                .clone()
+        };
+        let of = |kind: &str, team: u8| -> Vec<Entity> {
+            units
+                .iter()
+                .filter(|(k, t, _)| k == kind && *t == team)
+                .map(|(_, _, e)| *e)
+                .collect()
+        };
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        for kind in ["yeoman", "mangonel"] {
+            let want = if kind == "yeoman" {
+                &yeoman_mesh
+            } else {
+                &mangonel_mesh
+            };
+            let mut team_materials = Vec::new();
+            for team in [0, 1] {
+                let es = of(kind, team);
+                assert!(es.len() > 1, "{kind} team {team}: {}", es.len());
+                let m = material_of(es[0]);
+                for e in &es {
+                    assert_eq!(&mesh_of(*e), want, "{kind}: the model mesh");
+                    assert_eq!(material_of(*e), m, "{kind} team {team}: one material");
+                }
+                let mat = materials.get(&m).unwrap();
+                assert!(
+                    mat.base_color_texture.is_some(),
+                    "{kind}: the team-painted texture"
+                );
+                team_materials.push(m);
+            }
+            assert_ne!(team_materials[0], team_materials[1], "{kind}");
+        }
+        // Both models are on one texture: one team material per team.
+        assert_eq!(
+            material_of(of("yeoman", 0)[0]),
+            material_of(of("mangonel", 0)[0])
+        );
+        // The Scribe's model never loaded: its fallback cylinder in the
+        // plain team colour.
+        let scribe = of("scribe", 0)[0];
+        assert_ne!(mesh_of(scribe), yeoman_mesh);
+        let scribe_mat = materials.get(&material_of(scribe)).unwrap();
+        assert!(scribe_mat.base_color_texture.is_none());
+        assert_eq!(scribe_mat.base_color, palette::team_color(0));
+        let visuals = app.world().resource::<UnitVisuals>();
+        assert_eq!(visuals.top_y(0), Some(1.3), "the Yeoman's model top");
+        assert!(visuals.is_model(0) && !visuals.is_model(1));
+        assert_eq!(visuals.top_y(1), Some(0.7), "the Scribe's fallback top");
+        // Banners: one per Mangonel, none on anyone else, top level, the
+        // shared banner mesh in the team's material, at the unit's pose
+        // times the mount.
+        let mangonels = of("mangonel", 0).len() + of("mangonel", 1).len();
+        assert_eq!(banners.len(), mangonels);
+        for (kind, team, e) in &units {
+            let carries = app.world().get::<CarriesBanner>(*e);
+            assert_eq!(carries.is_some(), kind == "mangonel", "{kind}");
+            let Some(carries) = carries else { continue };
+            let banner = carries.0;
+            let id = app.world().get::<UnitRef>(*e).unwrap().0;
+            assert!(
+                banners
+                    .iter()
+                    .any(|(b, ub)| *b == banner && ub.unit == id && ub.local.scale.x == 3.0),
+                "its banner names it and the mount"
+            );
+            assert!(app.world().get::<ChildOf>(banner).is_none());
+            assert!(app.world().get::<Pickable>(banner).is_none());
+            assert_eq!(mesh_of(banner), banner_mesh);
+            assert_eq!(
+                material_of(banner),
+                material_of(of("yeoman", *team)[0]),
+                "the banner is on the same texture: the team material"
+            );
+            let unit_tf = *app.world().get::<Transform>(*e).unwrap();
+            let banner_tf = *app.world().get::<Transform>(banner).unwrap();
+            let want = unit_tf.mul_transform(crate::buildings::mount_transform(Vec3::ZERO, &mount));
+            assert!(
+                (banner_tf.translation - want.translation).length() < 1e-4
+                    && banner_tf.rotation.abs_diff_eq(want.rotation, 1e-5)
+                    && banner_tf.scale == want.scale,
+                "{banner_tf:?} vs {want:?}"
+            );
+        }
+
+        // Past the charge (tick 20) P1's Mangonels turn west and every
+        // engine has moved: each banner still stands at its unit's pose
+        // times the mount, turned with it.
+        run_ticks(&mut app, 30);
+        let carriers: Vec<(Entity, Entity)> = {
+            let mut q = app.world_mut().query::<(Entity, &CarriesBanner)>();
+            q.iter(app.world()).map(|(e, c)| (e, c.0)).collect()
+        };
+        assert_eq!(carriers.len(), mangonels);
+        let mut turned = 0;
+        for (e, banner) in &carriers {
+            let unit_tf = *app.world().get::<Transform>(*e).unwrap();
+            let banner_tf = *app.world().get::<Transform>(*banner).unwrap();
+            let want = unit_tf.mul_transform(crate::buildings::mount_transform(Vec3::ZERO, &mount));
+            assert!(
+                (banner_tf.translation - want.translation).length() < 1e-4
+                    && banner_tf.rotation.abs_diff_eq(want.rotation, 1e-5),
+                "{banner_tf:?} vs {want:?}"
+            );
+            if unit_tf.rotation.angle_between(Quat::IDENTITY) > 1.0 {
+                turned += 1;
+            }
+        }
+        assert!(turned > 0, "some Mangonel faces away from +X");
+
+        // A Mangonel that dies takes its banner with it.
+        let (e, banner) = carriers[0];
+        let id = app.world().get::<UnitRef>(e).unwrap().0;
+        app.world_mut()
+            .resource_mut::<crate::sim_driver::PendingCommands>()
+            .push_local(sim::Command::DebugDamage {
+                target: sim::TargetId::Unit(id),
+                amount: u32::MAX,
+            });
+        run_ticks(&mut app, 4);
+        assert!(
+            !app.world().resource::<UnitEntities>().0.contains_key(&id),
+            "the Mangonel is gone"
+        );
+        assert!(app.world().get_entity(e).is_err());
+        assert!(app.world().get_entity(banner).is_err(), "so is its banner");
+        let mut q = app.world_mut().query::<&UnitBanner>();
+        assert_eq!(q.iter(app.world()).count(), mangonels - 1);
+    }
+
+    /// The walk bob: civilians, infantry and cavalry carry a [`Gait`],
+    /// siege engines and the Wain do not; a walking unit lifts off the
+    /// ground and the rest stay on it, and a unit that stops ends its step
+    /// on the ground.
+    #[test]
+    fn gait_bobs_only_moving_infantry_cavalry_and_civilians() {
+        // The step itself: mid-stride is the full lift, a footfall none.
+        let mut g = Gait::at(Vec3::ZERO);
+        assert_eq!(g.step(Vec3::ZERO, 0.1), 0.0, "at rest from the start");
+        let lift = g.step(Vec3::new(GAIT_STRIDE_M / 2.0, 0.0, 0.0), 0.016);
+        assert!((lift - GAIT_LIFT_M).abs() < 1e-5, "{lift}");
+        assert_eq!(
+            g.step(Vec3::new(GAIT_STRIDE_M / 2.0, 7.0, 0.0), 0.0),
+            lift,
+            "height does not count as walking"
+        );
+        // Stopped mid-step: it settles within one stride's settle time and
+        // stays down.
+        let mut settled = false;
+        for _ in 0..60 {
+            if g.step(Vec3::new(GAIT_STRIDE_M / 2.0, 0.0, 0.0), 0.016) == 0.0 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "{g:?}");
+        assert_eq!(g.step(Vec3::new(GAIT_STRIDE_M / 2.0, 0.0, 0.0), 1.0), 0.0);
+        assert!(gait_lift(GAIT_STRIDE_M) < 1e-6);
+        assert!(has_gait(UnitClass::Civilian) && has_gait(UnitClass::Infantry));
+        assert!(has_gait(UnitClass::Cavalry));
+        assert!(!has_gait(UnitClass::Siege) && !has_gait(UnitClass::Support));
+
+        // In the game: art_bench's armies attack-move at tick 20 (spawned
+        // during tick 0, they stand from the command delay on).
+        let mut app = unit_app(unit_fixture());
+        run_ticks(&mut app, 8);
+        let rules = app.world().non_send::<SimHandle>().rules().clone();
+        let units = unit_entities(&app);
+        assert_eq!(units.len(), 400, "both armies stand");
+        for (kind, _, e) in &units {
+            let class = rules.units.iter().find(|k| &k.id == kind).unwrap().class;
+            assert_eq!(
+                app.world().get::<Gait>(*e).is_some(),
+                has_gait(class),
+                "{kind}"
+            );
+        }
+        let mut lifted = std::collections::BTreeSet::new();
+        let walkers = ["skirmisher", "shieldbearer", "bowman", "outrider"];
+        for _ in 0..200 {
+            if walkers.iter().all(|k| lifted.contains(*k)) {
+                break;
+            }
+            app.update();
+            for (kind, _, e) in &units {
+                let Some(tf) = app.world().get::<Transform>(*e) else {
+                    continue;
+                };
+                let interp = app.world().get::<Interp>(*e).unwrap();
+                if tf.translation.y > 1e-4 {
+                    assert!(
+                        app.world().get::<Gait>(*e).is_some(),
+                        "{kind} rolls, never bobs"
+                    );
+                    assert!(tf.translation.y <= GAIT_LIFT_M + 1e-5);
+                    assert!(interp.curr.y == 0.0, "the bob is not in the pose");
+                    lifted.insert(kind.clone());
+                }
+            }
+        }
+        for kind in walkers {
+            assert!(
+                lifted.contains(kind),
+                "{kind} walked without a bob: {lifted:?}"
+            );
+        }
     }
 }

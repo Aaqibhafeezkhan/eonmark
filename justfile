@@ -125,9 +125,10 @@ data-check:
 fetch-assets:
     scripts/fetch_assets.sh
 
-# Art pass: bake the characters of tools/assets/bake.ron from the download cache into assets/models/kaykit_adventurers/ (`just art-bake --only shieldbearer`); run `just fetch-assets` first.
+# Art pass: bake the characters of tools/assets/bake.ron from the download cache into assets/models/kaykit_adventurers/ (`just art-bake --only shieldbearer`); run `just fetch-assets` first. Then checks the outputs against their bake.ron sha256 pins (scripts/check_assets.sh rule 5), which print the new hash of a file that changed.
 art-bake *ARGS:
     cargo run -p inspect_gltf --locked --release -- bake tools/assets/bake.ron --cache "${EONMARK_ASSET_CACHE:-target/asset-cache}/files" {{ARGS}}
+    scripts/check_assets.sh
 
 # Seeded bot-vs-bot matches (M5b): `just bots --seeds 1..5 --a standard --b standard --jobs 5` prints one CSV row per game; see docs/design/ai.md.
 bots *ARGS:

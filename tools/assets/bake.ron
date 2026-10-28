@@ -19,15 +19,47 @@
 //   max_texture  largest side; a larger texture is halved until it fits, only
 //                when every face keeps its colour
 //   yaw_deg      optional, default 90: turns glTF's +Z front to +X
+//   sha256       the committed output's sha256, which scripts/check_assets.sh
+//                holds it to (rule 5); a re-bake that changes a byte prints
+//                the new hash there and must be re-pinned deliberately
 //
-// Measured in slice 2 (`inspect_gltf inspect`): every character is a 41-joint
-// rig at rest in a T-pose (arm-span ratio 1.09 on the Knight), its clips are
-// LINEAR (76 on the Knight, including "Idle"), and its texture is a 1024x1024
-// PNG embedded in the .glb. Body plus kept items are 4,005 to 5,325
-// triangles. The rows are written in slice 4, e.g.
-//   (out: "models/kaykit_adventurers/shieldbearer.glb", src: "Knight.glb",
-//    keep: ["Knight_*", "Rectangle_Shield", "1H_Sword"],
-//    pose: (clip: "Idle", at_ms: 0), max_texture: 256),
+// Measured in slice 2 (`inspect_gltf inspect`) and again in slice 4: every
+// character is the same 41-joint rig at rest in a T-pose (arm-span ratio
+// 0.89 on the Mage to 1.35 on the Rogue), its 76 clips are all LINEAR (none
+// CUBICSPLINE), and its texture is a 1024x1024 PNG embedded in the .glb (the
+// hooded Rogue embeds rogue_texture.png's bytes). Each row keeps the body,
+// the head and the clothes (cape, hat, helmet) plus the items that make the
+// kind's silhouette, poses it where those items read at 40 m, and halves
+// the texture twice to 256x256 (every face keeps its colour cell).
 (
-  models: [],
+  models: [
+    // Hood, empty hands.
+    (out: "models/kaykit_adventurers/yeoman.glb", src: "Rogue_Hooded.glb",
+     keep: ["Rogue_*"], pose: (clip: "Idle", at_ms: 0), max_texture: 256,
+     sha256: "108619190837a599de6e1f3e0dbac86862b960f9e0f80312e73c6beff1c35747"),
+    // Hat and an open book held out.
+    (out: "models/kaykit_adventurers/scribe.glb", src: "Mage.glb",
+     keep: ["Mage_*", "Spellbook_open"], pose: (clip: "Spellcasting", at_ms: 0), max_texture: 256,
+     sha256: "9f3bf176875606c991e97072c67595bfaabab2caa4355581ce13ca75c5b57f93"),
+    // Two axes crossed in front (the Barbarian's round shield is dropped).
+    (out: "models/kaykit_adventurers/skirmisher.glb", src: "Barbarian.glb",
+     keep: ["Barbarian_Arm*", "Barbarian_Leg*", "Barbarian_Body", "Barbarian_Head", "Barbarian_Hat", "Barbarian_Cape", "1H_Axe", "1H_Axe_Offhand"],
+     pose: (clip: "2H_Melee_Idle", at_ms: 0), max_texture: 256,
+     sha256: "70d65293498c0ea2dde1f1338fae6ea9159f61a12dbf998ee0ea80cb08d36bdd"),
+    // Tower shield raised in front, sword.
+    (out: "models/kaykit_adventurers/shieldbearer.glb", src: "Knight.glb",
+     keep: ["Knight_*", "Rectangle_Shield", "1H_Sword"], pose: (clip: "Blocking", at_ms: 0), max_texture: 256,
+     sha256: "0bbf7ec5e758e0bbc8b89d45834ceabd72f78421cd307abce2d38be00c0180b6"),
+    // Hood up and a crossbow levelled forward: the hooded Rogue, so the
+    // team-coloured hood covers the hair (the bare Rogue's brown hair hid
+    // its team colour from the camera; 2026-10-28 review).
+    (out: "models/kaykit_adventurers/bowman.glb", src: "Rogue_Hooded.glb",
+     keep: ["Rogue_*", "2H_Crossbow"], pose: (clip: "2H_Ranged_Aiming", at_ms: 0), max_texture: 256,
+     sha256: "b464d69a3117e4bd2f367332a4d2b78478f87b199ab939983096512023944c79"),
+    // The Knight with a two-handed sword, drawn 1.41x the Shieldbearer's
+    // height (no CC0 horse is reachable).
+    (out: "models/kaykit_adventurers/outrider.glb", src: "Knight.glb",
+     keep: ["Knight_*", "2H_Sword"], pose: (clip: "2H_Melee_Idle", at_ms: 0), max_texture: 256,
+     sha256: "9ba4b11f3fcbff0a0444732f1d198fffdef15a99588ead00e3d40106fe25db1a"),
+  ],
 )

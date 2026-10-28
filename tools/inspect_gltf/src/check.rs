@@ -5,17 +5,31 @@
 //! indexed triangles with `POSITION`, `NORMAL` and `TEXCOORD_0` and one base
 //! texture, no cameras, lights, skins or animations, ground contact, team
 //! area against `team_swatches`, the reserved-rect rule and the 1.4x
-//! silhouette rule within a rig group. It prints one `ok` line per Scene
+//! silhouette rule within a rig group (units sharing a skeleton, or a
+//! file, and a base texture: variants of one character, see
+//! `same_rig_group`). It prints one `ok` line per Scene
 //! with triangles, bytes, top, size, team share and the facing it finds
 //! ([`facing`]), plus a suggested `scale_x100` for a building's footprint
 //! or a unit's look height.
+//!
+//! Owner decision 12 of the art pass: a building's team share is measured
+//! on the model plus its team banner (`banner_at`, the `banner` model placed
+//! at its data scale), against the same floors, and the line prints the
+//! banner's height (and on a Town the Seat flag's). Every mount on a
+//! building keeps its banner or flag inside the footprint in plan view, so
+//! no cloth hangs over a neighbour's tiles, into the terrain beside it or
+//! over the units walking there (a building's own rule, not a unit's: a
+//! unit's banner moves with it). On a Town the Seat flag flies wholly
+//! above the Town's own banner, so a Seat reads apart from any other Town
+//! by its place. A banner taller than its building is only a note: its
+//! size is the owner's to judge at the 40 m sign-off.
 
 use crate::bake::rig_key;
 use crate::image::Rgba;
 use crate::math::{Mat4, Vec3, cross, sub, triangle_area};
 use crate::model::{Model, bounds};
 use crate::uv::{Cover, Mask, Rect, face_rect};
-use rules::visuals::{DecorAt, Part, Primitive, Visual, Visuals};
+use rules::visuals::{DecorAt, Mount, Part, Primitive, Visual, Visuals};
 use rules::{BuildingKind, UnitKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +45,9 @@ pub const GROUND_Y: (f32, f32) = (-0.02, 0.05);
 pub const CENTRE_TOLERANCE: f32 = 0.10;
 /// The same for terrain props, which are jittered anyway.
 pub const PROP_CENTRE_TOLERANCE: f32 = 0.5;
+/// How far a banner or the Seat flag may reach past its building's
+/// footprint edge, metres (rounding; the rule is that it stays inside).
+pub const FOOTPRINT_TOLERANCE: f32 = 0.01;
 /// Share of a footprint side a building model should fill.
 pub const FOOTPRINT_FILL: f32 = 0.95;
 
@@ -112,18 +129,22 @@ enum Use<'a> {
     Site,
     Rubble,
     Flag,
+    /// The team banner model (owner decision 12 of the art pass).
+    Banner,
     Prop(DecorAt),
 }
 
 struct SceneRef<'a> {
     path: &'a str,
     scale_x100: u32,
-    y_offset_x100: i32,
+    offset_x100: (i32, i32, i32),
     yaw_deg: i32,
     nodes: &'a [String],
     parts: &'a [Part],
     team: Option<&'a str>,
     fallback: Option<&'a Visual>,
+    banner_at: Option<&'a Mount>,
+    seat_flag_at: Option<&'a Mount>,
 }
 
 fn scene_ref(v: &Visual) -> Option<SceneRef<'_>> {
@@ -133,19 +154,29 @@ fn scene_ref(v: &Visual) -> Option<SceneRef<'_>> {
             scale_x100,
             y_offset_tiles_x100,
             yaw_deg,
+            x_offset_tiles_x100,
+            z_offset_tiles_x100,
             nodes,
             parts,
             team,
             fallback,
+            banner_at,
+            seat_flag_at,
         } => Some(SceneRef {
             path,
             scale_x100: *scale_x100,
-            y_offset_x100: *y_offset_tiles_x100,
+            offset_x100: (
+                *x_offset_tiles_x100,
+                *y_offset_tiles_x100,
+                *z_offset_tiles_x100,
+            ),
             yaw_deg: *yaw_deg,
             nodes,
             parts,
             team: team.as_deref(),
             fallback: fallback.as_deref(),
+            banner_at: banner_at.as_ref(),
+            seat_flag_at: seat_flag_at.as_ref(),
         }),
         _ => None,
     }
@@ -160,11 +191,23 @@ struct Placed {
     problems: Vec<String>,
 }
 
-/// `T(0, lift) * S(scale) * R(yaw)`: the game's placement of a Scene.
+/// `T(x, lift, z) * S(scale) * R(yaw)`: the game's placement of a Scene
+/// (`crates/game/src/models.rs`, `scene_transform`).
 fn scene_matrix(s: &SceneRef) -> Mat4 {
-    Mat4::translation([0.0, s.y_offset_x100 as f32 / 100.0, 0.0])
+    let (x, y, z) = s.offset_x100;
+    Mat4::translation([x as f32 / 100.0, y as f32 / 100.0, z as f32 / 100.0])
         .mul(&Mat4::scale(s.scale_x100 as f32 / 100.0))
         .mul(&Mat4::yaw_deg(s.yaw_deg))
+}
+
+/// `T(offset) * R(yaw) * S(scale)`: a banner or the Seat flag on its
+/// building, from the footprint centre on the ground (the game's
+/// `buildings::mount_transform`).
+fn mount_matrix(m: &Mount) -> Mat4 {
+    let (x, y, z) = m.offset_x100;
+    Mat4::translation([x as f32 / 100.0, y as f32 / 100.0, z as f32 / 100.0])
+        .mul(&Mat4::yaw_deg(m.yaw_deg))
+        .mul(&Mat4::scale(m.scale_x100 as f32 / 100.0))
 }
 
 /// `T(offset) * R(yaw) * S(scale)`: a part in its scene's model space.
@@ -175,7 +218,8 @@ fn part_matrix(p: &Part) -> Mat4 {
         .mul(&Mat4::scale(p.scale_x100 as f32 / 100.0))
 }
 
-fn place(s: &SceneRef, assets: &Path, budgets: &Budgets) -> Placed {
+/// Load and merge the Scene `s`, placed by `outer * scene_matrix(s)`.
+fn place(s: &SceneRef, assets: &Path, budgets: &Budgets, outer: &Mat4) -> Placed {
     let mut placed = Placed {
         tris: Vec::new(),
         texture: None,
@@ -183,7 +227,7 @@ fn place(s: &SceneRef, assets: &Path, budgets: &Budgets) -> Placed {
         rig: String::new(),
         problems: Vec::new(),
     };
-    let scene = scene_matrix(s);
+    let scene = outer.mul(&scene_matrix(s));
     let mut sources: Vec<(&str, &[String], Mat4)> = vec![(s.path, s.nodes, Mat4::IDENTITY)];
     for p in s.parts {
         sources.push((&p.path, &p.nodes, part_matrix(p)));
@@ -334,6 +378,71 @@ pub fn facing(tris: &[([Vec3; 3], [[f32; 2]; 3])]) -> Option<(&'static str, u32)
     Some((NAMES[best], (100.0 * area[best] / total).round() as u32))
 }
 
+/// The team and whole surface of a placed model's faces against the
+/// swatch `key`, and how many faces straddle a rect edge.
+struct Surface {
+    team: f64,
+    straddles: usize,
+}
+
+/// Measure `faces` (texel rect and area of each triangle) of a model whose
+/// base texture is `tex` against `team_swatches[key]`: an unknown key or a
+/// rect outside the texture is a problem.
+fn swatch_surface(
+    faces: &[(Rect, f32)],
+    tex: &Rgba,
+    key: &str,
+    visuals: &Visuals,
+) -> Result<Surface, String> {
+    let Some(swatch) = visuals.team_swatches.get(key) else {
+        return Err(format!("team {key:?} is not a key of team_swatches"));
+    };
+    let rects: Vec<Rect> = swatch
+        .rects
+        .iter()
+        .map(|&(x, y, w, h)| Rect { x, y, w, h })
+        .collect();
+    if let Some(r) = rects
+        .iter()
+        .find(|r| r.x + r.w > tex.width || r.y + r.h > tex.height)
+    {
+        return Err(format!(
+            "team_swatches[{key:?}] rect {r} lies outside the {}x{} texture",
+            tex.width, tex.height
+        ));
+    }
+    let mask = Mask::from_rects(tex.width, tex.height, &rects);
+    let (mut team, mut straddles) = (0.0f64, 0);
+    for (r, a) in faces {
+        match mask.cover(r) {
+            Cover::Inside => team += f64::from(*a),
+            Cover::Straddles => straddles += 1,
+            Cover::Outside => {}
+        }
+    }
+    Ok(Surface { team, straddles })
+}
+
+/// How far placed triangles (metres from a building's footprint centre)
+/// reach past the edge of `kind`'s footprint in plan view, if they do.
+fn past_footprint(tris: &[([Vec3; 3], [[f32; 2]; 3])], kind: &BuildingKind) -> Option<f32> {
+    let (lo, hi) = bounds(tris.iter().flat_map(|(p, _)| p.iter()))?;
+    let (hx, hz) = (
+        kind.width_tiles as f32 / 2.0,
+        kind.height_tiles as f32 / 2.0,
+    );
+    let past = (-hx - lo[0])
+        .max(hi[0] - hx)
+        .max(-hz - lo[2])
+        .max(hi[2] - hz);
+    (past > FOOTPRINT_TOLERANCE).then_some(past)
+}
+
+/// Height of placed triangles (top minus base), metres; 0 for none.
+fn height(tris: &[([Vec3; 3], [[f32; 2]; 3])]) -> f32 {
+    bounds(tris.iter().flat_map(|(p, _)| p.iter())).map_or(0.0, |(lo, hi)| hi[1] - lo[1])
+}
+
 /// The nominal height of a unit's Primitive or Body look, metres.
 fn look_height(v: &Visual, kind: &UnitKind) -> Option<f32> {
     let r = kind.radius_tiles_x100 as f32 / 100.0;
@@ -423,6 +532,9 @@ pub fn check_visuals(
     if let Some(f) = &visuals.seat_flag {
         entries.push(("seat_flag".into(), Use::Flag, f));
     }
+    if let Some(b) = &visuals.banner {
+        entries.push(("banner".into(), Use::Banner, b));
+    }
     for (key, decor) in &visuals.terrain {
         for (i, look) in decor.looks.iter().enumerate() {
             entries.push((
@@ -439,7 +551,7 @@ pub fn check_visuals(
     for (field, usage, visual) in entries {
         let Some(s) = scene_ref(visual) else { continue };
         report.scenes += 1;
-        let placed = place(&s, assets, budgets);
+        let placed = place(&s, assets, budgets, &Mat4::IDENTITY);
         let mut problems = placed.problems.clone();
         let mut notes = Vec::new();
         all_files.extend(placed.files.keys().cloned());
@@ -448,7 +560,7 @@ pub fn check_visuals(
             Use::Unit(_) => budgets.unit_triangles,
             Use::Building(_) => budgets.building_triangles,
             Use::Site | Use::Rubble => budgets.site_triangles,
-            Use::Flag => budgets.flag_triangles,
+            Use::Flag | Use::Banner => budgets.flag_triangles,
             Use::Prop(DecorAt::Interior) => budgets.interior_prop_triangles,
             Use::Prop(_) => budgets.edge_prop_triangles,
         };
@@ -484,7 +596,7 @@ pub fn check_visuals(
         }
         let mut texture_desc = "none".to_string();
         let mut faces = Vec::new();
-        let mut team_permille = None;
+        let mut model_team: Option<f64> = None;
         if let Some((tex, name, _)) = &placed.texture {
             texture_desc = format!("{}x{}", tex.width, tex.height);
             let base = Path::new(name)
@@ -508,54 +620,154 @@ pub fn check_visuals(
                 ));
             }
             if let Some(key) = s.team {
-                match visuals.team_swatches.get(key) {
-                    None => problems.push(format!("team {key:?} is not a key of team_swatches")),
-                    Some(swatch) => {
-                        let rects: Vec<Rect> = swatch
-                            .rects
-                            .iter()
-                            .map(|&(x, y, w, h)| Rect { x, y, w, h })
-                            .collect();
-                        if let Some(r) = rects
-                            .iter()
-                            .find(|r| r.x + r.w > tex.width || r.y + r.h > tex.height)
-                        {
-                            problems.push(format!("team_swatches[{key:?}] rect {r} lies outside the {texture_desc} texture"));
-                        }
-                        let mask = Mask::from_rects(tex.width, tex.height, &rects);
-                        let (mut team_area, mut area, mut straddles) = (0.0f64, 0.0f64, 0);
-                        for (r, a) in &faces {
-                            area += f64::from(*a);
-                            match mask.cover(r) {
-                                Cover::Inside => team_area += f64::from(*a),
-                                Cover::Straddles => straddles += 1,
-                                Cover::Outside => {}
-                            }
-                        }
-                        let permille = if area > 0.0 {
-                            (1000.0 * team_area / area).round() as u32
-                        } else {
-                            0
-                        };
-                        team_permille = Some(permille);
-                        let floor = match usage {
-                            Use::Unit(k) if k.id == "supply_wain" => budgets.wain_team_permille,
-                            Use::Unit(_) => budgets.unit_team_permille,
-                            Use::Building(_) => budgets.building_team_permille,
-                            Use::Flag => budgets.flag_team_permille,
-                            _ => 0,
-                        };
-                        if permille < floor {
-                            problems
-                                .push(format!("team area {permille}‰ is under the {floor}‰ floor"));
-                        }
-                        if straddles > 0 {
+                match swatch_surface(&faces, tex, key, visuals) {
+                    Err(p) => problems.push(p),
+                    Ok(surface) => {
+                        if surface.straddles > 0 {
                             problems.push(format!(
-                                "{straddles} face(s) straddle a team rect edge, so the repaint would split them (reserved-rect rule)"
+                                "{} face(s) straddle a team rect edge, so the repaint would split them (reserved-rect rule)",
+                                surface.straddles
+                            ));
+                        }
+                        model_team = Some(surface.team);
+                    }
+                }
+            }
+        }
+        let model_area: f64 = faces.iter().map(|(_, a)| f64::from(*a)).sum();
+
+        // Owner decision 12: the team banner (and on a Seat the Seat flag)
+        // at the building's mounts, measured at their data scale.
+        let mut mounts_desc = String::new();
+        let mut banner_team: Option<(f64, f64)> = None;
+        let mut banner_top = None;
+        if let (Use::Building(_) | Use::Unit(_), Some(mount)) = (usage, s.banner_at) {
+            match visuals.banner.as_ref().and_then(scene_ref) {
+                None => problems.push(
+                    "banner_at names where the banner stands, but there is no banner model".into(),
+                ),
+                Some(b) => {
+                    let bp = place(&b, assets, budgets, &mount_matrix(mount));
+                    problems.extend(bp.problems.iter().map(|p| format!("banner: {p}")));
+                    all_files.extend(bp.files.keys().cloned());
+                    let h = height(&bp.tris);
+                    banner_top = bounds(bp.tris.iter().flat_map(|(p, _)| p.iter())).map(|b| b.1[1]);
+                    mounts_desc.push_str(&format!(" banner={h:.2}m"));
+                    if let Use::Building(kind) = usage {
+                        if let Some(past) = past_footprint(&bp.tris, kind) {
+                            problems.push(format!(
+                                "the banner reaches {past:.2} m past the {}x{} footprint's edge, over a neighbour's tiles (a building or prop beside it would be pierced, units there covered); keep banner_at inside the footprint",
+                                kind.width_tiles, kind.height_tiles
+                            ));
+                        }
+                        if tris > 0 && h > size[1] {
+                            notes.push(format!(
+                                "the banner stands {h:.2} m tall, over the building's {:.2} m (a size for the owner to judge at the 40 m sign-off)",
+                                size[1]
                             ));
                         }
                     }
+                    let area: f64 = bp
+                        .tris
+                        .iter()
+                        .map(|(p, _)| f64::from(triangle_area(p[0], p[1], p[2])))
+                        .sum();
+                    let mut team = 0.0;
+                    if let (Some(key), Some((tex, _, _))) = (b.team, &bp.texture) {
+                        let bfaces: Vec<(Rect, f32)> = bp
+                            .tris
+                            .iter()
+                            .map(|(p, uv)| {
+                                (
+                                    face_rect(*uv, tex.width, tex.height),
+                                    triangle_area(p[0], p[1], p[2]),
+                                )
+                            })
+                            .collect();
+                        match swatch_surface(&bfaces, tex, key, visuals) {
+                            Err(p) => problems.push(format!("banner: {p}")),
+                            Ok(surface) => {
+                                if surface.straddles > 0 {
+                                    problems.push(format!(
+                                        "banner: {} face(s) straddle a team rect edge (reserved-rect rule)",
+                                        surface.straddles
+                                    ));
+                                }
+                                team = surface.team;
+                            }
+                        }
+                    }
+                    banner_team = Some((team, area));
                 }
+            }
+        }
+        if let (Use::Building(kind), Some(mount)) = (usage, s.seat_flag_at)
+            && kind.town
+        {
+            match visuals.seat_flag.as_ref().and_then(scene_ref) {
+                None => problems.push(
+                    "seat_flag_at names where the Seat flag stands, but there is no seat_flag model"
+                        .into(),
+                ),
+                Some(f) => {
+                    let fp = place(&f, assets, budgets, &mount_matrix(mount));
+                    problems.extend(fp.problems.iter().map(|p| format!("seat flag: {p}")));
+                    let h = height(&fp.tris);
+                    mounts_desc.push_str(&format!(" seat_flag={h:.2}m"));
+                    if let Some(past) = past_footprint(&fp.tris, kind) {
+                        problems.push(format!(
+                            "the Seat flag reaches {past:.2} m past the {}x{} footprint's edge; keep seat_flag_at inside the footprint",
+                            kind.width_tiles, kind.height_tiles
+                        ));
+                    }
+                    let foot = bounds(fp.tris.iter().flat_map(|(p, _)| p.iter())).map(|b| b.0[1]);
+                    if let (Some(foot), Some(top)) = (foot, banner_top)
+                        && foot <= top
+                    {
+                        problems.push(format!(
+                            "the Seat flag's foot at {foot:.2} m stands under the top of the Town's banner at {top:.2} m; it must fly wholly above that banner, so a Seat reads apart from any other Town"
+                        ));
+                    }
+                }
+            }
+        }
+        let mut model_team_desc = String::new();
+        let team_permille = match (model_team, banner_team) {
+            (None, None) => None,
+            (model, banner) => {
+                let (bt, ba) = banner.unwrap_or((0.0, 0.0));
+                let total = model_area + ba;
+                let share = |team: f64, area: f64| {
+                    if area > 0.0 {
+                        (1000.0 * team / area).round() as u32
+                    } else {
+                        0
+                    }
+                };
+                if banner.is_some() {
+                    model_team_desc =
+                        format!(" model_team={}‰", share(model.unwrap_or(0.0), model_area));
+                }
+                Some(share(model.unwrap_or(0.0) + bt, total))
+            }
+        };
+        if let Some(permille) = team_permille {
+            let floor = match usage {
+                Use::Unit(k) if k.id == "supply_wain" => budgets.wain_team_permille,
+                Use::Unit(_) => budgets.unit_team_permille,
+                Use::Building(_) => budgets.building_team_permille,
+                Use::Flag | Use::Banner => budgets.flag_team_permille,
+                _ => 0,
+            };
+            let with = if banner_team.is_some() {
+                " (model plus banner)"
+            } else {
+                ""
+            };
+            if permille < floor {
+                problems.push(format!(
+                    "team area {permille}‰{with} is under the {floor}‰ floor"
+                ));
             }
         }
         let mut suggest = String::new();
@@ -600,7 +812,7 @@ pub fn check_visuals(
             (_, Some((dir, share))) => format!("{dir}({share}%)"),
         };
         let measures = format!(
-            "tris={tris} bytes={bytes} top={:.2} size={:.2}x{:.2}x{:.2} team={team_desc} facing={facing_desc} texture={texture_desc}{suggest}",
+            "tris={tris} bytes={bytes} top={:.2} size={:.2}x{:.2}x{:.2} team={team_desc}{model_team_desc}{mounts_desc} facing={facing_desc} texture={texture_desc}{suggest}",
             hi[1], size[0], size[1], size[2]
         );
         if problems.is_empty() {
@@ -677,7 +889,7 @@ pub fn check_visuals(
             let (Use::Unit(_), Use::Unit(_)) = (a.usage, b.usage) else {
                 continue;
             };
-            if a.rig != b.rig {
+            if !same_rig_group(a, b) {
                 continue;
             }
             let apart = (0..3).any(|c| {
@@ -700,6 +912,20 @@ pub fn check_visuals(
         .lines
         .push(format!("files: {} distinct", all_files.len()));
     report
+}
+
+/// Whether two measured units are variants of one character, whose
+/// silhouettes the 1.4x rule compares: the same rig (the baked
+/// `asset.extras.rig`, the hash of a skin's joint names, else the file)
+/// and the same base texture. Art slice 4 added the texture: every `KayKit`
+/// Adventurers character is skinned to one 41-joint skeleton, so the rig
+/// alone would hold the Knight, the Mage, the Barbarian and both Rogues in
+/// one group, while their bodies, heads and clothes differ; each one's
+/// atlas (`knight_texture`, `mage_texture`, ...) is what its variants
+/// share (the hooded Rogue embeds the Rogue's bytes, so the Yeoman and the
+/// Bowman are compared, as are the Shieldbearer and the Outrider).
+fn same_rig_group(a: &Measured, b: &Measured) -> bool {
+    a.rig == b.rig && a.texture_hash == b.texture_hash
 }
 
 /// Load the rules under `data` and check `visuals.ron` against `assets`.
@@ -1169,5 +1395,260 @@ mod tests {
             "{text}"
         );
         assert_eq!(facing(&[]), None);
+    }
+
+    /// Owner decision 12 of the art pass: a building's team share is
+    /// measured on the model plus its banner at the mount's scale, against
+    /// the same floor for every kind; a banner or Seat flag that reaches
+    /// past the footprint fails, as does a Seat flag whose foot is not
+    /// above the Town's banner; a banner taller than its building is a
+    /// note; the banner model gets its own line with its facing; and the
+    /// Scene's x/z offsets centre an off-centre model.
+    #[test]
+    fn check_measures_model_plus_banner_and_mounts() {
+        let dir = TempDir::new("check-banner");
+        let m = dir.path().join("m");
+        std::fs::create_dir_all(&m).unwrap();
+        // A neutral 2 x 1.5 x 2 m barn (20 m², none on team texels) and a
+        // 0.1 x 0.5 x 1 m flag whose four sides sample the team rect.
+        box_gltf(&m, "barn", [2.0, 1.5, 2.0], 0.0, false);
+        box_gltf(&m, "flag", [0.1, 0.5, 1.0], 0.0, true);
+        let rules = rules::Rules::load(repo_root().join("data")).unwrap();
+        let flag = r#"Scene(path: "m/flag.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 270, team: Some("t"))"#;
+        let run = |town: &str, sites: &str| {
+            let text = format!(
+                r#"(units: {{}}, buildings: {{ "town": {town} }},
+                   team_swatches: {{ "t": (rects: [(4, 0, 4, 4)], desaturate_permille: 0) }},
+                   banner: Some({flag}), seat_flag: Some({flag}), sites: [{sites}])"#
+            );
+            let v: Visuals = ron::from_str(&text).unwrap();
+            check_visuals(
+                &v,
+                &rules.units,
+                &rules.buildings,
+                dir.path(),
+                &Budgets::default(),
+            )
+            .text()
+        };
+        // The flag is 1 m long and 0.1 m deep after its 270° yaw; the
+        // Town's footprint is 3 x 3 m.
+        let town_at = |banner: u32, at: (i32, i32), seat_flag: u32, seat_flag_y: i32| {
+            format!(
+                r#"Scene(path: "m/barn.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("t"), banner_at: Some((offset_x100: ({}, 0, {}), scale_x100: {banner}, yaw_deg: 30)), seat_flag_at: Some((offset_x100: (0, {seat_flag_y}, 0), scale_x100: {seat_flag})))"#,
+                at.0, at.1
+            )
+        };
+        let town = |banner: u32, seat_flag: u32| town_at(banner, (80, 80), seat_flag, 150);
+        let site = r#"Primitive(Cuboid)"#;
+
+        // At 1.5x the flag adds 2.475 of 2.925 m² on team texels:
+        // 2.475 / 22.925 = 108‰, over the 100‰ floor; the model alone is 0‰.
+        let text = run(&town(150, 250), site);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ok buildings[\"town\"]"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            line.contains(" team=108‰ model_team=0‰ banner=0.75m seat_flag=1.25m "),
+            "{line}"
+        );
+        assert!(text.ends_with("check: ok 3 scene(s)\n"), "{text}");
+        // The banner model is checked like the Seat flag, with its facing:
+        // its broad sides turned toward the camera (+Z) by the 270° yaw.
+        let banner = text
+            .lines()
+            .find(|l| l.starts_with("ok banner m/flag.gltf"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            banner.contains(" team=846‰ ") && banner.contains(" facing=+Z("),
+            "{banner}"
+        );
+
+        // At its own size the banner is too small: 1.1 / 21.3 = 52‰.
+        let text = run(&town(100, 250), site);
+        assert!(
+            text.contains(
+                "FAIL buildings[\"town\"] m/barn.gltf: team area 52‰ (model plus banner) is under the 100‰ floor"
+            ),
+            "{text}"
+        );
+        // At 4x, 1 m east of the centre, the turned banner reaches 1.13 m
+        // past the footprint's east edge: it fails however much team
+        // colour it adds. Its height over the building's is only a note.
+        let text = run(&town(400, 600), site);
+        assert!(
+            text.contains(
+                "FAIL buildings[\"town\"] m/barn.gltf: the banner reaches 1.13 m past the 3x3 footprint's edge"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("under the 100‰ floor"), "{text}");
+        assert!(
+            text.contains(
+                "note buildings[\"town\"]: the banner stands 2.00 m tall, over the building's 1.50 m"
+            ),
+            "{text}"
+        );
+        // Centred, a 1.60 m banner stays inside and passes, with the note.
+        let text = run(&town_at(320, (0, 0), 250, 250), site);
+        assert!(text.contains("ok buildings[\"town\"]"), "{text}");
+        assert!(
+            text.contains("the banner stands 1.60 m tall, over the building's 1.50 m"),
+            "{text}"
+        );
+        assert!(text.ends_with("check: ok 3 scene(s)\n"), "{text}");
+        // So does a Seat flag 4 m long over a 3 m footprint.
+        let text = run(&town(150, 400), site);
+        assert!(
+            text.contains(
+                "FAIL buildings[\"town\"] m/barn.gltf: the Seat flag reaches 0.50 m past the 3x3 footprint's edge"
+            ),
+            "{text}"
+        );
+        // A Seat flag standing on the ground beside the banner does not
+        // read apart from it: its foot must be above the banner's top.
+        let text = run(&town_at(150, (80, 80), 160, 0), site);
+        assert!(
+            text.contains(
+                "the Seat flag's foot at 0.00 m stands under the top of the Town's banner at 0.75 m"
+            ),
+            "{text}"
+        );
+
+        // The x/z offsets: the barn with a copy of itself 0.6 m along +X
+        // is centred 0.3 m off; x_offset_tiles_x100: -30 centres it.
+        let pair = |offset: &str| {
+            format!(
+                r#"Scene(path: "m/barn.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, parts: [(path: "m/barn.gltf", offset_x100: (60, 0, 0))]{offset})"#
+            )
+        };
+        let text = run(&town(150, 250), &pair(""));
+        assert!(
+            text.contains("FAIL sites[0] m/barn.gltf: its x/z centre is (0.300, 0.000) m"),
+            "{text}"
+        );
+        let text = run(&town(150, 250), &pair(", x_offset_tiles_x100: -30"));
+        assert!(text.contains("ok sites[0] m/barn.gltf"), "{text}");
+        let text = run(
+            &town(150, 250),
+            &pair(", x_offset_tiles_x100: -30, z_offset_tiles_x100: 25"),
+        );
+        assert!(
+            text.contains("FAIL sites[0] m/barn.gltf: its x/z centre is (0.000, 0.250) m"),
+            "{text}"
+        );
+    }
+
+    /// Art slice 4 (owner decision 12): a unit's `banner_at` plants the
+    /// team banner on it too, and its team share is measured on model plus
+    /// banner against the unit floor (200‰). A unit's banner may stand
+    /// taller than the unit (a standard on a pole over a siege engine),
+    /// unlike a building's.
+    #[test]
+    fn check_measures_a_unit_banner() {
+        let dir = TempDir::new("check-unit-banner");
+        let m = dir.path().join("m");
+        std::fs::create_dir_all(&m).unwrap();
+        box_gltf(&m, "cart", [2.0, 1.5, 2.0], 0.0, false);
+        box_gltf(&m, "flag", [0.1, 0.5, 1.0], 0.0, true);
+        let rules = rules::Rules::load(repo_root().join("data")).unwrap();
+        let run = |banner: u32| {
+            let text = format!(
+                r#"(units: {{ "mangonel": Scene(path: "m/cart.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, team: Some("t"), banner_at: Some((offset_x100: (-80, 0, 80), scale_x100: {banner}))) }},
+                   buildings: {{}},
+                   team_swatches: {{ "t": (rects: [(4, 0, 4, 4)], desaturate_permille: 0) }},
+                   banner: Some(Scene(path: "m/flag.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 270, team: Some("t"))))"#
+            );
+            let v: Visuals = ron::from_str(&text).unwrap();
+            check_visuals(
+                &v,
+                &rules.units,
+                &rules.buildings,
+                dir.path(),
+                &Budgets::default(),
+            )
+            .text()
+        };
+        // At 1.5x the banner lifts the neutral cart to 108‰: under 200‰.
+        let text = run(150);
+        assert!(
+            text.contains(
+                "FAIL units[\"mangonel\"] m/cart.gltf: team area 108‰ (model plus banner) is under the 200‰ floor"
+            ),
+            "{text}"
+        );
+        // At 4x it stands 2.00 m over the 1.5 m cart and passes: 17.6 of
+        // 40.8 m² on team texels.
+        let text = run(400);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ok units[\"mangonel\"]"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            line.contains(" team=431‰ model_team=0‰ banner=2.00m "),
+            "{line}"
+        );
+        assert!(!text.contains("taller than"), "{text}");
+    }
+
+    /// Art slice 4: the silhouette rule compares units of one rig only when
+    /// they also share a base texture. Two bakes of one skeleton with
+    /// different textures (two characters on a shared rig) are never
+    /// compared; with the same texture they clash.
+    #[test]
+    fn silhouettes_compare_one_rig_on_one_texture() {
+        let dir = TempDir::new("check-rig-texture");
+        let cache = dir.path().join("cache");
+        let assets = dir.path().join("assets");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("rig.glb"),
+            crate::testkit::rig_glb("LINEAR", false),
+        )
+        .unwrap();
+        std::fs::write(
+            cache.join("other.png"),
+            crate::testkit::atlas(true).encode_png().unwrap(),
+        )
+        .unwrap();
+        let bake_ron = dir.path().join("bake.ron");
+        std::fs::write(
+            &bake_ron,
+            r#"(models: [
+                (out: "m/a.glb", src: "rig.glb", keep: ["Body"], pose: (clip: "Bend", at_ms: 0), max_texture: 8),
+                (out: "m/b.glb", src: "rig.glb", keep: ["Body"], pose: (clip: "Bend", at_ms: 0), max_texture: 8),
+                (out: "m/c.glb", src: "rig.glb", texture: Some("other.png"), keep: ["Body"], pose: (clip: "Bend", at_ms: 0), max_texture: 8),
+            ])"#,
+        )
+        .unwrap();
+        crate::bake::bake(&bake_ron, &cache, &assets, None).unwrap();
+        let rig = |f: &str| crate::bake::rig_key(&Model::load(&assets.join(f)).unwrap());
+        assert_eq!(rig("m/a.glb"), rig("m/c.glb"), "one skeleton");
+        let rules = rules::Rules::load(repo_root().join("data")).unwrap();
+        let unit = |kind: &str, file: &str| {
+            format!(
+                r#""{kind}": Scene(path: "m/{file}", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0),"#
+            )
+        };
+        let run = |units: String| {
+            let v: Visuals =
+                ron::from_str(&format!("(units: {{ {units} }}, buildings: {{}})")).unwrap();
+            check_visuals(
+                &v,
+                &rules.units,
+                &rules.buildings,
+                &assets,
+                &Budgets::default(),
+            )
+            .text()
+        };
+        let text = run(unit("yeoman", "a.glb") + &unit("scribe", "c.glb"));
+        assert!(!text.contains("less than 1.4x apart"), "{text}");
+        let text = run(unit("yeoman", "a.glb") + &unit("scribe", "b.glb"));
+        assert!(
+            text.contains(r#"FAIL units["yeoman"] m/a.glb: same rig as units["scribe"] and less than 1.4x apart"#),
+            "{text}"
+        );
     }
 }

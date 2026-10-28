@@ -14,7 +14,11 @@
 #      is the row's pin. ATTRIBUTION.md says Modifications `none` (or
 #      `renamed from`) for these files, and this is what holds it to that;
 #      a deliberate change must update the row and its Modifications text.
-#      Checked only when the manifest exists under the root.
+#      Checked only when the manifest exists under the root. Likewise every
+#      row of tools/assets/bake.ron (art slice 4: the baked characters,
+#      script-modified CC0 whose Modifications the bake records) names its
+#      output's sha256 after its `out`, and the committed output matches
+#      it: a re-bake that changes a byte must re-pin deliberately.
 # An empty or missing assets/ directory passes.
 #
 # --self-test proves the injection clause of ROADMAP M7's asset line: it
@@ -22,7 +26,8 @@
 # and requires this script to exit 1 naming that path on stderr, then to
 # exit 0 once the file is removed again. It then proves rule 5 on a second
 # root holding assets/ and tools/assets/sources.tsv: one changed byte in a
-# pinned file must exit 1 naming that file, and the original bytes exit 0.
+# pinned file must exit 1 naming that file, and the original bytes exit 0;
+# then the same for the first baked output of tools/assets/bake.ron.
 #
 # Usage: scripts/check_assets.sh [repo-root | --self-test]
 set -euo pipefail
@@ -87,7 +92,31 @@ if [ "${1:-}" = "--self-test" ]; then
       echo "check_assets: self-test FAILED: the copy fails with $pinned restored" >&2
       exit 1
     fi
-    echo "check_assets: self-test ok (an unattributed file fails with its path; removing it passes; a changed pinned file fails with its path; restoring it passes)"
+    # The same for a baked output pinned in bake.ron.
+    baked=""
+    if [ -f "$repo/tools/assets/bake.ron" ]; then
+      cp "$repo/tools/assets/bake.ron" "$tmp/pins/tools/assets/bake.ron"
+      baked="$(grep -v '^[[:space:]]*//' "$repo/tools/assets/bake.ron" | grep -oE 'out: *"[^"]*"' | head -1 | sed -E 's/^out: *"([^"]*)"$/\1/' || true)"
+    fi
+    if [ -n "$baked" ]; then
+      cp "$tmp/pins/assets/$baked" "$tmp/original"
+      printf 'x' >>"$tmp/pins/assets/$baked"
+      set +e
+      "$self" "$tmp/pins" >"$tmp/out" 2>"$tmp/err"
+      code=$?
+      set -e
+      if [ "$code" -ne 1 ] || ! grep -F "$baked" "$tmp/err"; then
+        echo "check_assets: self-test FAILED: a changed byte in the baked $baked gave exit $code without naming it" >&2
+        cat "$tmp/out" "$tmp/err" >&2
+        exit 1
+      fi
+      cp "$tmp/original" "$tmp/pins/assets/$baked"
+      if ! "$self" "$tmp/pins"; then
+        echo "check_assets: self-test FAILED: the copy fails with $baked restored" >&2
+        exit 1
+      fi
+    fi
+    echo "check_assets: self-test ok (an unattributed file fails with its path; removing it passes; a changed pinned file fails with its path; restoring it passes${baked:+; the same for the baked $baked})"
   else
     echo "check_assets: self-test ok (an unattributed file fails with its path; removing it passes; no pinned file to change)"
   fi
@@ -208,6 +237,49 @@ if [ -f "$manifest" ]; then
   done <"$manifest"
   if [ "$status" -eq 0 ]; then
     echo "check_assets: pins ok ($pins vendored files match $manifest)"
+  fi
+fi
+
+# --- rule 5 (art slice 4): baked outputs match their bake.ron pins ----------
+bake="tools/assets/bake.ron"
+if [ -f "$bake" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d' ' -f1; }
+  else
+    sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+  fi
+  baked=0
+  before="$status"
+  # `out` and `sha256` values in file order, comments skipped: each row's
+  # out must be followed by its own sha256 before the next out.
+  pending=""
+  while read -r key value; do
+    case "$key" in
+      out)
+        [ -n "$pending" ] && fail "$pending in $bake has no sha256 pin; add sha256: \"$(sha256 "$assets_dir/$pending" 2>/dev/null || echo '<hash>')\" to its row"
+        pending="$value"
+        ;;
+      sha256)
+        if [ -z "$pending" ]; then
+          fail "$bake: a sha256 pin without an out before it"
+          continue
+        fi
+        baked=$((baked + 1))
+        if [ ! -f "$assets_dir/$pending" ]; then
+          fail "$pending is pinned in $bake but missing from $assets_dir/ (just art-bake)"
+        else
+          got="$(sha256 "$assets_dir/$pending")"
+          if [ "$got" != "$value" ]; then
+            fail "$pending: sha256 $got does not match its pin $value in $bake; a re-bake that changes the file must re-pin it (and its ATTRIBUTION.md Modifications if the row changed)"
+          fi
+        fi
+        pending=""
+        ;;
+    esac
+  done < <(grep -v '^[[:space:]]*//' "$bake" | grep -oE '(out|sha256): *"[^"]*"' | sed -E 's/^(out|sha256): *"([^"]*)"$/\1 \2/')
+  [ -n "$pending" ] && fail "$pending in $bake has no sha256 pin; add sha256: \"$(sha256 "$assets_dir/$pending" 2>/dev/null || echo '<hash>')\" to its row"
+  if [ "$status" -eq "$before" ] && [ "$baked" -gt 0 ]; then
+    echo "check_assets: bake pins ok ($baked baked files match $bake)"
   fi
 fi
 

@@ -19,7 +19,9 @@
 //!
 //! Art pass: `AssetPlugin` reads models from [`Cli::resolve_assets_dir`]
 //! (the repository's `assets/` under `cargo run`, not Bevy's default
-//! `crates/game/assets`), `--window-size` sets the window,
+//! `crates/game/assets`), `crate::models` loads them before the sim's
+//! first tick and `crate::terrain_props` dresses forests, mountains and
+//! water once they settle, `--window-size` sets the window,
 //! `--grid` starts with the debug grid on, and `--draw-stats` (or a `dev`
 //! build) adds the draw-call counter (`crate::draw_stats`) with the
 //! frame-time lines. `EONMARK_WGPU_DISABLE` turns wgpu features off for the
@@ -427,12 +429,25 @@ pub fn run(cli: &Cli) -> AppExit {
         OrdersPlugin,
         HudPlugin { hud_click_check },
     ));
+    // Art pass: the glTF models of visuals.ron (the sim waits for them,
+    // `models::models_settled`) and the terrain props placed once they
+    // settle. Only here, where DefaultPlugins provide the asset server.
+    app.add_plugins((
+        crate::models::ModelsPlugin,
+        crate::terrain_props::TerrainPropsPlugin,
+    ));
     // M5a: the attrition indicator, supply ring, annexation timer and
     // readout, and the outcome overlay over the frozen world.
     app.add_plugins((
         crate::markers::MarkersPlugin,
         crate::outcome::OutcomeOverlayPlugin,
     ));
+
+    // Art pass AP10: every unit selectable by a real click (a driver
+    // clicks the printed targets; `crate::click_check`).
+    if cli.click_check {
+        app.add_plugins(crate::click_check::ClickCheckPlugin);
+    }
 
     // Presentation only: frames and selects the walkthrough's beats, or
     // selects `art_bench`'s army.

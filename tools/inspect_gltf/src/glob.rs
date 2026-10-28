@@ -4,34 +4,15 @@
 //! keeps a node when any glob matches its own name; an empty list keeps
 //! every node. Keeping a node keeps its mesh only, not its children.
 
-/// Whether `name` matches `pattern`.
+/// Whether `name` matches `pattern` (`rules::visuals::glob_match`, the
+/// definition the game's model merge shares).
 pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0, 0);
-    // Where the last `*` was and the name position it was tried against.
-    let mut star: Option<(usize, usize)> = None;
-    while ni < n.len() {
-        if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, ni));
-            pi += 1;
-        } else if pi < p.len() && p[pi] == n[ni] {
-            pi += 1;
-            ni += 1;
-        } else if let Some((sp, sn)) = star {
-            pi = sp + 1;
-            ni = sn + 1;
-            star = Some((sp, sn + 1));
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|&c| c == '*')
+    rules::visuals::glob_match(pattern, name)
 }
 
 /// Whether a node called `name` is kept by `globs` (empty keeps all).
 pub fn keeps(globs: &[String], name: &str) -> bool {
-    globs.is_empty() || globs.iter().any(|g| glob_match(g, name))
+    rules::visuals::keeps_node(globs, name)
 }
 
 #[cfg(test)]

@@ -258,10 +258,13 @@ fn a_cadence_inside_the_command_delay_exits_1_naming_personalities_ron() {
 /// unit kind without a visual fails data-check naming the file and kind.
 #[test]
 fn a_unit_kind_without_a_visual_exits_1_naming_visuals_ron() {
+    // The Yeoman's line as the repository has it (a model since art slice
+    // 4), so the test does not depend on its look.
+    let yeoman = format!("{}\n", visuals_line("yeoman"));
     rejects_edit(
         "visual-missing",
         "visuals.ron",
-        "    \"yeoman\": Primitive(Capsule),\n",
+        &yeoman,
         "",
         &[r#"units["yeoman"]: "#, "needs a visual"],
     );
@@ -273,8 +276,8 @@ fn a_visual_out_of_range_exits_1_naming_visuals_ron() {
     rejects_edit(
         "visual-height",
         "visuals.ron",
-        r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
-        r#""skirmisher": Body(shape: Cone, height_tiles_x100: 500)"#,
+        &visuals_line("skirmisher"),
+        r#"    "skirmisher": Body(shape: Cone, height_tiles_x100: 500),"#,
         &[r#"units["skirmisher"].height_tiles_x100: "#, "20..=400"],
     );
 }
@@ -302,17 +305,19 @@ fn a_missing_visuals_ron_exits_1_naming_it() {
 #[test]
 fn a_valid_visuals_edit_keeps_the_rules_hash() {
     let repo = data_check(&repo_data());
-    let from = r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#;
+    // The Skirmisher's line as the repository has it, one size step
+    // bigger (its model's scale since art slice 4, a Body's height before),
+    // so the test does not depend on its look and the edit names the same
+    // files (the `models=` count stays).
+    let from = visuals_line("skirmisher");
+    let to = bump_size(&from);
+    assert_ne!(from, to, "the Skirmisher's line has a size to change");
     let dir = edited_copy("visuals-edit", "visuals.ron", |text| {
         assert!(
-            text.contains(from),
+            text.contains(&from),
             "visuals.ron no longer contains {from:?}"
         );
-        text.replacen(
-            from,
-            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 160)"#,
-            1,
-        )
+        text.replacen(&from, &to, 1)
     });
     let edited = data_check(&dir);
     let (repo_out, edited_out) = (text(&repo.stdout), text(&edited.stdout));
@@ -331,35 +336,116 @@ fn a_valid_visuals_edit_keeps_the_rules_hash() {
 /// Art pass: `visuals.ron` needs a visual for every building kind too.
 #[test]
 fn a_building_without_a_visual_exits_1_naming_visuals_ron() {
+    // The Croft's line as the repository has it (a model since art slice
+    // 3), so the test does not depend on its look.
+    let croft = format!("{}\n", visuals_line("croft"));
     rejects_edit(
         "building-visual-missing",
         "visuals.ron",
-        "    \"croft\": Primitive(Cuboid),\n",
+        &croft,
         "",
         &[r#"buildings["croft"]: "#, "every building kind"],
     );
     rejects_edit(
         "building-visual-sphere",
         "visuals.ron",
-        r#""croft": Primitive(Cuboid)"#,
-        r#""croft": Primitive(Sphere)"#,
+        &croft,
+        "    \"croft\": Primitive(Sphere),\n",
         &[r#"buildings["croft"]: "#, "Primitive(Cuboid)"],
     );
+}
+
+/// The whole line of the repository's `visuals.ron` that maps `id`.
+/// `line` (a `visuals.ron` look) with its first `scale_x100` raised by 1,
+/// or, without one, its first `height_tiles_x100` raised by 10: a valid
+/// edit of any Scene or Body look that keeps the files it names.
+fn bump_size(line: &str) -> String {
+    for (key, step) in [("scale_x100: ", 1u32), ("height_tiles_x100: ", 10)] {
+        if let Some(at) = line.find(key) {
+            let start = at + key.len();
+            let digits = line[start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map_or(line.len(), |n| start + n);
+            let value: u32 = line[start..digits].parse().expect("a number");
+            return format!("{}{}{}", &line[..start], value + step, &line[digits..]);
+        }
+    }
+    line.to_string()
+}
+
+fn visuals_line(id: &str) -> String {
+    let text = std::fs::read_to_string(repo_data().join("visuals.ron")).unwrap();
+    let key = format!("    \"{id}\": ");
+    text.lines()
+        .find(|l| l.starts_with(&key))
+        .unwrap_or_else(|| panic!("visuals.ron has no line for {id:?}"))
+        .to_string()
+}
+
+/// The look inside a Scene line's `fallback: Some(...)`, if it has one.
+fn fallback_of(line: &str) -> Option<&str> {
+    let at = line.find("fallback: Some(")? + "fallback: Some(".len();
+    let mut depth = 1u32;
+    for (i, c) in line[at..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&line[at..at + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `text` (a `visuals.ron`) cut after its `buildings` table, every unit its
+/// fallback look (a unit Scene's `fallback`, a model since art slice 4),
+/// every building the box but the Town, which is `town`, and no sites,
+/// rubble, flags, terrain or swatches, so the only Scene is the Town's
+/// whatever the repository's looks are (art slice 3 made them models).
+fn only_town_scene(text: &str, town: &str) -> String {
+    let units = text.find("  units: {\n").expect("a units table");
+    let start = text.find("  buildings: {\n").expect("a buildings table");
+    let end = start + text[start..].find("\n  },\n").expect("its end") + "\n  },\n".len();
+    let mut out = text[..units].to_string();
+    for line in text[units..start].lines() {
+        match (line.strip_prefix("    \""), fallback_of(line)) {
+            (Some(rest), Some(look)) => {
+                let id = &rest[..rest.find('"').expect("a quoted key")];
+                out.push_str(&format!("    \"{id}\": {look},\n"));
+            }
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str("  buildings: {\n");
+    for line in text[start..end].lines() {
+        let Some(rest) = line.strip_prefix("    \"") else {
+            continue;
+        };
+        let id = &rest[..rest.find('"').expect("a quoted key")];
+        if id == "town" {
+            out.push_str(&format!("    \"town\": {town},\n"));
+        } else {
+            out.push_str(&format!("    \"{id}\": Primitive(Cuboid),\n"));
+        }
+    }
+    out.push_str("  },\n)\n");
+    out
 }
 
 /// A copy of `data/` whose Town is a Scene naming `models/test/castle.gltf`,
 /// and an empty assets directory beside it.
 fn scene_copy(name: &str) -> (PathBuf, PathBuf) {
     let dir = edited_copy(name, "visuals.ron", |text| {
-        let from = r#""town": Primitive(Cuboid)"#;
-        assert!(
-            text.contains(from),
-            "visuals.ron no longer contains {from:?}"
-        );
-        text.replacen(
-            from,
-            r#""town": Scene(path: "models/test/castle.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, fallback: Some(Primitive(Cuboid)))"#,
-            1,
+        only_town_scene(
+            &text,
+            r#"Scene(path: "models/test/castle.gltf", scale_x100: 100, y_offset_tiles_x100: 0, yaw_deg: 0, fallback: Some(Primitive(Cuboid)))"#,
         )
     });
     let assets = dir.with_file_name(format!(

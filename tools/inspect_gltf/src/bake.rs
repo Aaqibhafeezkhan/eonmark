@@ -50,6 +50,14 @@ pub struct BakeModel {
     /// face +Z, which 90 turns into +X.
     #[serde(default = "default_yaw")]
     pub yaw_deg: i32,
+    /// The sha256 of the committed output (64 lowercase hex digits), the
+    /// pin `scripts/check_assets.sh` holds the file to (rule 5, as
+    /// `sources.tsv` pins the vendored files): a re-bake that changes a
+    /// byte must be re-pinned deliberately. Empty only while a new row is
+    /// being pinned (`check_assets.sh` then prints the hash to paste); the
+    /// repository's rows all carry one.
+    #[serde(default)]
+    pub sha256: String,
 }
 
 /// How far, per 8-bit channel, a face's colour (the texel at its UV
@@ -111,6 +119,18 @@ pub fn parse(text: &str) -> Result<BakeFile, String> {
         crate::model::check_uri(&m.src)?;
         if let Some(t) = &m.texture {
             crate::model::check_uri(t)?;
+        }
+        let pin = &m.sha256;
+        if !pin.is_empty()
+            && !(pin.len() == 64
+                && pin
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+        {
+            return Err(format!(
+                "bake.ron: {}: sha256 must be 64 lowercase hex digits",
+                m.out
+            ));
         }
         if m.max_texture == 0 {
             return Err(format!(
@@ -395,6 +415,7 @@ mod tests {
             },
             max_texture,
             yaw_deg: 0,
+            sha256: String::new(),
         }
     }
 
@@ -546,6 +567,19 @@ mod tests {
         let file = parse(&std::fs::read_to_string(&bake_ron).unwrap()).unwrap();
         assert_eq!(file.models[0].yaw_deg, 90);
         assert!(parse(r#"(models: [(out: "../x.glb", src: "a.glb", keep: ["a"], pose: (clip: "c", at_ms: 0), max_texture: 4)])"#).is_err());
+        // A pin is 64 lowercase hex digits.
+        let pinned = |pin: &str| {
+            parse(&format!(
+                r#"(models: [(out: "m/x.glb", src: "a.glb", keep: ["a"], pose: (clip: "c", at_ms: 0), max_texture: 4, sha256: "{pin}")])"#
+            ))
+        };
+        assert_eq!(
+            pinned(&"0f".repeat(32)).unwrap().models[0].sha256,
+            "0f".repeat(32)
+        );
+        assert_eq!(pinned("").unwrap().models[0].sha256, "", "not pinned yet");
+        assert!(pinned(&"0F".repeat(32)).is_err());
+        assert!(pinned("abc").is_err());
         assert!(parse("(models: [])").unwrap().models.is_empty());
     }
 }

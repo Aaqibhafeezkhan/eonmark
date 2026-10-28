@@ -58,7 +58,7 @@ pub use resources::{Resource, Resources};
 pub use techs::{Tech, Techs};
 pub use units::{Counter, Defender, UnitClass, UnitKind, UnitRamp, Units};
 pub use visuals::{
-    DecorAt, DecorLook, Part, Primitive, Rubble, TeamSwatch, TerrainDecor, Visual, Visuals,
+    DecorAt, DecorLook, Mount, Part, Primitive, Rubble, TeamSwatch, TerrainDecor, Visual, Visuals,
 };
 
 /// The time unit every income rate is authored in: per 30 s, in
@@ -1788,26 +1788,20 @@ mod tests {
         assert_eq!(rules.yield_cap_base, 70);
         assert_eq!(rules.pop_cap_base, 25);
         assert!(rules.map("plains_1v1").is_some());
-        assert_eq!(
-            rules.visual(0),
-            Some(&Visual::Primitive(visuals::Primitive::Capsule))
-        );
-        assert_eq!(
-            rules.visual(3),
-            Some(&Visual::Body {
-                shape: visuals::Primitive::Cuboid,
-                height_tiles_x100: 130,
-                lying: false,
-            })
-        );
-        assert_eq!(
-            rules.visual(5),
-            Some(&Visual::Body {
-                shape: visuals::Primitive::Capsule,
-                height_tiles_x100: 180,
-                lying: true,
-            })
-        );
+        // `visual(i)` is the look visuals.ron gives kind `i`'s id, for every
+        // kind, and nothing past the last kind. Compared with the file's own
+        // table rather than with literal looks, so a look edit (the unit
+        // models of art slice 4) never fails this test (art-pass decision
+        // 17); visuals.rs tests what each look parses to.
+        for (i, kind) in (0u16..).zip(&rules.units) {
+            assert!(rules.visual(i).is_some(), "{}", kind.id);
+            assert_eq!(
+                rules.visual(i),
+                rules.visuals.units.get(&kind.id),
+                "{}",
+                kind.id
+            );
+        }
         assert!(rules.visual(8).is_none());
         assert_eq!(rules.ticks_from_ds(32), 64);
         assert_eq!(rules.attrition_interval_ticks(), 64);
@@ -2096,12 +2090,15 @@ mod tests {
         cleared.visuals = Visuals::default();
         assert_eq!(a.rules_hash(), cleared.rules_hash());
 
+        // The Skirmisher's line as the repository has it (a model since
+        // art slice 4), so the test does not depend on its look.
+        let skirmisher = live_visuals_line("skirmisher");
         let edited = loads_after_edits(
             "visuals-edit",
             &[(
                 "visuals.ron",
-                r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
-                r#""skirmisher": Body(shape: Cone, height_tiles_x100: 160)"#,
+                skirmisher.as_str(),
+                r#"    "skirmisher": Body(shape: Cone, height_tiles_x100: 160),"#,
             )],
         );
         assert_eq!(
@@ -2127,8 +2124,8 @@ mod tests {
         let msg = load_error_after_edit(
             "visual-bad-height",
             "visuals.ron",
-            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 150)"#,
-            r#""skirmisher": Body(shape: Cone, height_tiles_x100: 500)"#,
+            &live_visuals_line("skirmisher"),
+            r#"    "skirmisher": Body(shape: Cone, height_tiles_x100: 500),"#,
         );
         assert!(msg.contains("visuals.ron"), "{msg}");
         assert!(
@@ -2298,6 +2295,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         copy_dir(&data_dir(), &dir);
         dir
+    }
+
+    /// The line of the repository's `data/visuals.ron` that maps the unit
+    /// or building kind `id` (`    "id": ...,`), so a test that edits a
+    /// look does not depend on what the look is.
+    fn live_visuals_line(id: &str) -> String {
+        let text = std::fs::read_to_string(data_dir().join("visuals.ron")).unwrap();
+        let key = format!("    \"{id}\": ");
+        text.lines()
+            .find(|l| l.starts_with(&key))
+            .unwrap_or_else(|| panic!("visuals.ron has no line for {id:?}"))
+            .to_string()
     }
 
     /// Replace the first `from` in the copied `file` with `to`, asserting

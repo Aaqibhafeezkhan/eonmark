@@ -29,8 +29,8 @@ fn repo_models_pass_check() {
 
 /// Every vendored row of sources.tsv and every output of bake.ron has an
 /// ATTRIBUTION.md row whose Author, Source URL, License and Modifications
-/// match, and every third-party row of ATTRIBUTION.md comes from one of
-/// them.
+/// match (and a sha256 pin), and every third-party row of ATTRIBUTION.md
+/// comes from one of them.
 #[test]
 fn attribution_rows_match_the_sources() {
     let tsv = std::fs::read_to_string(root().join("tools/assets/sources.tsv")).unwrap();
@@ -88,13 +88,24 @@ fn attribution_rows_match_the_sources() {
     }
     let bake = std::fs::read_to_string(root().join("tools/assets/bake.ron")).unwrap();
     for m in inspect_gltf::bake::parse(&bake).unwrap().models {
+        // Pinned like a vendored file (scripts/check_assets.sh holds the
+        // committed output to it).
+        assert_eq!(m.sha256.len(), 64, "{} is not pinned", m.out);
         let row = find(&m.out).unwrap_or_else(|| panic!("no ATTRIBUTION.md row for {}", m.out));
         let src = sources
             .iter()
             .find(|s| url_file_name(&s.url) == m.src)
             .unwrap_or_else(|| panic!("{} is not in sources.tsv", m.src));
+        assert_eq!(row.author, src.author, "{}", m.out);
         assert_eq!(row.source_url, src.page, "{}", m.out);
         assert_eq!(row.license, src.licence, "{}", m.out);
+        assert_eq!(row.original, "no", "{}", m.out);
+        assert!(
+            date(&row.download_date),
+            "{}: date {:?}",
+            m.out,
+            row.download_date
+        );
         let model = inspect_gltf::model::Model::load(&root().join("assets").join(&m.out)).unwrap();
         let extras = inspect_gltf::bake::read_extras(&model)
             .expect("a baked file records its modifications");

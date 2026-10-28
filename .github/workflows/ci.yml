@@ -325,7 +325,11 @@ jobs:
       # adds one for a pipeline that never becomes ready). Since M4b it also
       # renders `unit_looks`, one of every unit look per team at 40 m, and
       # `enemy_outpost` at tick 400 in its own framing: 400 units mid-fight
-      # with health bars, so the unlit bar pipeline compiles. winit
+      # with health bars, so the unlit bar pipeline compiles. Since art
+      # slice 4 its 400 units are KayKit character models (about 2.2 M
+      # triangles in the main pass), which lavapipe draws at about 1.4 s a
+      # frame, so tick 400 comes about 120 s in: it gets a 180 s deadline
+      # (the sixth argument; docs/BUILD_TIMES.md). winit
       # loads libxkbcommon-x11 and the X libraries at run time; the runner
       # image lacks the first. The screenshots are uploaded for review.
       - name: Render smoke test (Xvfb, lavapipe)
@@ -334,7 +338,7 @@ jobs:
           cargo build -p game --locked --profile ci
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke"
           scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/unit_looks" unit_looks 20,32,40 100
-          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/enemy_outpost" enemy_outpost '' 400
+          scripts/render_smoke.sh target/ci/eonmark "$RUNNER_TEMP/render-smoke/enemy_outpost" enemy_outpost '' 400 180
 
       - uses: actions/upload-artifact@v7
         if: always()

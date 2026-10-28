@@ -38,9 +38,10 @@ use bevy::transform::TransformSystems;
 use rules::Rules;
 use sim::{BuildingId, PlayerId, SimView, TargetId, Unit, UnitId, UnitKindId};
 
-use crate::buildings::building_transform;
+use crate::buildings::{building_top_y, footprint_centre};
 use crate::camera::RtsCamera;
 use crate::hud::WorldInputSet;
+use crate::models::ModelLibrary;
 use crate::palette;
 use crate::present::{FALLBACK_VISUAL, Interp, UnitEntities, UnitVisuals, look_top_y};
 use crate::selection::Selection;
@@ -228,11 +229,14 @@ impl MaxHpTable {
 
 /// The targets that carry a bar now and what each shows: every unit that
 /// has taken damage or is selected, every building below its kind's hit
-/// points or selected. `top_y` gives the height of a unit kind's look.
+/// points or selected. `top_y` gives the height of a unit kind's look; a
+/// building's bar rides on `buildings::building_top_y` (its model's top
+/// when `models` has it ready, else the M3b box's).
 pub fn bar_specs(
     view: &SimView<'_>,
     rules: &Rules,
     selection: &Selection,
+    models: Option<&ModelLibrary>,
     top_y: impl Fn(UnitKindId) -> f32,
 ) -> BTreeMap<TargetId, BarSpec> {
     let mut table = MaxHpTable::default();
@@ -261,15 +265,17 @@ pub fn bar_specs(
         if hp >= max && selection.building != Some(b.id) {
             continue;
         }
-        // A site's box rises with its progress; the bar rides on top.
-        let t = building_transform(rules, b);
+        // A site's look rises with its progress; the bar rides on top.
+        let top = building_top_y(rules, b, models);
         specs.insert(
             TargetId::Building(b.id),
             BarSpec {
                 owner: b.owner,
                 hp,
                 max,
-                anchor: BarAnchor::Fixed(t.translation + Vec3::Y * (t.scale.y + BUILDING_BAR_GAP)),
+                anchor: BarAnchor::Fixed(
+                    footprint_centre(rules, b) + Vec3::Y * (top + BUILDING_BAR_GAP),
+                ),
             },
         );
     }
@@ -301,10 +307,12 @@ pub struct SyncedFor {
 /// `ChildOf`), update the values of the others (and the fill's material
 /// when an annexation changed the owner), and despawn the pairs of targets
 /// that died or are neither damaged nor selected.
+#[allow(clippy::too_many_arguments)] // Bevy system: each parameter is one resource or query
 pub fn sync_bar_targets(
     sim: NonSend<SimHandle>,
     selection: Res<Selection>,
     visuals: Res<UnitVisuals>,
+    models: Option<Res<ModelLibrary>>,
     assets: Option<Res<BarAssets>>,
     mut bars: ResMut<HealthBars>,
     mut synced: Local<Option<SyncedFor>>,
@@ -326,7 +334,9 @@ pub fn sync_bar_targets(
     });
     let view = sim.view();
     let rules = sim.rules();
-    let specs = bar_specs(&view, rules, &selection, |k| unit_top_y(&visuals, rules, k));
+    let specs = bar_specs(&view, rules, &selection, models.as_deref(), |k| {
+        unit_top_y(&visuals, rules, k)
+    });
     bars.0.retain(|target, bar| {
         if specs.contains_key(target) {
             true
@@ -1246,7 +1256,7 @@ mod tests {
         let view = sim.view();
         let mut selection = Selection::default();
         selection.set([UnitId(1), UnitId(2)]);
-        let specs = bar_specs(&view, &rules, &selection, |_| 1.0);
+        let specs = bar_specs(&view, &rules, &selection, None, |_| 1.0);
         let own = specs[&TargetId::Unit(UnitId(1))];
         let theirs = specs[&TargetId::Unit(UnitId(2))];
         assert_eq!(
@@ -1504,5 +1514,217 @@ mod tests {
             .unwrap();
         let aabb = quad.compute_aabb().unwrap();
         assert!((aabb.min().x - 0.0).abs() < 1e-6 && (aabb.max().x - 1.0).abs() < 1e-6);
+    }
+
+    /// Art slice 4: a unit kind drawn as its model carries its bar
+    /// [`UNIT_BAR_GAP`] over the model's top, not over its fallback look's.
+    #[test]
+    fn bar_sits_above_a_model_top() {
+        use crate::models::{Geometry, ModelKey, ModelLibrary, content_hash, finish_geometry};
+        use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+        let mut rules = rules();
+        let yeoman = rules::Visual::Scene {
+            path: "m/yeoman.glb".into(),
+            scale_x100: 100,
+            y_offset_tiles_x100: 0,
+            yaw_deg: 0,
+            x_offset_tiles_x100: 0,
+            z_offset_tiles_x100: 0,
+            nodes: vec![],
+            parts: vec![],
+            team: None,
+            fallback: Some(Box::new(rules::Visual::Primitive(
+                rules::Primitive::Capsule,
+            ))),
+            banner_at: None,
+            seat_flag_at: None,
+        };
+        rules.visuals.units.insert("yeoman".into(), yeoman.clone());
+        let (mut meshes, mut images) = (Assets::<Mesh>::default(), Assets::<Image>::default());
+        let image = Image::new(
+            Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![200; 4 * 4 * 4],
+            TextureFormat::Rgba8UnormSrgb,
+            bevy::asset::RenderAssetUsages::default(),
+        );
+        let hash = content_hash(&image);
+        let model = finish_geometry(
+            Geometry {
+                positions: vec![[-0.3, 0.0, -0.3], [0.3, 2.5, 0.3], [0.0, 0.0, 0.3]],
+                normals: vec![[0.0, 1.0, 0.0]; 3],
+                uvs: vec![[0.1, 0.1]; 3],
+                indices: vec![0, 1, 2],
+                textures: vec![],
+                base_color: None,
+            },
+            hash,
+            &mut meshes,
+        );
+        let mut lib = ModelLibrary::new(&rules.visuals);
+        lib.insert_ready(ModelKey::of(&yeoman).unwrap(), model, images.add(image));
+        let kind = unit_kind(&rules, "yeoman");
+        // The cached top: the model's with the library, the capsule's
+        // 1.19 m without.
+        let mut with = UnitVisuals::default();
+        with.mesh_with(kind.0, &rules, &mut meshes, Some(&lib));
+        assert_eq!(unit_top_y(&with, &rules, kind), 2.5);
+        let without = UnitVisuals::default();
+        assert!((unit_top_y(&without, &rules, kind) - 1.19).abs() < 1e-5);
+
+        // In the game: a selected Yeoman's bar rides over its model.
+        let setup = sim::MatchSetup::scenario(&rules, 7);
+        let handle = SimHandle::from_setup(setup, rules.clone());
+        let stream = vec![(0, vec![spawn(LOCAL_PLAYER, 0, kind, (20, 30), 1)])];
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(meshes)
+            .insert_resource(images)
+            .insert_resource(Assets::<StandardMaterial>::default())
+            .insert_resource(lib)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::ZERO,
+            ))
+            .init_resource::<Selection>()
+            .add_plugins((
+                SimPlugin::new(handle, Box::new(ScenarioInput::new(stream))),
+                PresentPlugin,
+                HealthBarsPlugin,
+            ));
+        let camera = RtsCamera {
+            zoom: BAR_REFERENCE_ZOOM,
+            zoom_target: BAR_REFERENCE_ZOOM,
+            ..default()
+        };
+        let cam_tf = Transform::from_translation(camera.eye()).looking_at(camera.focus, Vec3::Y);
+        app.world_mut().spawn((camera, cam_tf));
+        app.update();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(50),
+        ));
+        run_to(&mut app, 5);
+        app.world_mut().resource_mut::<Selection>().set([UnitId(1)]);
+        app.update();
+        app.update();
+        let bar = bars(&app)[&TargetId::Unit(UnitId(1))];
+        assert_eq!(bar.spec.anchor, BarAnchor::Unit { top_y: 2.5 });
+        let unit = app.world().resource::<UnitEntities>().0[&UnitId(1)];
+        let pos = app.world().get::<Interp>(unit).unwrap().curr;
+        let want = bar_layout(
+            pos + Vec3::Y * (2.5 + UNIT_BAR_GAP),
+            cam_tf.rotation,
+            bar_scale(BAR_REFERENCE_ZOOM),
+            1.0,
+        );
+        let back = *app.world().get::<Transform>(bar.back).unwrap();
+        assert!(
+            (back.translation - want.back.translation).length() < 1e-4,
+            "{back:?} vs {:?}",
+            want.back
+        );
+    }
+
+    /// Art slice 4: a kind that carries the team banner (the Mangonel's
+    /// stands far above its catapult) rides its bar over the higher of its
+    /// model's top and its banner's top, so the cloth, standing between
+    /// the camera and the unit, never covers the bar; without a banner, or
+    /// with a banner lower than the model, the model's top.
+    #[test]
+    fn a_carried_banner_lifts_the_bar_over_it() {
+        use crate::models::{Geometry, ModelKey, ModelLibrary, content_hash, finish_geometry};
+        use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+        let mut rules = rules();
+        let scene = |path: &str, banner_at: Option<rules::Mount>| rules::Visual::Scene {
+            path: path.into(),
+            scale_x100: 100,
+            y_offset_tiles_x100: 0,
+            yaw_deg: 0,
+            x_offset_tiles_x100: 0,
+            z_offset_tiles_x100: 0,
+            nodes: vec![],
+            parts: vec![],
+            team: None,
+            fallback: Some(Box::new(rules::Visual::Primitive(rules::Primitive::Sphere))),
+            banner_at,
+            seat_flag_at: None,
+        };
+        let mount = |y: i32, scale: u32| rules::Mount {
+            offset_x100: (-40, y, 40),
+            scale_x100: scale,
+            yaw_deg: 0,
+        };
+        let banner = scene("m/flag.gltf", None);
+        rules.visuals.banner = Some(banner.clone());
+        let (mut meshes, mut images) = (Assets::<Mesh>::default(), Assets::<Image>::default());
+        let mut lib = ModelLibrary::new(&rules.visuals);
+        let mut ready = |visual: &rules::Visual, top: f32| {
+            let image = Image::new(
+                Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                vec![200; 4 * 4 * 4],
+                TextureFormat::Rgba8UnormSrgb,
+                bevy::asset::RenderAssetUsages::default(),
+            );
+            let hash = content_hash(&image);
+            let model = finish_geometry(
+                Geometry {
+                    positions: vec![[-0.3, 0.0, -0.3], [0.3, top, 0.3], [0.0, 0.0, 0.3]],
+                    normals: vec![[0.0, 1.0, 0.0]; 3],
+                    uvs: vec![[0.1, 0.1]; 3],
+                    indices: vec![0, 1, 2],
+                    textures: vec![],
+                    base_color: None,
+                },
+                hash,
+                &mut meshes,
+            );
+            lib.insert_ready(ModelKey::of(visual).unwrap(), model, images.add(image));
+        };
+        // A 0.8 m catapult and a 0.28 m flag, as shipped.
+        let catapult = scene("m/catapult.gltf", None);
+        ready(&catapult, 0.8);
+        ready(&banner, 0.28);
+        let kind = unit_kind(&rules, "mangonel");
+        let top = |rules: &Rules, lib: &ModelLibrary, meshes: &mut Assets<Mesh>| {
+            let mut v = UnitVisuals::default();
+            v.mesh_with(kind.0, rules, meshes, Some(lib));
+            unit_top_y(&v, rules, kind)
+        };
+        rules.visuals.units.insert("mangonel".into(), catapult);
+        assert!(
+            (top(&rules, &lib, &mut meshes) - 0.8).abs() < 1e-5,
+            "no banner"
+        );
+        // At scale 700 the banner stands 7 x 0.28 = 1.96 m: the bar rides
+        // over it.
+        rules.visuals.units.insert(
+            "mangonel".into(),
+            scene("m/catapult.gltf", Some(mount(0, 700))),
+        );
+        assert!(
+            (top(&rules, &lib, &mut meshes) - 1.96).abs() < 1e-5,
+            "over the banner: {}",
+            top(&rules, &lib, &mut meshes)
+        );
+        // Mounted 0.5 m up, its top is 0.5 m higher.
+        rules.visuals.units.insert(
+            "mangonel".into(),
+            scene("m/catapult.gltf", Some(mount(50, 700))),
+        );
+        assert!((top(&rules, &lib, &mut meshes) - 2.46).abs() < 1e-5);
+        // A small banner under the model's top leaves the model's top.
+        rules.visuals.units.insert(
+            "mangonel".into(),
+            scene("m/catapult.gltf", Some(mount(0, 100))),
+        );
+        assert!((top(&rules, &lib, &mut meshes) - 0.8).abs() < 1e-5);
     }
 }
