@@ -197,7 +197,7 @@ The M5a annexation slice (`SIM_VERSION` 16, `rules_version` 20) adds the annex-h
 | [attrition.md](attrition.md) | Unsupplied armies bleed inside enemy borders; Supply Wains and Scribes are immune. |
 | [towns.md](towns.md) | Towns shoot and cannot be destroyed; infantry and cavalry annex them. |
 | [territory.md](territory.md) | Watchtowers are border sources. |
-| [ai.md](ai.md) | Influence maps (4 x 4 tile cells, every 10 ticks) and counter-weighted composition arrive in M6; retreat-when-losing. |
+| [ai.md](ai.md) | Influence maps (4 x 4 tile cells, built per plan by the bot since M6) and counter-weighted composition arrive in M6; retreat-when-losing. |
 | [fog.md](fog.md) | From M7 acquisition respects the visibility grid through `SimView`. |
 | [ui.md](ui.md) | Health bars, five primitive silhouettes, attack-move key, selection panel (M4b). |
 

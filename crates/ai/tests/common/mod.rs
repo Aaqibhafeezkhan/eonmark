@@ -96,13 +96,12 @@ impl Arena {
             .iter()
             .map(|slot| {
                 let seat = setup.ai_seats.iter().find(|s| s.player == slot.id)?;
-                (seat.bot == ai::BOT_STANDARD).then(|| {
-                    let knobs = rules
-                        .ai
-                        .personality(&seat.personality)
-                        .expect("personality");
-                    StandardBot::new(&rules, &setup, slot.id, knobs)
-                })
+                let difficulty = rules.ai.difficulty(&seat.bot)?;
+                let knobs = rules
+                    .ai
+                    .personality(&seat.personality)
+                    .expect("personality");
+                Some(StandardBot::new(&rules, &setup, slot.id, knobs, difficulty))
             })
             .collect();
         let memories = vec![AiMemory::default(); setup.players.len()];
@@ -168,9 +167,29 @@ impl Arena {
 
     /// A live plan context for `me` at the current tick.
     pub fn ctx(&self, me: PlayerId) -> Ctx<'_> {
+        self.bot(me).ctx(self.sim.view(), me)
+    }
+
+    /// [`Arena::ctx`] with the seat's personality as written (not resolved
+    /// for its level) and no level pressure: the bot the slice-2 tests
+    /// describe, which a Standard seat played until the M6 retune (owner
+    /// decision 12) gave the level its pressure and all-in time.
+    pub fn base_ctx(&self, me: PlayerId) -> Ctx<'_> {
+        let mut ctx = self.ctx(me);
         let view = self.sim.view();
-        let knobs = self.bot(me).knobs(view.rules());
-        Ctx::new(view, me, knobs, self.bot(me).map())
+        let seat = view
+            .setup()
+            .ai_seats
+            .iter()
+            .find(|s| s.player == me)
+            .expect("the seat is a bot");
+        ctx.knobs = view
+            .rules()
+            .ai
+            .personality(&seat.personality)
+            .expect("personality");
+        ctx.pressure = rules::Pressure::OFF;
+        ctx
     }
 
     /// What `me`'s Standard bot would plan now, whatever its cadence, and

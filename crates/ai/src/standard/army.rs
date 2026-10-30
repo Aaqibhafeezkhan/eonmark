@@ -29,8 +29,10 @@
 //! analysis' rally seed ([`Ctx::rally`]); every trainer of a non-civilian
 //! kind whose rally differs gets `SetRally` (`check_rally` first).
 
-use super::ctx::Ctx;
+use super::compose::{Counters, shares, weighted_mix};
+use super::ctx::{Ctx, jitter, salt};
 use super::memory::BotMemory;
+use super::waves::wain_needed;
 use rules::UnitClass;
 use sim::{BuildingId, BuildingKindId, Command, UnitId, UnitKindId};
 use std::collections::BTreeSet;
@@ -130,13 +132,79 @@ pub fn producing(mem: &BotMemory) -> bool {
     mem.military || mem.defend.is_some()
 }
 
-/// Train the plan's army: Wains first, then the mix by deficit.
+/// Whether kind `k` is armed siege.
+fn is_siege(ctx: &Ctx<'_>, k: UnitKindId) -> bool {
+    ctx.view
+        .rules()
+        .unit_kind(k.0)
+        .is_some_and(|d| d.class == UnitClass::Siege)
+}
+
+/// Emergency production before a difficulty's deadline raid (M6): from
+/// `by_ds - prep_ds` until the raid launches (and while no wave has),
+/// the bot trains non-siege armed kinds of its mix toward the raid's
+/// `min_armed`, before the `Military` latch too. `true` while that many
+/// are not yet alive or queued.
+pub fn emergency(ctx: &Ctx<'_>, mem: &BotMemory) -> bool {
+    let Some(raid) = ctx.first_raid else {
+        return false;
+    };
+    if mem.raid_used
+        || mem.waves_launched > 0
+        || ctx.tick() < ctx.ticks(raid.by_ds.saturating_sub(raid.prep_ds))
+    {
+        return false;
+    }
+    raiders_alive_and_queued(ctx) < raid.min_armed
+}
+
+/// Non-siege armed units alive or queued.
+fn raiders_alive_and_queued(ctx: &Ctx<'_>) -> u32 {
+    let rules = ctx.view.rules();
+    rules
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.class != UnitClass::Civilian && u.class != UnitClass::Siege)
+        .filter(|(_, u)| u.attack.is_some())
+        .map(|(i, _)| {
+            ctx.facts
+                .alive_and_queued(UnitKindId(u16::try_from(i).expect("few")))
+        })
+        .sum()
+}
+
+/// The personality's counter knobs as [`Counters`].
+fn counters(ctx: &Ctx<'_>) -> Counters {
+    Counters {
+        weight_permille: ctx.knobs.counter_weight_permille,
+        floor_permille: ctx.knobs.counter_floor_permille,
+        cap_permille: ctx.knobs.counter_cap_permille,
+        join_permille: ctx.knobs.counter_join_permille,
+        kinds: ctx
+            .knobs
+            .counter_kinds
+            .iter()
+            .filter_map(|m| Some((unit_kind_id(ctx, &m.kind)?, m.weight)))
+            .collect(),
+    }
+}
+
+/// Train the plan's army: Wains first, then the mix by deficit. M6: the
+/// mix is weighted by counters against the visible enemy army
+/// ([`super::compose`]) and jittered by `noise_mix_permille` per wave;
+/// Wains are trained only while the Wain rule needs them; and before the
+/// latch, emergency production ([`emergency`]) trains the non-siege kinds
+/// of the mix toward the deadline raid's `min_armed`.
 pub fn produce(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
-    if !producing(mem) {
+    let urgent = !producing(mem) && emergency(ctx, mem);
+    if !producing(mem) && !urgent {
         return;
     }
     let mut used: BTreeSet<BuildingId> = BTreeSet::new();
-    if let Some(wain) = unit_kind_id(ctx, &ctx.knobs.supply_kind)
+    if !urgent
+        && wain_needed(ctx)
+        && let Some(wain) = unit_kind_id(ctx, &ctx.knobs.supply_kind)
         && ctx.facts.alive_and_queued(wain) < ctx.knobs.wains_per_wave
         && let Some(b) = free_trainers(ctx, wain).first().copied()
     {
@@ -157,12 +225,26 @@ pub fn produce(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
             Err(_) => {}
         }
     }
-    let mix: Vec<(UnitKindId, u32)> = ctx
+    let personal: Vec<(UnitKindId, u32)> = ctx
         .knobs
         .army_mix
         .iter()
         .filter_map(|m| Some((unit_kind_id(ctx, &m.kind)?, m.weight)))
+        .collect();
+    let enemy = shares(&ctx.facts.enemy.armed);
+    let knobs = counters(ctx);
+    let weighted = weighted_mix(ctx.view.rules(), &personal, &enemy, &knobs, |k| {
+        in_share_base(ctx, k)
+    });
+    let waves = u64::from(mem.waves_launched);
+    let mix: Vec<(UnitKindId, u32)> = weighted
+        .into_iter()
+        .filter(|(k, _)| !urgent || !is_siege(ctx, *k))
         .filter(|(k, _)| in_share_base(ctx, *k))
+        .map(|(k, w)| {
+            let noise = ctx.noise(salt::MIX + (u64::from(k.0) << 16) + waves);
+            (k, jitter(w, noise, ctx.knobs.noise_mix_permille).max(1))
+        })
         .collect();
     let base: Vec<usize> = (0..mix.len()).collect();
     let now: Vec<usize> = base
@@ -181,8 +263,10 @@ pub fn produce(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
     for i in &now {
         trainers.extend(free_trainers(ctx, mix[*i].0));
     }
+    let mut raiders = raiders_alive_and_queued(ctx);
+    let raid_min = ctx.first_raid.map_or(0, |r| r.min_armed);
     for b in trainers {
-        if used.contains(&b) || ctx.commands_left == 0 {
+        if used.contains(&b) || ctx.commands_left == 0 || (urgent && raiders >= raid_min) {
             continue;
         }
         let mut order: Vec<(i64, UnitKindId, usize)> = now
@@ -204,6 +288,7 @@ pub fn produce(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
                 kind: k,
             }) {
                 have[i] += 1;
+                raiders = raiders.saturating_add(1);
             }
             break;
         }
@@ -421,5 +506,72 @@ mod tests {
         let mut ctx = a.ctx(P0);
         rally_upkeep(&mut ctx);
         assert!(ctx.into_commands().is_empty(), "set once");
+    }
+
+    /// M6: from `by_ds - prep_ds` of a deadline raid, before the
+    /// `Military` latch, the bot trains non-siege armed kinds of its mix
+    /// toward `min_armed`; not without a deadline raid, not once
+    /// `min_armed` stand, and never a Mangonel or a Wain.
+    #[test]
+    fn emergency_production_trains_raiders_before_the_military_latch() {
+        let r = crate::testkit::rules();
+        let raid = rules::FirstRaid {
+            by_ds: 600,
+            prep_ds: 600,
+            min_armed: 6,
+            max_armed: 10,
+        };
+        let setup = |extra: u16| {
+            let mut v = vec![
+                Command::DebugAdvanceAge { owner: P0 },
+                place(&r, P0, "muster_hall", 29, 66),
+                place(&r, P0, "engine_yard", 29, 58),
+            ];
+            v.extend(grant_all(&r, P0, 1000));
+            if extra > 0 {
+                v.push(crate::testkit::spawn(&r, P0, "skirmisher", 36, 64, extra));
+            }
+            Arena::frozen(standard_vs_passive(&r), v)
+        };
+        let a = setup(0);
+        let mh = a.buildings_of(P0, "muster_hall")[0];
+        let mut ctx = a.ctx(P0);
+        ctx.first_raid = Some(raid);
+        let mut mem = BotMemory::default();
+        assert!(emergency(&ctx, &mem));
+        produce(&mut ctx, &mut mem);
+        let cmds = ctx.into_commands();
+        assert!(!cmds.is_empty(), "trains before the latch");
+        for c in &cmds {
+            let Command::Train { building, kind } = c else {
+                panic!("{c:?}");
+            };
+            assert_eq!(*building, mh, "at the Muster Hall, not the Engine Yard");
+            let def = r.unit_kind(kind.0).unwrap();
+            assert!(
+                def.class != UnitClass::Siege && def.attack.is_some(),
+                "{}",
+                def.id
+            );
+        }
+        // No deadline raid: no production before the latch.
+        let mut ctx = a.ctx(P0);
+        ctx.first_raid = None;
+        produce(&mut ctx, &mut BotMemory::default());
+        assert!(ctx.into_commands().is_empty(), "no raid, no latch");
+        // Six armed already: nothing more.
+        let six = setup(6);
+        let mut ctx = six.ctx(P0);
+        ctx.first_raid = Some(raid);
+        let mem = BotMemory::default();
+        assert!(!emergency(&ctx, &mem));
+        // The raid launched: back to the latch.
+        let mut ctx = a.ctx(P0);
+        ctx.first_raid = Some(raid);
+        let mem = BotMemory {
+            raid_used: true,
+            ..BotMemory::default()
+        };
+        assert!(!emergency(&ctx, &mem));
     }
 }

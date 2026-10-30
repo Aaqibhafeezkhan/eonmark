@@ -1,0 +1,50 @@
+// Tower (M6): an Ore Pit early, a border Watchtower by the eighth step,
+// two Ore Pits and six Ore workers by the Masonry Age, Harrying I at once
+// (no wave launches before it), three border Watchtowers, a Bowman-led army
+// and (M6 owner decision 12) Statecraft II after Arms III, so a cap game in
+// which no Town fell is not a mirror image of its opponent's. Schema:
+// crates/rules/src/ai.rs (deny_unknown_fields). Knobs: personalities.ron.
+(
+  id: "tower",
+  steps: [
+    Workers(count: 7, split: {"grain": 3, "lumber": 4}),
+    Build(kind: "croft", count: 2, at: NearTown),
+    Build(kind: "lumber_yard", count: 1, at: Terrain),
+    Build(kind: "ore_pit", count: 1, at: Terrain),
+    Workers(count: 10, split: {"grain": 3, "lumber": 4, "ore": 3}),
+    Build(kind: "scriptorium", count: 1, at: NearTown),
+    Train(kind: "scribe", count: 3),
+    Build(kind: "watchtower", count: 1, at: BorderEdge, optional: true),
+    Build(kind: "croft", count: 3, at: NearTown),
+    Build(kind: "muster_hall", count: 1, at: NearTown),
+    Military,                                   // production starts; latched
+    Research(tech: "arms_1"),                   // age tech 1; pop 25 -> 50
+    Build(kind: "ore_pit", count: 2, at: Terrain),
+    Workers(count: 14, split: {"grain": 4, "lumber": 4, "ore": 6}),
+    Research(tech: "trade_1"),                  // age tech 2
+    Build(kind: "watchtower", count: 2, at: BorderEdge, optional: true),
+    Build(kind: "croft", count: 5, at: NearTown),
+    Advance(age: "masonry"),
+    Research(tech: "harrying_1", optional: true),     // hosted by the Watchtower
+    Build(kind: "engine_yard", count: 1, at: NearTown),
+    Train(kind: "mangonel", count: 1),
+    Build(kind: "watchtower", count: 3, at: BorderEdge, optional: true),
+    Build(kind: "town", count: 2, at: Expansion, optional: true),
+    Build(kind: "scriptorium", count: 2, at: NearTown),
+    Train(kind: "scribe", count: 6),
+    Research(tech: "arms_2"),
+    Workers(count: 17, split: {"grain": 6, "lumber": 5, "ore": 6}),
+    Research(tech: "letters_1"),
+    Research(tech: "trade_2"),
+    Research(tech: "statecraft_1"),
+    Advance(age: "charter"),                    // 6 counting techs before it
+    Research(tech: "harrying_2", optional: true),
+    Research(tech: "arms_3"),
+    Research(tech: "statecraft_2"),              // a turtle widens its borders
+    Build(kind: "lumber_yard", count: 2, at: Terrain),
+    Workers(count: 20, split: {"grain": 8, "lumber": 6, "ore": 6}),
+    Build(kind: "muster_hall", count: 2, at: NearTown),
+    Build(kind: "lumber_yard", count: 3, at: Terrain),
+    Workers(count: 23, split: {"grain": 8, "lumber": 9, "ore": 6}),
+  ],
+)

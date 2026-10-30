@@ -4,9 +4,35 @@
 use rules::{Rules, UnitClass};
 use sim::{
     BuildingId, BuildingKindId, Construction, Fx, FxVec2, Hold, Job, PlayerId, QueueItem, SimView,
-    TechId, Tile, UnitId, UnitKindId,
+    TechId, Tile, Unit, UnitId, UnitKindId,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The other players' units the bot may see (M6: the fog seam). Every read
+/// of enemy units by the bot's rules goes through here or through
+/// [`Facts::enemy`], so M7's fog of war filters in one place; until then
+/// the bot sees every unit (docs/design/fog.md lists the non-spatial
+/// reads: enemy techs, Harrying, worked slots).
+pub fn visible_enemies<'a>(
+    view: &SimView<'a>,
+    me: PlayerId,
+) -> impl Iterator<Item = &'a Unit> + 'a {
+    view.units().filter(move |u| u.owner != me)
+}
+
+/// What one plan knows of the enemy (M6), gathered with the [`Facts`]
+/// through the same seam as [`visible_enemies`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Enemies {
+    /// Armed (non-civilian, attacking) enemy units alive per kind: the
+    /// counter rule's input.
+    pub armed: BTreeMap<UnitKindId, u32>,
+    /// Enemy complete gathering buildings with at least one unit on a
+    /// gather job there, and that count, in id order: the raid targets.
+    pub worked: Vec<(BuildingId, u32)>,
+    /// The highest Harrying level of any other player (the Wain rule).
+    pub harrying: u32,
+}
 
 /// The centre of a `w` x `h` footprint whose north-west tile is `nw`, in
 /// world coordinates (a 3x3 footprint's centre is the middle of its middle
@@ -141,6 +167,8 @@ pub struct Facts {
     pub enemy_shooters: Vec<BuildingId>,
     /// Non-civilian units of the other players on own land.
     pub threats: Vec<UnitId>,
+    /// The enemy as the bot sees it (M6).
+    pub enemy: Enemies,
 }
 
 impl Facts {
@@ -199,16 +227,36 @@ impl Facts {
             enemy_towns: Vec::new(),
             enemy_shooters: Vec::new(),
             threats: Vec::new(),
+            enemy: Enemies {
+                harrying: view
+                    .players()
+                    .iter()
+                    .filter(|p| p.id != me)
+                    .map(|p| view.harrying_level(p.id))
+                    .max()
+                    .unwrap_or(0),
+                ..Enemies::default()
+            },
         };
         let territory = view.territory();
         let map = view.map();
         let mut taken: BTreeMap<BuildingId, u8> = BTreeMap::new();
+        let mut enemy_taken: BTreeMap<BuildingId, u32> = BTreeMap::new();
+        for u in visible_enemies(view, me) {
+            let k = flag(u.kind);
+            if !k.civilian && territory.owner_at(map.tile_of(u.pos)) == Some(me) {
+                f.threats.push(u.id);
+            }
+            if k.armed {
+                *f.enemy.armed.entry(u.kind).or_default() += 1;
+            }
+            if let Some(Job::Gather { node, .. }) = u.job {
+                *enemy_taken.entry(node).or_default() += 1;
+            }
+        }
         for u in view.units() {
             let k = flag(u.kind);
             if u.owner != me {
-                if !k.civilian && territory.owner_at(map.tile_of(u.pos)) == Some(me) {
-                    f.threats.push(u.id);
-                }
                 continue;
             }
             *f.alive.entry(u.kind).or_default() += 1;
@@ -243,6 +291,12 @@ impl Facts {
             if b.owner != me {
                 if complete && b.kind == town_kind {
                     f.enemy_towns.push(b.id);
+                }
+                if complete
+                    && let Some(n) = enemy_taken.get(&b.id).copied()
+                    && n > 0
+                {
+                    f.enemy.worked.push((b.id, n));
                 }
                 let shoots = rules
                     .building_kind(b.kind.0)
@@ -312,5 +366,38 @@ impl Facts {
     /// Own buildings of `kind`, sites included.
     pub fn owned(&self, kind: BuildingKindId) -> u32 {
         self.buildings.get(&kind).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The fog seam (M6 plan 2b.6, docs/design/fog.md): no rule of the
+    /// Standard bot iterates every unit except through [`super::visible_enemies`].
+    /// The only other `units()` reads are the seam itself, the own-unit
+    /// passes of `Facts::gather` and of the influence maps, and
+    /// `Ctx::occupied`, a placement-legality read (the sim's `SiteOccupied`
+    /// counts any player's unit) that fog.md lists for M7 to classify. A
+    /// new read of every unit elsewhere would see through M7's fog.
+    #[test]
+    fn enemy_units_are_read_only_through_the_seam() {
+        let needle = concat!(".", "units()");
+        let files: [(&str, &str, usize); 13] = [
+            ("army.rs", include_str!("army.rs"), 0),
+            ("build_order.rs", include_str!("build_order.rs"), 0),
+            ("compose.rs", include_str!("compose.rs"), 0),
+            ("ctx.rs", include_str!("ctx.rs"), 1),
+            ("defend.rs", include_str!("defend.rs"), 0),
+            ("economy.rs", include_str!("economy.rs"), 0),
+            ("facts.rs", include_str!("facts.rs"), 2),
+            ("influence.rs", include_str!("influence.rs"), 1),
+            ("memory.rs", include_str!("memory.rs"), 0),
+            ("mod.rs", include_str!("mod.rs"), 0),
+            ("retreat.rs", include_str!("retreat.rs"), 0),
+            ("sites.rs", include_str!("sites.rs"), 0),
+            ("waves.rs", include_str!("waves.rs"), 0),
+        ];
+        for (name, src, want) in files {
+            assert_eq!(src.matches(needle).count(), want, "{name}: units() reads");
+        }
     }
 }

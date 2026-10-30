@@ -128,6 +128,28 @@ jobs:
           cargo run -p sim-cli --locked --release -- verify crates/sim/tests/fixtures/m5_first_match.eonreplay | grep '^OK' | tee hash-macos-m5.txt
           test -s hash-macos-m5.txt
 
+      - name: M6 acceptance 3 (two play-bots --seeds 7..7 runs print identical final hashes)
+        # ROADMAP M6 line 3, the literal command twice on macOS (the headless
+        # job runs the same on Linux): the CSVs hold no wall time, so they
+        # must be byte-identical; the final hash goes to hash-macos-seed7.txt
+        # and hash-parity diffs it against Linux's. A second pair, Hard
+        # against Easy with the rush and tower personalities, puts the
+        # difficulty paths (the disclosed bonus of step 6d', the resolved
+        # knobs) and slice 2's behaviours (raids, the deadline raid, the
+        # Wain rule, reactive towers) under the same checks; it is not part
+        # of the literal line, so --allow-undecided keeps a draw from
+        # failing it.
+        run: |
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 > s7a.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 > s7b.csv
+          diff s7a.csv s7b.csv
+          awk -F, 'NR==2{print "seed=7 standard/standard final_hash=" $5}' s7a.csv | tee hash-macos-seed7.txt
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 --a hard --b easy --personality-a rush --personality-b tower --allow-undecided > s7c.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 --a hard --b easy --personality-a rush --personality-b tower --allow-undecided > s7d.csv
+          diff s7c.csv s7d.csv
+          awk -F, 'NR==2{print "seed=7 hard-rush/easy-tower final_hash=" $5}' s7c.csv | tee -a hash-macos-seed7.txt
+          test "$(grep -c 'final_hash=0x[0-9a-f]\{16\}$' hash-macos-seed7.txt)" = 2
+
       - uses: actions/upload-artifact@v7
         with:
           name: hash-macos
@@ -138,6 +160,7 @@ jobs:
             hash-macos-capture-seat.txt
             hash-macos-stalemate.txt
             hash-macos-m5.txt
+            hash-macos-seed7.txt
           if-no-files-found: error
 
   headless:
@@ -232,6 +255,20 @@ jobs:
           cargo run -p sim-cli --locked --release -- play-bots --seeds 1..5 --a passive --b standard --max-ticks 36000 | tee m5b-wave-b.csv
           scripts/check_first_wave.sh --side b --decisive m5b-wave-b.csv
 
+      - name: M6 acceptance 3 (two play-bots --seeds 7..7 runs print identical final hashes)
+        # ROADMAP M6 line 3 on Linux, the same commands as the macOS check
+        # job; hash-parity diffs the two hash-<os>-seed7.txt files.
+        run: |
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 > s7a.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 > s7b.csv
+          diff s7a.csv s7b.csv
+          awk -F, 'NR==2{print "seed=7 standard/standard final_hash=" $5}' s7a.csv | tee hash-linux-seed7.txt
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 --a hard --b easy --personality-a rush --personality-b tower --allow-undecided > s7c.csv
+          cargo run -p sim-cli --locked --release -- play-bots --seeds 7..7 --a hard --b easy --personality-a rush --personality-b tower --allow-undecided > s7d.csv
+          diff s7c.csv s7d.csv
+          awk -F, 'NR==2{print "seed=7 hard-rush/easy-tower final_hash=" $5}' s7c.csv | tee -a hash-linux-seed7.txt
+          test "$(grep -c 'final_hash=0x[0-9a-f]\{16\}$' hash-linux-seed7.txt)" = 2
+
       - name: ignored M5b bot tests (long games)
         # The m5b_ filter leaves out golden_m5_first_match, which the
         # release verify above covers. `ai` is opt-level 3 in dev.
@@ -291,7 +328,101 @@ jobs:
             hash-linux-capture-seat.txt
             hash-linux-stalemate.txt
             hash-linux-m5.txt
+            hash-linux-seed7.txt
           if-no-files-found: error
+
+  fun-gate:
+    name: fun-gate (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    # ROADMAP M6 acceptance 1, 2 and 4 with the literal commands (the M6
+    # plan's "fun-gate" job, docs/design/ai.md "The fun gate in CI"), in
+    # parallel with headless so that job keeps its time. Measured on the
+    # 4-vCPU VM: about 8-19 minutes once sim-cli is cached; if the job
+    # passes 25 minutes, the flip moves to release-check.yml. Every check
+    # step runs even when an earlier one failed (`!cancelled()`), and
+    # inside a step every command runs too (`|| rc=1`, then `exit "$rc"`:
+    # the default shell is `bash -eo pipefail`, which would otherwise stop
+    # at the first failing command and hide the rest), so one run reports
+    # every line; the job still fails if any step does.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-shared-key: fun-gate
+          cache-on-failure: true
+          rustflags: ""
+          build-warnings: warn
+
+      - name: build sim-cli (release)
+        run: cargo build -p sim-cli --locked --release
+
+      - name: M6 acceptance 1 (20 personality games, a winner in all)
+        if: ${{ !cancelled() }}
+        # The literal command; scripts/fun_gate.sh checks every clause by
+        # the M6 owner decision 1 readings (a winner is a or b; decisive is
+        # seat_captured before tick 48000; past 24000 is tick > 24000).
+        # The line requires exit 0, so play-bots' exit fails the step, but
+        # only after the summary and fun_gate.sh's clauses are printed.
+        run: |
+          start=$(date +%s)
+          rc=0
+          target/release/sim-cli play-bots --seeds 1..20 --a standard --b standard --personality-a rush,boom,tower --personality-b rush,boom,tower --max-ticks 72000 --jobs 5 > l1.csv 2> l1.err || { echo "play-bots exit=$?"; rc=1; }
+          tail -n 1 l1.err
+          scripts/fun_gate.sh l1.csv l1.err || rc=1
+          echo "elapsed_s=$(( $(date +%s) - start ))"
+          exit "$rc"
+
+      - name: M6 acceptance 2 (Standard beats Easy, Hard beats Standard)
+        if: ${{ !cancelled() }}
+        # The literal commands at --jobs 4 and with --allow-undecided: the
+        # CSV is the same at any --jobs and with or without the flag, which
+        # only stops a draw from making play-bots exit 1 (the line counts
+        # wins, not draws; a panic or a usage error still exits non-zero
+        # and fails the step). Only `winner == b` counts; check_ordering.sh
+        # also prints the cap games that ended untouched. Both pairings run
+        # and report whatever the first one gave.
+        run: |
+          start=$(date +%s)
+          rc=0
+          target/release/sim-cli play-bots --a easy --b standard --seeds 1..20 --jobs 4 --allow-undecided > e_s.csv 2> e_s.err || { echo "play-bots exit=$?"; rc=1; }
+          tail -n 1 e_s.err
+          scripts/check_ordering.sh e_s.csv b 15 || rc=1
+          target/release/sim-cli play-bots --a standard --b hard --seeds 1..20 --jobs 4 --allow-undecided > s_h.csv 2> s_h.err || { echo "play-bots exit=$?"; rc=1; }
+          tail -n 1 s_h.err
+          scripts/check_ordering.sh s_h.csv b 15 || rc=1
+          echo "elapsed_s=$(( $(date +%s) - start ))"
+          exit "$rc"
+
+      - name: M6 acceptance 4, first clause (Hard attacks the borders before minute 12)
+        if: ${{ !cancelled() }}
+        # Hard against Passive in seeds 1..3, as the New Game seat (b), with
+        # every Random style, and from seat a; check_attack_before.sh also
+        # requires an armed unit on the enemy's land before tick 14400.
+        run: |
+          rc=0
+          target/release/sim-cli play-bots --seeds 1..3 --a passive --b hard --max-ticks 14400 --allow-undecided > h.csv || rc=1
+          scripts/check_attack_before.sh --side b --before 14400 h.csv || rc=1
+          target/release/sim-cli play-bots --seeds 1..3 --a passive --b hard --personality-b rush,boom,tower --max-ticks 14400 --allow-undecided > hp.csv || rc=1
+          scripts/check_attack_before.sh --side b --before 14400 hp.csv || rc=1
+          target/release/sim-cli play-bots --seeds 1..3 --a hard --b passive --max-ticks 14400 --allow-undecided > ha.csv || rc=1
+          scripts/check_attack_before.sh --side a --before 14400 ha.csv || rc=1
+          exit "$rc"
+
+      - name: M6 acceptance 4, second clause (hard.ron income_interval_ds 200 -> 300 flips Hard vs Easy)
+        if: ${{ !cancelled() }}
+        run: |
+          start=$(date +%s)
+          rc=0
+          scripts/check_difficulty_flip.sh || rc=1
+          echo "elapsed_s=$(( $(date +%s) - start ))"
+          exit "$rc"
+
+      - name: ignored M6 bot tests (long games)
+        if: ${{ !cancelled() }}
+        run: cargo test -p ai --locked -- --ignored m6_
 
   game-linux:
     name: game compiles on Linux
@@ -452,3 +583,14 @@ jobs:
           test -s hashes/macos/hash-macos-m5.txt
           test -s hashes/linux/hash-linux-m5.txt
           diff hashes/macos/hash-macos-m5.txt hashes/linux/hash-linux-m5.txt
+
+      - name: compare M6 acceptance 3 (seed 7, Standard against Standard and Hard against Easy)
+        # ROADMAP M6 line 3: both jobs ran `play-bots --seeds 7..7` twice
+        # with identical CSVs; their final-hash lines must also agree across
+        # the two operating systems.
+        run: |
+          echo "macOS:"; cat hashes/macos/hash-macos-seed7.txt
+          echo "Linux:"; cat hashes/linux/hash-linux-seed7.txt
+          test -s hashes/macos/hash-macos-seed7.txt
+          test -s hashes/linux/hash-linux-seed7.txt
+          diff hashes/macos/hash-macos-seed7.txt hashes/linux/hash-linux-seed7.txt

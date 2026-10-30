@@ -2238,18 +2238,29 @@ fn annexation_during_the_timer_research_is_rejected_and_a_research_entry_pauses(
 }
 
 /// The `capture_seat` scenario (`sim::scenarios::capture_seat`) run to the
-/// first step with an outcome, at most `CAPTURE_SEAT_MAX_TICKS`.
-fn capture_seat_to_outcome(rules: &Rules) -> (Sim, sim::scenarios::Stream, Vec<(u32, SimEvent)>) {
+/// first step with an outcome, at most `CAPTURE_SEAT_MAX_TICKS`, with the
+/// M6 `MatchStats` fed after every step.
+fn capture_seat_to_outcome(
+    rules: &Rules,
+) -> (
+    Sim,
+    sim::scenarios::Stream,
+    Vec<(u32, SimEvent)>,
+    sim::MatchStats,
+) {
     let (setup, stream, cap) = sim::scenarios::by_name("capture_seat", rules).unwrap();
+    let mut stats = sim::MatchStats::new(&setup, rules);
     let mut sim = Sim::new(setup, rules.clone(), Box::new(NoAi));
     let mut events = Vec::new();
     while sim.outcome().is_none() {
         let t = sim.tick();
         assert!(t < cap, "decided within {cap} ticks");
         sim.step(sim::scenarios::commands_at(&stream, t));
-        events.extend(sim.drain_events().into_iter().map(|e| (t, e)));
+        let step_events = sim.drain_events();
+        stats.observe(&sim.view(), &step_events);
+        events.extend(step_events.into_iter().map(|e| (t, e)));
     }
-    (sim, stream, events)
+    (sim, stream, events, stats)
 }
 
 /// Acceptance 2, fourth clause: capturing the Seat makes `outcome()` return
@@ -2262,7 +2273,7 @@ fn capture_seat_to_outcome(rules: &Rules) -> (Sim, sim::scenarios::Stream, Vec<(
 #[test]
 fn annexation_capturing_the_seat_makes_outcome_a_decisive_victory() {
     let rules = load_rules();
-    let (mut sim, stream, events) = capture_seat_to_outcome(&rules);
+    let (mut sim, stream, events, _) = capture_seat_to_outcome(&rules);
     let seat = BuildingId(2);
     let result = sim.result().unwrap();
     assert_eq!(
@@ -3237,7 +3248,7 @@ fn annexation_view_remaining_ticks_agrees_with_the_flip() {
 fn annexation_capture_seat_scenario_beats() {
     use sim::scenarios::{CAPTURE_SEAT_MOVE_TICK, CAPTURE_SEAT_RING};
     let rules = load_rules();
-    let (sim, _, events) = capture_seat_to_outcome(&rules);
+    let (sim, _, events, stats) = capture_seat_to_outcome(&rules);
     let seat = BuildingId(2);
     let rejected: Vec<_> = events
         .iter()
@@ -3273,6 +3284,20 @@ fn annexation_capture_seat_scenario_beats() {
         assert_eq!(bled(u), 0, "{u}");
     }
     assert_eq!(CAPTURE_SEAT_RING.len(), 8);
+    // M6: the same run's `MatchStats`. P0 took P1's Seat, P1 lost its five
+    // Yeomen (and its Seat: its lowest own Town is 0), and the Seat P0
+    // annexed, back at 250 per mille, never counts as P0's own.
+    let yeoman = UnitKindId(
+        u16::try_from(rules.units.iter().position(|u| u.id == "yeoman").unwrap()).unwrap(),
+    );
+    let (s0, s1) = (stats.player(P0), stats.player(P1));
+    assert_eq!((s0.towns_taken, s0.towns_lost), (1, 0));
+    assert_eq!((s1.towns_taken, s1.towns_lost), (0, 1));
+    assert_eq!(s1.units_lost.get(&yeoman), Some(&5));
+    assert_eq!(s1.min_own_town_hp_permille, 0);
+    assert_eq!(s0.min_own_town_hp_permille, 1000);
+    assert_eq!(stats.decided_tick(), Some(sim.tick()));
+    assert!(stats.first_contact_tick().is_some());
     println!(
         "capture_seat: P1's Yeomen dead at {p1_dead:?}, Seat at 0 HP in step {zero}, timer from step {entry}, decided at tick {} ({:?}), the Bowman took {} pulses",
         sim.tick(),
@@ -3597,7 +3622,7 @@ fn annexation_outcome_tiebreak_goes_to_either_player() {
 #[test]
 fn annexation_outcome_surrender_beats_a_same_step_seat_capture() {
     let rules = load_rules();
-    let (sim, _, _) = capture_seat_to_outcome(&rules);
+    let (sim, _, _, _) = capture_seat_to_outcome(&rules);
     let decision = sim.result().unwrap().tick;
     let (setup, stream, _) = sim::scenarios::by_name("capture_seat", &rules).unwrap();
     let delay = setup.cmd_delay;

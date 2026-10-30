@@ -92,6 +92,8 @@ pub const LOCAL_PLAYER: PlayerId = PlayerId(0);
 /// outside this module calls `step`; every other module reads `view()`.
 pub struct SimHandle {
     sim: Sim,
+    /// The match statistics (M6), fed by [`SimHandle::drain_events`].
+    stats: sim::MatchStats,
 }
 
 impl SimHandle {
@@ -122,8 +124,10 @@ impl SimHandle {
     pub fn try_from_setup(setup: MatchSetup, rules: Rules) -> Result<Self, String> {
         let ai: Box<dyn AiController> =
             ai::controller_for(&setup, &rules).map_err(|e| e.to_string())?;
+        let stats = sim::MatchStats::new(&setup, &rules);
         Ok(Self {
             sim: Sim::new(setup, rules, ai),
+            stats,
         })
     }
 
@@ -228,9 +232,20 @@ impl SimHandle {
 
     /// Events since the last drain (`UnitSpawned`, `UnitArrived`,
     /// `CommandRejected`, ...). The fixed-step driver drains them every tick
-    /// and forwards them as [`SimEventMsg`].
+    /// and forwards them as [`SimEventMsg`]; [`SimHandle::fast_forward`]
+    /// drains after every step too. Every drain also feeds the match
+    /// statistics (M6, [`SimHandle::stats`]) with the view after the step.
     pub fn drain_events(&mut self) -> Vec<sim::SimEvent> {
-        self.sim.drain_events()
+        let events = self.sim.drain_events();
+        self.stats.observe(&self.sim.view(), &events);
+        events
+    }
+
+    /// The match statistics so far (M6): the game-over screen's numbers,
+    /// the same `sim::MatchStats` the play-bots harness and `sim-cli
+    /// match-log` derive.
+    pub fn stats(&self) -> &sim::MatchStats {
+        &self.stats
     }
 }
 
@@ -2533,6 +2548,33 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// M6: `SimHandle::drain_events` (and so `fast_forward`) feeds the
+    /// match statistics: the same numbers the play-bots harness derives
+    /// for the same setup, the Hard bot's disclosed bonus among them.
+    #[test]
+    fn drain_events_feeds_the_match_stats_like_the_harness() {
+        let rules = Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap();
+        let mut handle = SimHandle::vs_bot(rules.clone(), 5, "hard", "standard");
+        handle.fast_forward(4500).unwrap();
+        let mut m =
+            ai::harness::BotMatch::with_bots(handle.setup().clone(), rules.clone()).unwrap();
+        m.run(4500);
+        assert_eq!(handle.stats(), m.observer.stats());
+        let bundle: i64 = rules
+            .ai
+            .difficulty("hard")
+            .unwrap()
+            .bundle(&rules)
+            .iter()
+            .sum();
+        assert_eq!(handle.stats().player(PlayerId(1)).bonus_total(), 2 * bundle);
+        assert_eq!(
+            handle.stats().player(PlayerId(0)).bonus_total(),
+            0,
+            "the human gets nothing"
+        );
+    }
+
     /// `SimHandle::fast_forward` steps to its target with the events
     /// drained after every step, and is refused once the match is decided
     /// on the way, or already: the overlay needs a live deciding step.
@@ -2568,6 +2610,7 @@ mod tests {
                 rules.clone(),
                 Box::new(Script { surrender_at: 40 }),
             ),
+            stats: sim::MatchStats::new(&setup, &rules),
         };
         // Control: the same 30 ticks without draining leave the rejection.
         let mut control = scripted();

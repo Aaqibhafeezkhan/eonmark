@@ -7,7 +7,11 @@
 //! data-driven [`standard::StandardBot`] (knobs and build orders from
 //! `data/ai/`, attached to `Rules::ai`), [`controller_for`], which builds
 //! the controller for a match header's AI seats, and the engine-free
-//! [`harness`] behind `sim-cli play-bots`.
+//! [`harness`] behind `sim-cli play-bots`. M6 makes a seat's `bot` a
+//! difficulty id (`easy`, `standard`, `hard`: [`bot_ids`],
+//! [`is_standard_bot`]); every difficulty is the Standard bot playing the
+//! knobs `rules::ai::resolve` derives, while the sim pays the level's
+//! disclosed bonus.
 //!
 //! Module map:
 //!
@@ -38,11 +42,74 @@ use sim::{
 use std::collections::BTreeMap;
 
 /// The bot id of [`Passive`] in `MatchSetup.ai_seats`.
-pub const BOT_PASSIVE: &str = "passive";
-/// The bot id of [`standard::StandardBot`] in `MatchSetup.ai_seats`.
-pub const BOT_STANDARD: &str = "standard";
-/// Every bot id [`controller_for`] accepts.
-pub const BOTS: [&str; 2] = [BOT_PASSIVE, BOT_STANDARD];
+pub const BOT_PASSIVE: &str = rules::ai::PASSIVE_ID;
+/// The default bot id: the `standard` difficulty, played by
+/// [`standard::StandardBot`] (M6: any difficulty id of
+/// `data/ai/difficulty/` is a Standard bot, [`is_standard_bot`]).
+pub const BOT_STANDARD: &str = rules::ai::STANDARD_DIFFICULTY;
+/// The personality pseudo-id that `play-bots` and the game resolve per
+/// seed with [`resolve_personality`] (M6).
+pub const RANDOM_PERSONALITY: &str = "random";
+
+/// Every bot id [`controller_for`] accepts under `rules` (M6): `passive`,
+/// then the difficulty ids of `data/ai/difficulty/` in id order.
+pub fn bot_ids(rules: &Rules) -> Vec<String> {
+    std::iter::once(BOT_PASSIVE.to_string())
+        .chain(rules.ai.difficulties.keys().cloned())
+        .collect()
+}
+
+/// Whether `bot` is played by [`standard::StandardBot`]: it names a
+/// difficulty level of `rules` (M6).
+pub fn is_standard_bot(rules: &Rules, bot: &str) -> bool {
+    rules.ai.difficulty(bot).is_some()
+}
+
+/// The salt of [`resolve_personality`]'s hash.
+const RANDOM_PERSONALITY_SALT: u64 = 0x5241_4e44_4f4d;
+
+/// The personality the `random` choice gives `player` at `seed` (M6): one
+/// of the personalities with `random: true` in
+/// `data/ai/personalities.ron`, in file order, picked by a hash of the
+/// seed and the player (`sim::ai_noise`, never the sim's `Pcg32`), so a
+/// seed always resolves to the same style and the two seats of a
+/// bot-versus-bot match draw independently. The result is written to the
+/// header, so a replay never resolves it again. Adding a personality to
+/// the pool remaps the seeds.
+///
+/// # Errors
+///
+/// When no personality is in the pool.
+pub fn resolve_personality(rules: &Rules, seed: u64, player: PlayerId) -> Result<String, String> {
+    let pool: Vec<&str> = rules
+        .ai
+        .personalities
+        .iter()
+        .filter(|p| p.random)
+        .map(|p| p.id.as_str())
+        .collect();
+    if pool.is_empty() {
+        return Err(
+            "\"random\" needs a personality with `random: true` in data/ai/personalities.ron; none has it"
+                .to_string(),
+        );
+    }
+    let n = u64::try_from(pool.len()).expect("few personalities");
+    let pick = sim::ai_noise(seed, player, RANDOM_PERSONALITY_SALT) % n;
+    Ok(pool[usize::try_from(pick).expect("below the pool length")].to_string())
+}
+
+/// The bot statistics of `player`'s seat (M6), read from its memory
+/// outside `think`: waves, raids, retreats and wiped waves, for the
+/// play-bots CSV and the game-over screen. `None` for a human slot or a
+/// `passive` seat.
+pub fn bot_stats(view: &SimView<'_>, player: PlayerId) -> Option<standard::BotStats> {
+    let seat = view.setup().ai_seats.iter().find(|s| s.player == player)?;
+    if !is_standard_bot(view.rules(), &seat.bot) {
+        return None;
+    }
+    Some(standard::stats(view.ai_memory(player)))
+}
 
 /// Why [`controller_for`] could not build a controller for a header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +122,14 @@ pub enum BotError {
         /// The `is_ai` slots, in order.
         ai_slots: Vec<PlayerId>,
     },
-    /// A seat names a bot this build does not know.
+    /// A seat names a bot the rules do not know.
     UnknownBot {
         /// The seat.
         player: PlayerId,
         /// The bot id.
         bot: String,
+        /// The bot ids the rules know ([`bot_ids`]).
+        known: Vec<String>,
     },
     /// A seat names a personality its bot cannot take: one that is not in
     /// `data/ai/personalities.ron`, or any for `passive`.
@@ -83,11 +152,11 @@ impl core::fmt::Display for BotError {
                 seats.iter().map(|p| p.0).collect::<Vec<_>>(),
                 ai_slots.iter().map(|p| p.0).collect::<Vec<_>>()
             ),
-            BotError::UnknownBot { player, bot } => write!(
+            BotError::UnknownBot { player, bot, known } => write!(
                 f,
                 "player {}: unknown bot {bot:?} (known: {})",
                 player.0,
-                BOTS.join(", ")
+                known.join(", ")
             ),
             BotError::UnknownPersonality {
                 player,
@@ -118,7 +187,9 @@ impl std::error::Error for BotError {}
 /// `hash-dump`, `record`, the game and its `--headless-run`) builds bots
 /// through this, so a header always gets the bots it was recorded with.
 /// The slot check comes first, so a header `Sim::new` would reject is an
-/// error here instead of a panic.
+/// error here instead of a panic. A seat's `bot` is `passive` or a
+/// difficulty id (M6), whose Standard bot plays its personality's knobs
+/// resolved for that level.
 pub fn controller_for(
     setup: &MatchSetup,
     rules: &Rules,
@@ -143,7 +214,14 @@ pub fn controller_for(
         let bot: Box<dyn AiController> = match seat.bot.as_str() {
             BOT_PASSIVE if seat.personality.is_empty() => Box::new(Passive),
             BOT_PASSIVE => return Err(unknown_personality()),
-            BOT_STANDARD => {
+            id => {
+                let Some(difficulty) = rules.ai.difficulty(id) else {
+                    return Err(BotError::UnknownBot {
+                        player: seat.player,
+                        bot: seat.bot.clone(),
+                        known: bot_ids(rules),
+                    });
+                };
                 let personality = rules
                     .ai
                     .personality(&seat.personality)
@@ -153,13 +231,8 @@ pub fn controller_for(
                     setup,
                     seat.player,
                     personality,
+                    difficulty,
                 ))
-            }
-            _ => {
-                return Err(BotError::UnknownBot {
-                    player: seat.player,
-                    bot: seat.bot.clone(),
-                });
             }
         };
         by_player.insert(seat.player, bot);
@@ -168,26 +241,39 @@ pub fn controller_for(
 }
 
 /// One line about `player`'s bot for the dev panel and debugging (M5b):
-/// for a Standard seat, the build-order window (step index and label),
-/// the `Military` latch, the wave (phase and size, the next launch tick,
-/// waves launched) and the defend latch (Town and age, defences
-/// released), read from the view and the player's memory; `passive` for a
-/// Passive seat, `human` for a slot with no seat. Call it outside
-/// `think`, where `view.ai_memory` shows the memory.
+/// for a Standard seat, its difficulty and personality, the build-order
+/// window (step index and label), the difficulty's first raid (M6: its
+/// deadline tick, or `none`) with the raids and retreats so far, the
+/// `Military` latch, the wave (phase and size, the next launch tick, waves
+/// launched) and the defend latch (Town and age, defences released), read
+/// from the view and the player's memory; `passive` for a Passive seat,
+/// `human` for a slot with no seat. Call it outside `think`, where
+/// `view.ai_memory` shows the memory.
 pub fn describe(view: &SimView<'_>, player: PlayerId) -> String {
     let Some(seat) = view.setup().ai_seats.iter().find(|s| s.player == player) else {
         return "human".to_string();
     };
-    if seat.bot != BOT_STANDARD {
-        return seat.bot.clone();
-    }
     let rules = view.rules();
-    let Some(knobs) = rules.ai.personality(&seat.personality) else {
-        return format!("standard {}: unknown personality", seat.personality);
+    let Some(level) = rules.ai.difficulty(&seat.bot) else {
+        return seat.bot.clone();
     };
-    let Some(order) = rules.ai.build_order(&knobs.build_order) else {
-        return format!("standard {}: unknown build order", seat.personality);
+    let Some(personality) = rules.ai.personality(&seat.personality) else {
+        return format!("{} {}: unknown personality", seat.bot, seat.personality);
     };
+    let knobs = rules::ai::resolve(personality, level);
+    let Some(order) = rules
+        .ai
+        .build_order(&knobs.build_order)
+        .map(|o| rules::ai::resolve_order(o, level))
+    else {
+        return format!("{} {}: unknown build order", seat.bot, seat.personality);
+    };
+    let order = &order;
+    let stats = standard::stats(view.ai_memory(player));
+    let raid = level.first_raid.map_or_else(
+        || "none".to_string(),
+        |r| format!("by {}", rules.ticks_from_ds(r.by_ds)),
+    );
     let mem = standard::BotMemory::decode(view.ai_memory(player));
     let facts = standard::Facts::gather(view, player);
     let lookahead = usize::try_from(knobs.lookahead).unwrap_or(1);
@@ -211,9 +297,12 @@ pub fn describe(view: &SimView<'_>, player: PlayerId) -> String {
         },
     );
     format!(
-        "standard {} window=[{}] military={} wave={} next_wave={} waves={} defend={} defends={}",
+        "{} {} window=[{}] raid={raid} raids={} retreats={} military={} wave={} next_wave={} waves={} defend={} defends={}",
+        seat.bot,
         seat.personality,
         window.join(", "),
+        stats.raids,
+        stats.retreats,
         if mem.military { "yes" } else { "no" },
         wave,
         mem.next_wave_at,
@@ -444,8 +533,167 @@ mod tests {
         }
     }
 
+    /// M6: the bot ids are `passive` and the difficulty ids; only the
+    /// difficulties are Standard bots.
+    #[test]
+    fn controller_for_builds_every_difficulty_and_lists_ids_on_error() {
+        let r = rules();
+        assert_eq!(bot_ids(&r), ["passive", "easy", "hard", "standard"]);
+        for id in ["easy", "standard", "hard"] {
+            assert!(is_standard_bot(&r, id), "{id}");
+            let setup = MatchSetup::bots(&r, 3, (id, "standard"), (id, "standard"));
+            let mut sim = Sim::new(
+                setup.clone(),
+                r.clone(),
+                controller_for(&setup, &r).unwrap(),
+            );
+            for _ in 0..30 {
+                sim.step(&[]);
+            }
+            assert!(sim.view().commands_applied() > 0, "{id} plays");
+        }
+        assert!(!is_standard_bot(&r, BOT_PASSIVE));
+        assert!(!is_standard_bot(&r, "nightmare"));
+    }
+
+    /// M6: a Standard bot's knobs are `resolve(personality, difficulty)`,
+    /// a pure function of the rules and the header: two bots built for
+    /// the same seat agree, and `standard` plays the personality with its
+    /// level's all-in time and (M6 owner decision 12) no retreat.
+    #[test]
+    fn knobs_are_pure_functions_of_rules_and_header() {
+        let r = rules();
+        let p = r.ai.personality("standard").unwrap();
+        let setup = MatchSetup::bots(&r, 1, ("hard", "standard"), ("easy", "standard"));
+        for (seat, id) in [(PlayerId(0), "hard"), (PlayerId(1), "easy")] {
+            let level = r.ai.difficulty(id).unwrap();
+            let a = standard::StandardBot::new(&r, &setup, seat, p, level);
+            let b = standard::StandardBot::new(&r, &setup, seat, p, level);
+            assert_eq!(a.knobs(), b.knobs());
+            assert_eq!(a.knobs(), &rules::ai::resolve(p, level));
+            assert_eq!(a.first_raid(), level.first_raid);
+            assert_eq!(a.difficulty(), id);
+            // The build order it plays is the level's resolved order (M6
+            // owner decision 12: Easy's Statecraft II appended).
+            let order = r.ai.build_order(&p.build_order).unwrap();
+            assert_eq!(a.order(), &rules::ai::resolve_order(order, level));
+        }
+        let first_workers = |o: &rules::BuildOrder| {
+            o.steps.iter().find_map(|s| match s {
+                rules::Step::Workers { count, .. } => Some(*count),
+                _ => None,
+            })
+        };
+        let easy = r.ai.difficulty("easy").unwrap();
+        let easy_bot = standard::StandardBot::new(&r, &setup, PlayerId(1), p, easy);
+        assert_eq!(first_workers(easy_bot.order()), Some(7));
+        let shipped = r.ai.build_order(&p.build_order).unwrap();
+        assert_eq!(easy_bot.order().steps.len(), shipped.steps.len() + 1);
+        assert_eq!(
+            easy_bot.order().steps.last(),
+            Some(&rules::Step::Research {
+                tech: "statecraft_2".into(),
+                optional: true
+            })
+        );
+        let standard = r.ai.difficulty("standard").unwrap();
+        let bot = standard::StandardBot::new(&r, &setup, PlayerId(0), p, standard);
+        let mut want = p.clone();
+        // Standard retreats as its personality does (the review of the M6
+        // retune put it back); only its all-in time moves.
+        want.all_in_after_ds = 21600;
+        assert_eq!(bot.knobs(), &want);
+        assert_eq!(bot.order(), shipped);
+        assert_eq!(first_workers(bot.order()), Some(7));
+        // `describe` reads the same resolved window for the Easy seat (at
+        // tick 0, before the first plan, the window starts at step 0).
+        let sim = Sim::new(
+            setup.clone(),
+            r.clone(),
+            controller_for(&setup, &r).unwrap(),
+        );
+        let line = describe(&sim.view(), PlayerId(1));
+        assert!(
+            line.starts_with("easy standard window=[0 workers 7, "),
+            "{line}"
+        );
+        let line = describe(&sim.view(), PlayerId(0));
+        assert!(
+            line.starts_with("hard standard window=[0 workers 7, "),
+            "{line}"
+        );
+    }
+
+    /// M6: `random` resolves per seed and seat from the pool of
+    /// personalities with `random: true`, the same way every time; with
+    /// no such personality it is an error.
+    #[test]
+    fn resolve_personality_draws_from_the_random_pool() {
+        let mut r = rules();
+        // The shipped pool (slice 2): rush, boom and tower, never the
+        // Balanced `standard`, an explicit choice.
+        let shipped: Vec<String> = (0..60)
+            .map(|seed| resolve_personality(&r, seed, PlayerId(1)).unwrap())
+            .collect();
+        for id in ["rush", "boom", "tower"] {
+            assert!(shipped.iter().any(|p| p == id), "{id} is drawn");
+        }
+        assert!(!shipped.iter().any(|p| p == "standard"));
+        for p in &mut r.ai.personalities {
+            p.random = false;
+        }
+        let err = resolve_personality(&r, 1, PlayerId(1)).unwrap_err();
+        assert!(err.contains("random: true"), "{err}");
+        let mut extra = |id: &str| {
+            let mut p = r.ai.personality("standard").unwrap().clone();
+            p.id = id.to_string();
+            p.random = true;
+            r.ai.personalities.push(p);
+        };
+        extra("a");
+        extra("b");
+        extra("c");
+        let picks: Vec<String> = (0..60)
+            .map(|seed| resolve_personality(&r, seed, PlayerId(1)).unwrap())
+            .collect();
+        for id in ["a", "b", "c"] {
+            assert!(picks.iter().any(|p| p == id), "{id} is drawn");
+        }
+        assert!(!picks.iter().any(|p| p == "standard"), "not in the pool");
+        let again: Vec<String> = (0..60)
+            .map(|seed| resolve_personality(&r, seed, PlayerId(1)).unwrap())
+            .collect();
+        assert_eq!(picks, again);
+        let other_seat: Vec<String> = (0..60)
+            .map(|seed| resolve_personality(&r, seed, PlayerId(0)).unwrap())
+            .collect();
+        assert_ne!(picks, other_seat, "the seats draw independently");
+    }
+
+    /// M6: `bot_stats` reads a Standard seat's memory and is `None` for a
+    /// human slot or a Passive seat.
+    #[test]
+    fn bot_stats_reads_standard_seats_only() {
+        let r = rules();
+        let setup = MatchSetup::bots(&r, 1, ("hard", "standard"), ("passive", ""));
+        let sim = Sim::new(
+            setup.clone(),
+            r.clone(),
+            controller_for(&setup, &r).unwrap(),
+        );
+        let view = sim.view();
+        assert_eq!(
+            bot_stats(&view, PlayerId(0)),
+            Some(standard::BotStats::default())
+        );
+        assert_eq!(bot_stats(&view, PlayerId(1)), None);
+        let human = Sim::new(MatchSetup::skirmish(&r, 1), r, Box::new(Passive));
+        assert_eq!(bot_stats(&human.view(), PlayerId(0)), None);
+    }
+
     /// M5b: `controller_for` reads the header's seats: the slot check
-    /// first, then each seat's bot and personality.
+    /// first, then each seat's bot and personality. M6: every difficulty
+    /// id is a bot, and the unknown ones are ids no data file defines.
     #[test]
     fn controller_for_checks_slots_bots_and_personalities() {
         let r = rules();
@@ -453,6 +701,8 @@ mod tests {
             MatchSetup::skirmish(&r, 1),
             MatchSetup::vs_bot(&r, 1, BOT_STANDARD, "standard"),
             MatchSetup::bots(&r, 1, ("standard", "standard"), ("passive", "")),
+            MatchSetup::bots(&r, 1, ("easy", "standard"), ("hard", "standard")),
+            MatchSetup::vs_bot(&r, 1, "hard", "standard"),
             MatchSetup::scenario(&r, 1),
         ] {
             assert!(controller_for(&setup, &r).is_ok(), "{:?}", setup.ai_seats);
@@ -476,16 +726,22 @@ mod tests {
             2
         ];
         assert!(matches!(err(&s), BotError::SlotMismatch { .. }));
-        // An unknown bot is reported even after a valid seat.
-        let s = MatchSetup::bots(&r, 1, ("passive", ""), ("hard", "standard"));
+        // An unknown bot is reported even after a valid seat, with the ids
+        // the rules know.
+        let s = MatchSetup::bots(&r, 1, ("passive", ""), ("nightmare", "standard"));
         assert_eq!(
             err(&s).to_string(),
-            "player 1: unknown bot \"hard\" (known: passive, standard)"
+            "player 1: unknown bot \"nightmare\" (known: passive, easy, hard, standard)"
         );
-        let s = MatchSetup::vs_bot(&r, 1, "standard", "rush");
+        let s = MatchSetup::vs_bot(&r, 1, "standard", "zerg");
         assert_eq!(
             err(&s).to_string(),
-            "player 1: bot \"standard\" has no personality \"rush\" in data/ai/personalities.ron"
+            "player 1: bot \"standard\" has no personality \"zerg\" in data/ai/personalities.ron"
+        );
+        let s = MatchSetup::vs_bot(&r, 1, "hard", "zerg");
+        assert_eq!(
+            err(&s).to_string(),
+            "player 1: bot \"hard\" has no personality \"zerg\" in data/ai/personalities.ron"
         );
         let s = MatchSetup::vs_bot(&r, 1, "passive", "standard");
         assert_eq!(

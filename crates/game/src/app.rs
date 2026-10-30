@@ -112,6 +112,31 @@ pub fn spectate_setup(rules: &Rules, seed: u64) -> MatchSetup {
     )
 }
 
+/// The setup of a plain launch or `--skip-menu` (M6): the local player
+/// against `--difficulty` (default `standard`) with `--personality`
+/// (default `standard`; `random` resolved for the bot's seat at `seed`,
+/// `ai::resolve_personality`), or `passive` with no personality.
+///
+/// # Errors
+///
+/// A personality for `passive`, or `random` with no personality in the
+/// pool. Unknown ids are reported when the bots are built.
+pub fn vs_bot_setup(cli: &Cli, rules: &Rules, seed: u64) -> Result<MatchSetup, String> {
+    let bot = cli.difficulty.as_deref().unwrap_or(ai::BOT_STANDARD);
+    let personality = match (bot, cli.personality.as_deref()) {
+        (ai::BOT_PASSIVE, None) => String::new(),
+        (ai::BOT_PASSIVE, Some(p)) => {
+            return Err(format!("--personality {p}: the passive bot takes none"));
+        }
+        (_, None) => STANDARD_PERSONALITY.to_string(),
+        (_, Some(ai::RANDOM_PERSONALITY)) => {
+            ai::resolve_personality(rules, seed, sim::PlayerId(1))?
+        }
+        (_, Some(p)) => p.to_string(),
+    };
+    Ok(MatchSetup::vs_bot(rules, seed, bot, &personality))
+}
+
 /// The sim and the input source a windowed session starts with: a match
 /// against the Standard bot (a plain launch, `--skip-menu`), the Standard
 /// bot against itself (`--spectate`, fast-forwarded to
@@ -136,16 +161,16 @@ pub fn build_match(cli: &Cli, rules: Rules) -> Result<(SimHandle, Box<dyn InputS
         return Ok((handle, Box::new(LocalInput)));
     }
     match &cli.scenario {
-        // M5b: a plain launch plays the Standard bot (`MatchSetup::vs_bot`).
-        None => Ok((
-            SimHandle::vs_bot(
-                rules,
-                match_seed(cli),
-                ai::BOT_STANDARD,
-                STANDARD_PERSONALITY,
-            ),
-            Box::new(LocalInput),
-        )),
+        // M5b: a plain launch plays the Standard bot (`MatchSetup::vs_bot`);
+        // M6: `--difficulty` and `--personality` choose it.
+        None => {
+            let seed = match_seed(cli);
+            let setup = vs_bot_setup(cli, &rules, seed)?;
+            Ok((
+                SimHandle::try_from_setup(setup, rules)?,
+                Box::new(LocalInput),
+            ))
+        }
         Some(name) => {
             let Some((mut setup, stream, _ticks)) = scenarios::by_name(name, &rules) else {
                 return Err(format!(
@@ -1092,6 +1117,60 @@ mod tests {
                 Cli::default().seed
             );
         }
+    }
+
+    /// M6: `--difficulty` and `--personality` choose the opponent of
+    /// `--skip-menu` (and of a plain launch); an unknown id, a personality
+    /// for `passive` and a `random` with an empty pool are errors.
+    #[test]
+    fn difficulty_and_personality_choose_the_opponent() {
+        let rules =
+            Rules::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .unwrap();
+        let (hard, _) = build_match(
+            &launch(&["--skip-menu", "--seed", "5", "--difficulty", "hard"]),
+            rules.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            *hard.setup(),
+            MatchSetup::vs_bot(&rules, 5, "hard", "standard")
+        );
+        let (passive, _) = build_match(
+            &launch(&["--seed", "5", "--difficulty", "passive"]),
+            rules.clone(),
+        )
+        .unwrap();
+        assert_eq!(passive.setup().ai_seats[0].bot, "passive");
+        assert!(passive.setup().ai_seats[0].personality.is_empty());
+        let err = |args: &[&str]| {
+            build_match(&launch(args), rules.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} builds"))
+        };
+        assert!(err(&["--difficulty", "nightmare"]).contains("unknown bot \"nightmare\""));
+        assert!(err(&["--personality", "zerg"]).contains("no personality \"zerg\""));
+        assert!(err(&["--difficulty", "passive", "--personality", "x"]).contains("takes none"));
+        // The shipped pool (M6 slice 2: rush, boom and tower) resolves
+        // `random` into the header; an empty pool is an error.
+        let (random, _) = build_match(
+            &launch(&["--seed", "5", "--personality", "random"]),
+            rules.clone(),
+        )
+        .unwrap();
+        let picked = random.setup().ai_seats[0].personality.clone();
+        assert!(
+            ["rush", "boom", "tower"].contains(&picked.as_str()),
+            "{picked}"
+        );
+        let mut empty = rules.clone();
+        for p in &mut empty.ai.personalities {
+            p.random = false;
+        }
+        let e = build_match(&launch(&["--personality", "random"]), empty)
+            .err()
+            .expect("an empty pool is an error");
+        assert!(e.contains("random: true"), "{e}");
     }
 
     /// `--scenario`, `--skip-menu` and `--spectate` start in `Skirmish`.

@@ -252,9 +252,10 @@ pub fn resource_text(
     format!("{} {stock}  {rate_text}", def.name)
 }
 
-/// `true` while production of this resource is discarded at the Yield Cap.
+/// `true` while production of this resource is discarded at the Yield Cap:
+/// `RateInfo::at_cap`, the one rule `MatchStats` shares (M6).
 pub fn at_cap(rate: &sim::RateInfo) -> bool {
-    rate.raw > rate.credited
+    rate.at_cap()
 }
 
 /// The resource bar, pop readout and message line.

@@ -107,7 +107,7 @@ Each trap below was verified during design against the pinned versions. Re-check
 
 ## Definition of done for a PR
 
-A PR is done when every command below passes locally and its output is pasted into the PR description, and GitHub Actions is green on every job (check, headless, deny, game-linux, hash-parity). `just ci` runs the same list and skips optional tools with an install hint; CI is the gate.
+A PR is done when every command below passes locally and its output is pasted into the PR description, and GitHub Actions is green on every job (check, headless, deny, game-linux, hash-parity and, from M6, fun-gate). `just ci` runs the same list and skips optional tools with an install hint; CI is the gate.
 
 ```bash
 cargo fmt --all -- --check

@@ -7,18 +7,23 @@
 //! Player A is `PlayerId(0)` and player B `PlayerId(1)`.
 
 use crate::standard::{Facts, build_order};
-use crate::{BOT_STANDARD, BotError, controller_for};
+use crate::{BotError, bot_stats, controller_for, is_standard_bot};
 use rules::{BuildOrder, Rules, UnitClass};
 use sim::{
-    AiController, BuildingKindId, Construction, FxVec2, Intent, MatchResult, MatchSetup, Outcome,
-    OutcomeReason, PlayerId, Sim, SimEvent, SimView, TargetId, Unit,
+    AiController, BuildingKindId, Construction, FxVec2, Intent, MatchResult, MatchSetup,
+    MatchStats, Outcome, OutcomeReason, PlayerId, Sim, SimEvent, SimView, TargetId, Unit,
 };
 
 /// The CSV header: the seven columns of docs/design/ai.md first, in their
 /// order, then the M5b diagnostics (B's `second_town_tick`, `tower_tick`
-/// and `bo_done_tick` last, so the side swap reports what A's columns
-/// report).
-pub const CSV_HEADER: &str = "seed,winner,outcome,tick,final_hash,age_reached_tick,first_attack_tick,reason,first_attack_units,first_attack_wains,second_town_tick,tower_tick,bo_done_tick_a,age_reached_tick_b,first_attack_tick_b,first_attack_units_b,first_attack_wains_b,territory_a,territory_b,units_lost_a,units_lost_b,min_enemy_town_hp_permille_a,min_enemy_town_hp_permille_b,rejected_a,rejected_b,second_town_tick_b,tower_tick_b,bo_done_tick_b";
+/// and `bo_done_tick` last among them, so the side swap reports what A's
+/// columns report), then the M6 columns ([`M6_COLUMNS`]).
+pub const CSV_HEADER: &str = "seed,winner,outcome,tick,final_hash,age_reached_tick,first_attack_tick,reason,first_attack_units,first_attack_wains,second_town_tick,tower_tick,bo_done_tick_a,age_reached_tick_b,first_attack_tick_b,first_attack_units_b,first_attack_wains_b,territory_a,territory_b,units_lost_a,units_lost_b,min_enemy_town_hp_permille_a,min_enemy_town_hp_permille_b,rejected_a,rejected_b,second_town_tick_b,tower_tick_b,bo_done_tick_b,bot_a,personality_a,bot_b,personality_b,waves_a,waves_b,raids_a,raids_b,retreats_a,retreats_b,wiped_a,wiped_b,towns_taken_a,towns_taken_b,bonus_a,bonus_b,income_a,income_b,cap_s_a,cap_s_b,first_contact_tick,max_quiet_ticks,first_on_land_tick_a,first_on_land_tick_b,min_own_town_hp_permille_a,min_own_town_hp_permille_b";
+
+/// The columns M5b printed, which stay first and in order.
+pub const M5B_COLUMNS: usize = 28;
+/// The columns M6 appends (docs/design/ai.md, the CSV table).
+pub const M6_COLUMNS: usize = 26;
 
 /// The age whose arrival `age_reached_tick` records (by id).
 pub const AGE_REACHED: &str = "masonry";
@@ -92,30 +97,70 @@ pub struct Side {
     pub min_enemy_town_hp_permille: u32,
     /// The side's rejected commands (`CommandRejected`).
     pub rejected: u32,
+    /// M6, from the side's bot memory ([`crate::bot_stats`]; `None` for a
+    /// Passive seat): waves launched.
+    pub waves: Option<u16>,
+    /// Raids launched.
+    pub raids: Option<u16>,
+    /// Waves called home by the retreat rule.
+    pub retreats: Option<u16>,
+    /// Waves that ended below `recall_below_units`.
+    pub wiped: Option<u16>,
+    /// M6, from [`MatchStats`]: Towns the side annexed.
+    pub towns_taken: u32,
+    /// Bonus resources the side received (`BonusIncome`), every resource.
+    pub bonus: i64,
+    /// Credited income in whole resources, every resource, from the
+    /// once-a-second samples.
+    pub income: i64,
+    /// Seconds with any resource at its Yield Cap.
+    pub cap_s: u32,
+    /// The first tick an armed unit of the side stood on the other's land.
+    pub first_on_land_tick: Option<u32>,
+    /// The lowest hit points, per mille, of a Town the side started with or
+    /// founded, while it owned it (0 once one was annexed from it).
+    pub min_own_town_hp_permille: u32,
+}
+
+/// What the observer records for the match as a whole (M6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatchFacts {
+    /// The first tick a hit landed between the two players' entities.
+    pub first_contact_tick: Option<u32>,
+    /// The longest span with no cross-player hit after first contact, up
+    /// to the outcome.
+    pub max_quiet_ticks: Option<u32>,
 }
 
 /// Collects the play-bots facts after every step from the view and the
 /// step's events. Everything it reads is hashed state or an event, so two
-/// runs of one seed observe the same row.
+/// runs of one seed observe the same row. Since M6 it also feeds a
+/// [`MatchStats`], the source of the M6 columns.
 #[derive(Debug, Clone)]
 pub struct Observer {
     sides: [Side; 2],
     orders: [Option<BuildOrder>; 2],
     age_reached: Option<u8>,
+    stats: MatchStats,
 }
 
 impl Observer {
-    /// An observer for `setup` under `rules`: each `standard` seat's build
-    /// order is read from the rules for its `bo_done_tick`.
+    /// An observer for `setup` under `rules`: each Standard seat's build
+    /// order (any difficulty, M6, resolved for the level's
+    /// `worker_target_permille`) is read from the rules for its
+    /// `bo_done_tick`.
     pub fn new(setup: &MatchSetup, rules: &Rules) -> Observer {
         let order = |p: PlayerId| {
-            setup
+            let seat = setup
                 .ai_seats
                 .iter()
-                .find(|s| s.player == p && s.bot == BOT_STANDARD)
-                .and_then(|s| rules.ai.personality(&s.personality))
-                .and_then(|k| rules.ai.build_order(&k.build_order))
-                .cloned()
+                .find(|s| s.player == p && is_standard_bot(rules, &s.bot))?;
+            let level = rules.ai.difficulty(&seat.bot)?;
+            let k = rules.ai.personality(&seat.personality)?;
+            rules
+                .ai
+                .build_order(&k.build_order)
+                .map(|o| rules::ai::resolve_order(o, level))
         };
         Observer {
             sides: [
@@ -130,6 +175,7 @@ impl Observer {
             ],
             orders: [order(A), order(B)],
             age_reached: rules.age_index(AGE_REACHED),
+            stats: MatchStats::new(setup, rules),
         }
     }
 
@@ -138,9 +184,15 @@ impl Observer {
         &self.sides
     }
 
+    /// The match statistics so far (M6).
+    pub fn stats(&self) -> &MatchStats {
+        &self.stats
+    }
+
     /// Record one step: `view` is the sim after it, `events` what it
     /// emitted.
     pub fn observe(&mut self, view: &SimView<'_>, events: &[SimEvent]) {
+        self.stats.observe(view, events);
         let tick = view.tick;
         let rules = view.rules();
         for e in events {
@@ -319,22 +371,54 @@ impl BotMatch {
     }
 
     /// The row for `seed` at the current state, with the territory counted
-    /// now.
+    /// now, the bot statistics read from the memories now (M6), and the
+    /// [`MatchStats`] columns.
     pub fn row(&self, seed: u64) -> GameRow {
         let view = self.sim.view();
+        let stats = self.observer.stats();
         let mut sides = *self.observer.sides();
         for (i, side) in sides.iter_mut().enumerate() {
             let p = PlayerId(u8::try_from(i).expect("two sides"));
             side.territory = view.territory().owned_tile_count(p);
+            let bot = bot_stats(&view, p);
+            side.waves = bot.map(|b| b.waves_launched);
+            side.raids = bot.map(|b| b.raids);
+            side.retreats = bot.map(|b| b.retreats);
+            side.wiped = bot.map(|b| b.wiped);
+            let s = stats.player(p);
+            side.towns_taken = s.towns_taken;
+            side.bonus = s.bonus_total();
+            side.income = stats.income_total(p);
+            side.cap_s = s.cap_seconds;
+            side.first_on_land_tick = s.first_on_land_tick;
+            side.min_own_town_hp_permille = s.min_own_town_hp_permille;
         }
-        GameRow::finished(
+        let mut row = GameRow::finished(
             seed,
             self.sim.result(),
             self.sim.tick(),
             self.sim.hash(),
             sides,
-        )
+        );
+        row.seats = seats_of(self.sim.setup());
+        row.facts = Some(MatchFacts {
+            first_contact_tick: stats.first_contact_tick(),
+            max_quiet_ticks: stats.max_quiet_ticks(),
+        });
+        row
     }
+}
+
+/// The header's `(bot, personality)` of A and B (empty for a human slot).
+pub fn seats_of(setup: &MatchSetup) -> [(String, String); 2] {
+    [A, B].map(|p| {
+        setup
+            .ai_seats
+            .iter()
+            .find(|s| s.player == p)
+            .map(|s| (s.bot.clone(), s.personality.clone()))
+            .unwrap_or_default()
+    })
 }
 
 /// How a decided match ended, as the `outcome` column prints it.
@@ -373,6 +457,11 @@ pub struct GameRow {
     pub final_hash: Option<u64>,
     /// The observed facts, `[A, B]`; `None` after a panic.
     pub sides: Option<[Side; 2]>,
+    /// The header's `(bot, personality)` of A and B (M6; empty when not
+    /// known).
+    pub seats: [(String, String); 2],
+    /// The whole-match facts (M6); `None` after a panic.
+    pub facts: Option<MatchFacts>,
 }
 
 impl GameRow {
@@ -398,6 +487,8 @@ impl GameRow {
             tick: Some(result.map_or(tick, |r| r.tick)),
             final_hash: Some(final_hash),
             sides: Some(sides),
+            seats: Default::default(),
+            facts: Some(MatchFacts::default()),
         }
     }
 
@@ -410,13 +501,15 @@ impl GameRow {
             tick: None,
             final_hash: None,
             sides: None,
+            seats: Default::default(),
+            facts: None,
         }
     }
 
     /// The row in [`CSV_HEADER`]'s column order; an unknown value is
     /// empty.
     pub fn csv(&self) -> String {
-        fn opt(v: Option<u32>) -> String {
+        fn opt<T: ToString>(v: Option<T>) -> String {
             v.map(|v| v.to_string()).unwrap_or_default()
         }
         let r = self.result;
@@ -426,6 +519,9 @@ impl GameRow {
             None => (&blank, &blank, false),
         };
         let num = |v: u32| if known { v.to_string() } else { String::new() };
+        let num64 = |v: i64| if known { v.to_string() } else { String::new() };
+        let facts = self.facts.unwrap_or_default();
+        let [(bot_a, personality_a), (bot_b, personality_b)] = &self.seats;
         let cols = [
             self.seed.to_string(),
             self.winner.as_str().to_string(),
@@ -459,6 +555,33 @@ impl GameRow {
             opt(b.second_town_tick),
             opt(b.tower_tick),
             opt(b.bo_done_tick),
+            // M6.
+            bot_a.clone(),
+            personality_a.clone(),
+            bot_b.clone(),
+            personality_b.clone(),
+            opt(a.waves),
+            opt(b.waves),
+            opt(a.raids),
+            opt(b.raids),
+            opt(a.retreats),
+            opt(b.retreats),
+            opt(a.wiped),
+            opt(b.wiped),
+            num(a.towns_taken),
+            num(b.towns_taken),
+            num64(a.bonus),
+            num64(b.bonus),
+            num64(a.income),
+            num64(b.income),
+            num(a.cap_s),
+            num(b.cap_s),
+            opt(facts.first_contact_tick),
+            opt(facts.max_quiet_ticks),
+            opt(a.first_on_land_tick),
+            opt(b.first_on_land_tick),
+            num(a.min_own_town_hp_permille),
+            num(b.min_own_town_hp_permille),
         ];
         cols.join(",")
     }
@@ -486,6 +609,72 @@ mod tests {
         Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap()
     }
 
+    /// M6: the 26 columns appended after M5b's 28, in order, and a real
+    /// row of a Hard bot against Passive fills them.
+    #[test]
+    fn csv_appends_the_m6_columns_after_the_m5b_ones() {
+        let cols: Vec<&str> = CSV_HEADER.split(',').collect();
+        assert_eq!(cols.len(), M5B_COLUMNS + M6_COLUMNS);
+        assert_eq!(
+            cols[M5B_COLUMNS..],
+            [
+                "bot_a",
+                "personality_a",
+                "bot_b",
+                "personality_b",
+                "waves_a",
+                "waves_b",
+                "raids_a",
+                "raids_b",
+                "retreats_a",
+                "retreats_b",
+                "wiped_a",
+                "wiped_b",
+                "towns_taken_a",
+                "towns_taken_b",
+                "bonus_a",
+                "bonus_b",
+                "income_a",
+                "income_b",
+                "cap_s_a",
+                "cap_s_b",
+                "first_contact_tick",
+                "max_quiet_ticks",
+                "first_on_land_tick_a",
+                "first_on_land_tick_b",
+                "min_own_town_hp_permille_a",
+                "min_own_town_hp_permille_b"
+            ]
+        );
+        let r = rules();
+        let setup = MatchSetup::bots(&r, 1, ("hard", "standard"), ("passive", ""));
+        let mut m = BotMatch::with_bots(setup, r.clone()).unwrap();
+        m.run(4400);
+        let row = m.row(1).csv();
+        let got: Vec<&str> = row.split(',').collect();
+        assert_eq!(got.len(), cols.len(), "{row}");
+        let col = |name: &str| got[cols.iter().position(|c| *c == name).unwrap()];
+        assert_eq!(
+            [
+                col("bot_a"),
+                col("personality_a"),
+                col("bot_b"),
+                col("personality_b")
+            ],
+            ["hard", "standard", "passive", ""]
+        );
+        // Hard pays from 3:00 every 20 s: ticks 4000 and 4400.
+        let bundle: i64 = r.ai.difficulty("hard").unwrap().bundle(&r).iter().sum();
+        assert_eq!(col("bonus_a"), (2 * bundle).to_string());
+        assert_eq!(col("bonus_b"), "0");
+        assert_eq!(col("waves_a"), "0");
+        assert_eq!(col("waves_b"), "", "Passive has no bot memory");
+        assert!(col("income_a").parse::<i64>().unwrap() > 0);
+        assert_eq!(col("min_own_town_hp_permille_b"), "1000");
+        assert_eq!(col("first_contact_tick"), "", "no fight by 4400");
+        assert_eq!(col("max_quiet_ticks"), "");
+    }
+
     #[test]
     fn csv_header_starts_with_the_seven_design_columns() {
         let cols: Vec<&str> = CSV_HEADER.split(',').collect();
@@ -501,14 +690,14 @@ mod tests {
                 "first_attack_tick"
             ]
         );
-        assert_eq!(cols.len(), 28);
+        assert_eq!(cols.len(), M5B_COLUMNS + M6_COLUMNS);
         assert_eq!(
-            cols[25..],
+            cols[25..M5B_COLUMNS],
             ["second_town_tick_b", "tower_tick_b", "bo_done_tick_b"]
         );
         let row = GameRow::panicked(4).csv();
         assert_eq!(row.split(',').count(), cols.len());
-        assert_eq!(row, format!("4,panic{}", ",".repeat(26)));
+        assert_eq!(row, format!("4,panic{}", ",".repeat(cols.len() - 2)));
     }
 
     #[test]

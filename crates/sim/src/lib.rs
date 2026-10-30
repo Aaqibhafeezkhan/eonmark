@@ -22,7 +22,7 @@
 //! | [`replay`] | `.eonreplay` writer, reader, `verify` |
 //! | [`scenarios`] | scripted command streams shared by tests, benches, `record` and fixtures (the M4a counter duels and `combat_skirmish`, the M4b `enemy_outpost` pair among them) |
 //! | [`territory`] | `TerritoryField`: integer disc kernels per owner layer, tie-to-neutral ownership |
-//! | [`economy`] | `Economy` stockpiles and accumulators, `RateInfo`, exact income, jobs step, cost helpers |
+//! | [`economy`] | `Economy` stockpiles and accumulators, `RateInfo` (with `at_cap`), exact income, jobs step, cost helpers, the bot seats' disclosed bonus schedule and step 6d' (M6) |
 //! | [`construction`] | footprints, `Build` validation, sites, construction, site cancel |
 //! | [`gather`] | `Gather`, slots and stand tiles, worked-slot income, idle workers seeking work |
 //! | [`town`] | standard start, town count and limit, attribution to the nearest Town, tier and radius refresh |
@@ -32,7 +32,8 @@
 //! | [`annexation`] | the annexation timer of Towns at 0 HP (attackers, defenders, entry, reset), the flip and its transfers, step 5d (M5a) |
 //! | [`victory`] | the match outcome: Surrender, Seat captured, all Towns lost and the territory cap, latched in step 6e (M5a) |
 //! | [`combat`] | unit combat stats from the Modifier rows, explicit `Attack` (hold, direct chase, path chase, give up), target acquisition by guards and attack-movers, Watchtower and Town shooters, simultaneous hits, death and building destruction |
-//! | [`ai_hook`] | `AiController`, `SimView` (read-only quotes and checks; `building_hp` from M4b; Harrying, supply, exposure, annexation timers and the outcome from M5a) |
+//! | [`ai_hook`] | `AiController`, `SimView` (read-only quotes and checks; `building_hp` from M4b; Harrying, supply, exposure, annexation timers and the outcome from M5a; the bot's tick-free `ai_noise` from M6) |
+//! | [`stats`] | `MatchStats` (M6): engine-free, unhashed match statistics from the view and the events, for play-bots, `match-log` and the game-over screen |
 //! | [`hash`] | xxh3 over postcard |
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -54,18 +55,19 @@ pub mod pathing;
 pub mod replay;
 pub mod scenarios;
 pub mod state;
+pub mod stats;
 pub mod tech;
 pub mod territory;
 pub mod town;
 pub mod training;
 pub mod victory;
 
-pub use ai_hook::{AI_MEMORY_GUIDE_BYTES, AiController, AiMemory, NoAi, SimView};
+pub use ai_hook::{AI_MEMORY_GUIDE_BYTES, AiController, AiMemory, NoAi, SimView, ai_noise};
 pub use annexation::AnnexView;
 pub use attrition::Exposure;
 pub use combat::{AttackStats, Engage, UnitStats};
 pub use command::{Command, PlayerCommand, sort_commands};
-pub use economy::{Economy, PlayerEconomy, RateInfo};
+pub use economy::{BonusSeat, Economy, PlayerEconomy, RateInfo, bonus_table};
 pub use fx::{Fx, FxVec2};
 pub use ids::{
     BuildingId, BuildingKindId, IdGen, PlayerId, TargetId, TechId, Tile, UnitId, UnitKindId,
@@ -74,7 +76,8 @@ pub use map::Map;
 pub use movement::SpatialGrid;
 pub use pathing::{AStarSearch, PathRequest, Pathing, SearchStatus};
 pub use replay::{
-    ReplayError, ReplayFile, ReplayReader, ReplayWriter, VerifyOutcome, verify, verify_with,
+    ReplayError, ReplayFile, ReplayReader, ReplayWriter, VerifyOutcome, verify, verify_observed,
+    verify_with,
 };
 pub use rules::Rules;
 pub use state::{
@@ -82,5 +85,6 @@ pub use state::{
     OutcomeReason, Player, PlayerSlot, Post, QueueEntry, QueueItem, RejectReason, SIM_VERSION, Sim,
     SimEvent, SnapshotError, StartKind, SubHashes, TownState, Unit,
 };
+pub use stats::{MatchStats, PlayerStats};
 pub use tech::{PlayerTech, TechState};
 pub use territory::{InvalidTerritoryField, Source, SourceOwner, TerritoryField};

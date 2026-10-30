@@ -212,7 +212,9 @@ pub const BOTS_BENCH_KINDS: [&str; 4] = ["skirmisher", "bowman", "shieldbearer",
 pub const BOTS_BENCH_FORWARD_TILES: i32 = 12;
 
 /// The `sim-cli bench --bots` match (M5b, ROADMAP acceptance 3): the
-/// Standard bot in both seats (`passive` seats for the control run) from
+/// Standard bot in both seats as `bot = (difficulty, personality)`, M5b's
+/// `standard`/`standard` by default (`None`: `passive` seats for the
+/// control run) from
 /// the standard start with debug commands on, and a tick-0 stream issued
 /// by P0 with sequence numbers from [`BOTS_BENCH_SEQ`]. For each player:
 /// `DebugAdvanceAge` (Masonry, so waves may launch), a `DebugGrant` of
@@ -227,12 +229,13 @@ pub const BOTS_BENCH_FORWARD_TILES: i32 = 12;
 /// seat launches a wave of the army assembled, sieged and supplied at its
 /// rally; meanwhile the build order runs on the grants and production
 /// meets a full pop.
-pub fn bots_bench(rules: &Rules, units: u16, seed: u64, standard: bool) -> (MatchSetup, Stream) {
-    let seat = if standard {
-        (ai::BOT_STANDARD, "standard")
-    } else {
-        (ai::BOT_PASSIVE, "")
-    };
+pub fn bots_bench(
+    rules: &Rules,
+    units: u16,
+    seed: u64,
+    bot: Option<(&str, &str)>,
+) -> (MatchSetup, Stream) {
+    let seat = bot.unwrap_or((ai::BOT_PASSIVE, ""));
     let mut setup = MatchSetup::bots(rules, seed, seat, seat);
     setup.debug_commands = true;
     let kind = |id: &str| {
@@ -245,8 +248,8 @@ pub fn bots_bench(rules: &Rules, units: u16, seed: u64, standard: bool) -> (Matc
     };
     let knobs = rules
         .ai
-        .personality("standard")
-        .expect("the standard personality is in data/ai");
+        .personality(bot.map_or("standard", |(_, p)| p))
+        .expect("the bench's personality is in data/ai");
     let def = rules
         .map(&setup.map)
         .expect("the setup's map is in the rules");
@@ -680,14 +683,14 @@ mod tests {
     #[test]
     fn bots_bench_stream_and_seats() {
         let rules = rules();
-        let (setup, stream) = bots_bench(&rules, 400, 1, true);
+        let (setup, stream) = bots_bench(&rules, 400, 1, Some(("standard", "standard")));
         assert!(setup.debug_commands);
         assert!(setup.ai_seats.iter().all(|s| s.bot == "standard"));
         assert_eq!(stream.len(), 1);
         assert_eq!(stream[0].0, 0);
         assert!(stream[0].1.iter().all(|c| c.player == PlayerId(0)));
         assert!(stream[0].1.iter().all(|c| c.seq >= BOTS_BENCH_SEQ));
-        let (control, control_stream) = bots_bench(&rules, 400, 1, false);
+        let (control, control_stream) = bots_bench(&rules, 400, 1, None);
         assert!(control.ai_seats.iter().all(|s| s.bot == "passive"));
         assert_eq!(control_stream, stream);
     }

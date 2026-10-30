@@ -1,7 +1,7 @@
 # data/ai/
 
 This directory holds the scripted opponent's data: the personalities and
-their build orders (M5b), and later the difficulty table (M6). The schema
+their build orders (M5b), and the difficulty levels (M6). The schema
 lives in `crates/rules/src/ai.rs`; `rules::Rules::load` reads this directory
 last, after the maps, validates it against everything before it and attaches
 it as `Rules::ai`, so it is part of `rules_hash`. An edit here without a
@@ -10,24 +10,30 @@ recording`; the data-only path is the one in
 [`../rules/README.md`](../rules/README.md) ("Worked example"): edit, bump
 `rules_version`, `just rerecord`, run the tests; for a build order or a
 personality, [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) ("A build order
-or personality") adds the `play-bots` comparison. `sim-cli data-check` prints
-the counts as `personalities=1 build_orders=1`.
+or personality") adds the `play-bots` comparison, and ("A difficulty") the
+difficulty checks. `sim-cli data-check` prints the counts as
+`personalities=4 build_orders=4 difficulties=3`.
 
 | Path | Contents | Arrives |
 |------|----------|---------|
 | `personalities.ron` | One row per personality: its build order and every knob of the bot's rules | M5b (`standard`); M6 adds rush, boom and tower |
-| `build_orders/<id>.ron` | One build order per file; the `id` must equal the file stem. Non-`.ron` files here are ignored | M5b (`standard.ron`) |
-| `difficulty.ron` | Easy, Standard, Hard: the bot income interval (documented as a cheat) and aggression | M6 |
+| `build_orders/<id>.ron` | One build order per file; the `id` must equal the file stem. Non-`.ron` files here are ignored | M5b (`standard.ron`); M6 adds `rush.ron`, `boom.ron` and `tower.ron` |
+| `difficulty/<id>.ron` | One difficulty level per file (`easy`, `standard`, `hard`); the `id` must equal the file stem, `standard` must exist and `passive` is reserved. The disclosed bonus bundle the sim pays a bot seat (the income cheat) and the wave knobs the level scales. Non-`.ron` files here are ignored | M6 |
 
 The bots themselves are in `crates/ai`: `ai::Passive` (never acts), the
 data-driven `ai::standard::StandardBot`, and `ai::Scripted` (a fixed command
 list for `sim-cli selftest`). A match header names each AI slot's bot and
 personality (`MatchSetup.ai_seats`, for example `standard` with personality
-`standard`), and `ai::controller_for` builds the bots from it.
+`standard`), and `ai::controller_for` builds the bots from it. Since M6 the
+`bot` is `passive` or a difficulty id: every difficulty is the Standard bot
+playing its personality's knobs as the level resolves them
+(`rules::ai::resolve`), while the sim pays the level's bonus.
 
 Rule for every bot: it is a deterministic function of `sim::SimView` and its
-own hashed memory (`Player::ai_memory`). No clocks, no floats, no randomness
-of its own; `crates/ai/clippy.toml` enforces this.
+own hashed memory (`Player::ai_memory`). No clocks, no floats, no generator
+of its own; `crates/ai/clippy.toml` enforces this. Its only noise (M6) is
+`SimView::ai_noise(player, salt)`, a pure hash of the hashed seed, the
+player and a salt that never draws from the sim's `Pcg32`.
 
 ## Units
 
@@ -170,6 +176,31 @@ Engine Yard fill the army with Mangonels.
 | `defend_radius_tiles`, `defend_regoal_tiles`, `defend_release_ds`, `defend_max_block_ds` | Enemy military on own land this close to an own Town is a threat; a guard is re-ordered beyond this distance from the nearest threat; defence ends after this long with no threat; it blocks launches, and calls a staging wave home, for at most this long | 1 to 64; 1 to 64; 1 to 72000; 1 to 72000 |
 | `defend_guard_pop_ratio` | Past `defend_max_block_ds`, while a launch is due, the home guard is the home armed units nearest the threat (siege last) until their pop reaches this many times the threat's pop, at least one unit; the rest go back to the rally, and those at the rally are left to the wave | 1 to 64 |
 | `recall_wave`, `recall_wave_town_hp_permille` | `WhileStaging` (a staging wave while the defence still blocks launches, or an assaulting one when any threatened Town, the engaged one or another, is contested or at or below the share of its hit points) or `Always` | 0 to 1000 |
+| `random` | In the pool the `random` personality choice draws from (`play-bots --personality-a/-b random`, the game's `--personality random`; `ai::resolve_personality`, a hash of the seed and the seat, never the sim's generator). Required in every row since M6's slice 2; `standard` is `false`, rush, boom and tower are `true`. Adding a personality to the pool remaps which style a seed draws | `true` or `false` |
+
+M6 adds the knobs below (slice 2). Every row states each of them; no
+difficulty scales them, except that `rules::ai::resolve` caps the raid sizes
+at the level's `max_wave_units`.
+
+| Field | Meaning | Range |
+|-------|---------|-------|
+| `wave_mode` | `Siege` (every wave is a siege wave) or `RaidUntilSiege` (raids while the bot has fewer than `min_siege` siege units, at least one) | |
+| `wain_rule` | `Always`: a siege wave takes a Supply Wain; `IfEnemyHarrying`: only once the enemy has researched Harrying | |
+| `wave_requires_tech` | No wave or raid before this tech (the level's deadline raid ignores it) | a tech id or `None` |
+| `seat_last` | A siege wave skips the enemy Seat while the enemy holds another complete, uncontested Town | `true` or `false` |
+| `raid_min_armed`, `raid_max_armed` | Home armed units a raid needs, and the most it takes | 1 to 64, min at most max |
+| `raid_every_ds`, `raid_max_ds`, `raid_idle_ds`, `raid_idle_tiles` | Time between raids; a raid comes home after `raid_max_ds`, or after `raid_idle_ds` with no enemy unit within `raid_idle_tiles` | 1 to 72000; 1 to 64 tiles |
+| `raid_worker_weight`, `raid_distance_permille` | Raid target score: per worker at the enemy building, less the enemy strength near it, less this share of its distance from the rally | 0 to 1000; 0 to 10000 |
+| `retreat_ratio_permille`, `retreat_loss_permille` | A wave retreats when its own strength is below this share of the enemy's around it and it has lost at least `retreat_loss_permille` of the armed units it launched with (0: never) | 0 to 10000; 0 to 1000 |
+| `retreat_commit_ds`, `retreat_commit_town_hp_permille`, `retreat_cooldown_ds` | No retreat within `retreat_commit_ds` of the assault order or while the target Town is at or below this share of its hit points; after a retreat the next launch waits `retreat_cooldown_ds` | 0 to 72000; 0 to 1000; 0 to 72000 |
+| `influence_cell_tiles`, `influence_radius_cells` | The influence maps' cell side and the cells around a point a query sums | 1 to 16; 0 to 8 |
+| `target_strength_weight` | Siege target score per unit of the square root of the enemy strength at a Town, against 1000 per tile of distance | 0 to 1000 |
+| `counter_weight_permille`, `counter_floor_permille`, `counter_cap_permille`, `counter_join_permille` | How strongly the visible enemy kinds bend the army mix (0: off), the factor's floor and cap, and the factor at which a `counter_kinds` entry joins | 0 to 8000; 0 to 1000; 1000 to 8000; 1000 to the cap |
+| `counter_kinds` | `[(kind, weight)]`: armed kinds outside `army_mix` that join it while they counter what the enemy shows | armed, non-civilian kinds, each once; weights 1 to 1000 |
+| `defend_economy`, `defend_economy_tiles` | Enemy military this close to an own worked gathering building is a threat too | `true` or `false`; 1 to 64 |
+| `defend_wains_first` | The guard attacks enemy Supply Wains among the threats first | `true` or `false` |
+| `reactive_towers` | After a defence the bot adds one Watchtower toward the defended building, up to this many in a match | 0 to the cap |
+| `noise_wave_interval_permille`, `noise_wave_units`, `noise_first_wave_ds`, `noise_mix_permille`, `noise_site_top_k` | Bounded jitter from `SimView::ai_noise`: the wave interval (per mille), extra armed units a wave needs (upward only), extra wait before the first wave, each mix weight (per mille), and the `Expansion` and `BorderEdge` candidates a site is picked among (1: always the best) | 0 to 500; 0 to 64; 0 to 72000; 0 to 500; 1 to 8 |
 
 Since M5b's waves slice the bot reads every knob. A **defence** (enemy
 military on own land near an own Town) sends every home armed unit at the
@@ -198,3 +229,89 @@ fewer than `recall_below_units`, or older than `wave_max_ds` and not
 annexing comes home. From `all_in_after_ds` every home armed unit joins the
 wave out and nothing is recalled. The rules and their order are in
 docs/design/ai.md and `crates/ai/src/standard/waves.rs`.
+
+## Difficulty levels (`difficulty/<id>.ron`, M6)
+
+```ron
+(
+  id: "hard", name: "Hard",
+  income_interval_ds: 200,                          // Easy 300, Standard 250; 0 = no bonus
+  income_from_ds: 1800,                             // payments complete at 3:00 + n intervals
+  income: {"grain": 20, "lumber": 20, "ore": 10},   // the same in all three files
+  wave_age_gate: Off,                               // Personality | Age("masonry") | Off
+  largest_wave_only: false,
+  max_wave_units: None,
+  wave_size_permille: 1000,
+  wave_interval_permille: 800,
+  all_in_after_ds: None,                            // None keeps the personality's
+  first_raid: Some((by_ds: 6000, prep_ds: 1500, min_armed: 6, max_armed: 10)),
+  worker_target_permille: 1000,
+  extra_research: [],
+  pressure: (
+    reinforce_min_units: 6,
+    commit_ds: 300,
+    retreat_ratio_permille: 0,
+    retreat_cooldown_permille: 1000,
+    home_guard_units: 0,
+    lure_ds: 600,
+    cohesion_tiles: 4,
+    launch_ratio_permille: 0,
+    assault_ratio_permille: 1300,
+  ),
+)
+```
+
+Difficulty is a disclosed cheat plus wave timing and, since the M6 retune
+(M6 owner decision 12, `rules_version` 30; 31 after its review), how hard
+the level presses its sieges: Easy stays defensive (its largest wave only,
+later, no pressure, Statecraft II for wider borders), Standard and Hard
+reinforce and commit; Standard retreats as its personality does, Hard
+never retreats (a deviation from the plan's equal retreat, pending the
+owner: docs/design/ai.md, "Difficulty table (as retuned)"). The sim pays every AI seat whose `bot` names a level the
+same `income` bundle on the step that completes tick `from + k x every`
+(k >= 1, `from` = `income_from_ds` and `every` = `income_interval_ds` in
+ticks): Standard's first payment lands at 3:25 (tick 4100), Hard's at 3:20
+(4000) and Easy's at 3:30 (4200). The bundle is added to the stockpile and
+clamped to the stockpile caps (Lore), and the sim emits `BonusIncome` with
+what was credited (step 6d', docs/DETERMINISM.md). Human slots and
+`passive` seats get nothing, and the bonus never reads the opponent's state
+(no rubber band). The bundle is the same in every file, so the interval
+alone sizes the cheat: a shorter interval is a larger cheat.
+
+| Field | Meaning | Range |
+|-------|---------|-------|
+| `id`, `name` | Stable id (the header's `bot`, `play-bots --a/--b`, the game's `--difficulty`) and display name | the file stem; not `passive`; non-empty name |
+| `income_interval_ds` | The bonus is paid every this many deciseconds | 0 (no bonus), or 50 to 72000 and in ticks more than `cmd_delay_ticks` |
+| `income_from_ds` | The schedule counts from this match time; the first payment completes one interval later | below `match_cap_ds` |
+| `income` | The bonus bundle, `{resource id: amount}` | resource ids of `resources.ron`; each 0 to 500 |
+| `wave_age_gate` | `Personality` keeps the personality's `wave_requires_age`; `Age(id)` replaces it; `Off` removes it | an age id for `Age` |
+| `largest_wave_only` | Every `wave_sizes` row takes the last (largest) row's size | `true` or `false` |
+| `max_wave_units` | Caps every wave and the personality's `max_wave_units` | `None`, or 1 to 64 |
+| `wave_size_permille` | Scales every `wave_sizes` row, rounded up, at least 1, at most the cap | 250 to 4000 |
+| `wave_interval_permille` | Scales `wave_interval_ds`, rounded to nearest | 250 to 4000 |
+| `all_in_after_ds` | Replaces the personality's all-in time | `None`, or 0 to 72000 |
+| `first_raid` | `Some((by_ds, prep_ds, min_armed, max_armed))`: the deadline raid. If no wave has gone out by `by_ds`, a raid of up to `max_armed` home armed units (at least `min_armed`) goes at once, past every gate; from `by_ds - prep_ds` the bot trains raiders toward `min_armed` even before its military latch | `1 <= min_armed <= max_armed <= 64`, `prep_ds < by_ds`, `by_ds` below `match_cap_ds` |
+| `worker_target_permille` | Scales every `Workers` count of the build order, rounded up, at least 1 (`rules::ai::resolve_order`): the lever of M6 owner decision 2's disclosed Easy handicap (850 is 15% fewer Yeomen); 1000 is none | 500 to 1000 |
+| `extra_research` | Tech ids the level researches beyond its build order: each becomes an optional `Research` step appended to the resolved order (`rules::ai::resolve_order`), skipped when the order already researches it (M6 owner decision 12: Easy's Statecraft II, a defensive Easy holding wider borders) | at most 8 tech ids, each once |
+| `pressure` | How the level presses its sieges (M6 owner decision 12), the fields below; all off is `(reinforce_min_units: 0, commit_ds: 0, retreat_ratio_permille: 1000, retreat_cooldown_permille: 1000, home_guard_units: 0, lure_ds: 0, cohesion_tiles: 0, launch_ratio_permille: 0, assault_ratio_permille: 0)` | |
+| `pressure.reinforce_min_units` | While a siege wave assaults or holds its target (or, with `assault_ratio_permille`, stages short of the strength to assault), the home armed units at the rally (within `assemble_radius_tiles`, beyond the home guard) join it as one group once at least this many stand there, attack-moving to the target (to the stage point while it stages); during the all-in the launch and the joiners go in such groups from the rally instead of one unit at a time from anywhere; never while the defence blocks launches | 0 (off) to 64 |
+| `pressure.commit_ds` | A siege wave whose target Town was seen losing hit points within this long neither retreats nor ends on `wave_max_ds` | 0 (off) to 72000 |
+| `pressure.retreat_ratio_permille`, `pressure.retreat_cooldown_permille` | Scale the personality's `retreat_ratio_permille` (0: the level never retreats) and `retreat_cooldown_ds`, rounded to nearest | 0 to 4000; 250 to 4000 |
+| `pressure.home_guard_units` | Armed units every launch, reinforcement and all-in joiner leaves at home | 0 to 64 |
+| `pressure.lure_ds` | For this long after its assault order a siege wave holds at its Wain point (out of every enemy shooter's reach) while an enemy armed unit stands within `siege_focus_tiles` of the target, so the defenders come out to it away from the Town's and Watchtowers' fire | 0 (off) to 72000 |
+| `pressure.cohesion_tiles` | While a siege wave assaults, its armed units more than this many tiles nearer the goal than its rear quarter stop (a stopped unit guards and fights where it stands) until the rest close up; only the units past the stage point count (a group still on its way from the rally holds nobody up), and a unit within an enemy shooter's reach is never stopped | 0 (off) to 64 |
+| `pressure.launch_ratio_permille` | A siege wave (not the all-in, not a raid) launches only when the Lanchester strength (`sum(hp) x sum(dps)`) of the units it would take, times 1000, reaches this times that of the enemy armed units standing on the enemy's own land | 0 (off) to 10000 |
+| `pressure.assault_ratio_permille` | A staged siege wave (not the all-in) starts its assault only when its own Lanchester strength times 1000 reaches this times that of the enemy armed units on the enemy's own land; short of it the wave holds at its stage point (a rally group of `reinforce_min_units` joins it there) and, still short at `stage_max_ds`, comes home | 0 (off) to 10000 |
+
+`rules::ai::resolve(personality, difficulty)` applies the wave knobs once, a
+pure function of the two rows (so a bot rebuilt mid-match plays the same
+knobs); counters, influence and noise stay the personality's at every
+level, and retreat is the personality's scaled by `pressure`. The
+`standard` level resolves to the personality with its all-in at 36:00
+(retreat unchanged since `rules_version` 31); `resolve` leaves the rest of `pressure` to the bot
+(`crates/ai`, `waves.rs` and `retreat.rs`), which reads it from the level. M6
+also requires every build order to build a trainer of an armed kind before
+its first `Advance` (a difficulty's raid trains armed units before then).
+The shipped values, the bundle sweep and the line-4 flip (`hard.ron`
+`income_interval_ds` 200 to 300) are in docs/design/ai.md, "Difficulty
+table".

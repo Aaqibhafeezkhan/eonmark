@@ -149,6 +149,30 @@ art-bake *ARGS:
 bots *ARGS:
     cargo run -p sim-cli --locked --release -- play-bots {{ARGS}}
 
+# ROADMAP M6 acceptance 1 (M6): the literal 20-game line with distinct rush/boom/tower pairs, then scripts/fun_gate.sh on its CSV and stderr (winners, decisive before 48000, median, past 24000, per-pair diagnostics). The files stay under OUT (default a fresh scratch directory); see docs/design/ai.md, "The M6 fun gate".
+fun-gate OUT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="{{OUT}}"
+    if [ -z "$out" ]; then out="$(mktemp -d "${TMPDIR:-/tmp}/fun_gate.XXXXXX")"; fi
+    mkdir -p "$out"
+    cargo build -p sim-cli --locked --release
+    code=0
+    target/release/sim-cli play-bots --seeds 1..20 --a standard --b standard --personality-a rush,boom,tower --personality-b rush,boom,tower --max-ticks 72000 --jobs 5 > "$out/line1.csv" 2> "$out/line1.err" || code=$?
+    tail -n 1 "$out/line1.err"
+    echo "play-bots exit=$code (csv $out/line1.csv)"
+    scripts/fun_gate.sh "$out/line1.csv" "$out/line1.err"
+    exit "$code"
+
+# The M6 tuning matrix (scripts/bot_matrix.sh): `just bot-matrix --set standard --seeds 1..5` plays each personality against standard from both seats and prints the boring and frustrating proxies (B1-B6, F1-F6) per pairing.
+bot-matrix *ARGS:
+    cargo build -p sim-cli --locked --release
+    scripts/bot_matrix.sh {{ARGS}}
+
+# The docs/PLAYTEST.md match-log row of a replay (M6): `sim-cli match-log` re-simulates it with its bots, verifies every recorded hash and prints the row (today's date and `git rev-parse --short HEAD` in the Date and Commit cells), a statistics table and the verify line.
+match-log REPLAY:
+    cargo run -q -p sim-cli --locked --release -- match-log "{{REPLAY}}" --date "$(date +%Y-%m-%d)" --commit "$(git rev-parse --short HEAD)"
+
 # Sim benchmarks: `just bench` runs the 500-mover crossing, `just bench --astar --budget 4000` one saturated A* tick,
 # `just bench --territory --sources 16 --edits 100` incremental territory recompute (M3a acceptance: mean < 2 ms),
 # `just bench --units 400 --ticks 1200 --combat` 200 vs 200 fighting (M4a acceptance: mean step < 5 ms).

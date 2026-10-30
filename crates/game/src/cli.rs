@@ -17,6 +17,9 @@
 //! `crate::draw_stats`), `--click-check` (every unit selectable by a
 //! real click, `crate::click_check`) and `--minimap-check` (the minimap's
 //! input with real clicks, `crate::minimap_check`).
+//! M6 adds `--difficulty <id>` and `--personality <id>`: the opponent of a
+//! plain launch or `--skip-menu` (`app::build_match`), validated against
+//! the rules at start-up.
 //! Parsing is complete and tested here.
 
 use std::path::{Path, PathBuf};
@@ -64,6 +67,11 @@ Options:
                                own, and --headless-run uses 1.
   --skip-menu                  Start the match against the Standard bot at once instead
                                of opening the main menu.
+  --difficulty <ID>            The bot of a plain launch or --skip-menu: easy, standard
+                               (default) or hard (data/ai/difficulty/), or passive.
+                               The bot's disclosed bonus income follows the difficulty.
+  --personality <ID>           That bot's personality (data/ai/personalities.ron,
+                               default standard); random draws one per seed.
   --spectate                   Watch the Standard bot play itself (both slots AI; with
                                --seed 1 it is the m5_first_match setup, otherwise a
                                fresh seed). You can select units and move the camera
@@ -219,6 +227,12 @@ pub struct Cli {
     pub fast_forward_to: Option<u32>,
     /// `--new-game-after-seconds <s>` (M5b): the menu's New Game click proxy.
     pub new_game_after_seconds: Option<f64>,
+    /// `--difficulty <id>` (M6): the opponent's bot id; `None` is
+    /// `standard`.
+    pub difficulty: Option<String>,
+    /// `--personality <id>` (M6): the opponent's personality; `None` is
+    /// `standard`, `random` draws per seed.
+    pub personality: Option<String>,
     /// `--assets-dir <dir>` (art pass): the asset root, see
     /// [`Cli::resolve_assets_dir`].
     pub assets_dir: Option<PathBuf>,
@@ -259,6 +273,8 @@ impl Default for Cli {
             spectate: false,
             fast_forward_to: None,
             new_game_after_seconds: None,
+            difficulty: None,
+            personality: None,
             assets_dir: None,
             window_size: None,
             grid: false,
@@ -343,6 +359,17 @@ impl Cli {
                         return Err(format!("{arg}: expected a non-negative number"));
                     }
                     cli.new_game_after_seconds = Some(secs);
+                }
+                "--difficulty" | "--personality" => {
+                    let id = args.next().ok_or_else(|| format!("{arg}: missing value"))?;
+                    if id.is_empty() || id.starts_with("--") {
+                        return Err(format!("{arg}: expected an id"));
+                    }
+                    if arg == "--difficulty" {
+                        cli.difficulty = Some(id);
+                    } else {
+                        cli.personality = Some(id);
+                    }
                 }
                 "--data-dir" => cli.data_dir = Some(parse_path(&arg, args.next())?),
                 "--assets-dir" => cli.assets_dir = Some(parse_path(&arg, args.next())?),
@@ -444,11 +471,21 @@ impl Cli {
                     cli.new_game_after_seconds.is_some(),
                     "--new-game-after-seconds",
                 ),
+                (cli.difficulty.is_some(), "--difficulty"),
+                (cli.personality.is_some(), "--personality"),
             ] {
                 if given {
                     return Err(format!("{flag} needs a window; drop --headless-run"));
                 }
             }
+        }
+        if (cli.difficulty.is_some() || cli.personality.is_some())
+            && (cli.spectate || cli.scenario.is_some())
+        {
+            return Err(
+                "--difficulty and --personality choose the opponent of a plain launch or --skip-menu; drop --spectate and --scenario"
+                    .into(),
+            );
         }
         if cli.click_check && cli.headless_run.is_none() && cli.scenario.is_none() {
             return Err(
@@ -710,6 +747,8 @@ mod tests {
                 spectate: false,
                 fast_forward_to: None,
                 new_game_after_seconds: None,
+                difficulty: None,
+                personality: None,
                 assets_dir: None,
                 window_size: None,
                 grid: false,
@@ -911,6 +950,41 @@ mod tests {
             let mut args = vec!["--headless-run", "10"];
             args.extend(flag.iter().copied());
             assert!(parse(&args).is_err(), "{args:?} needs a window");
+        }
+    }
+
+    /// M6: `--difficulty` and `--personality` parse for a plain launch and
+    /// `--skip-menu`, need an id and a window, and do not go with
+    /// `--spectate` or `--scenario`.
+    #[test]
+    fn m6_difficulty_and_personality_flags_parse() {
+        assert_eq!(
+            parse(&[
+                "--skip-menu",
+                "--difficulty",
+                "hard",
+                "--personality",
+                "rush"
+            ]),
+            Ok(Parsed::Run(Cli {
+                skip_menu: true,
+                difficulty: Some("hard".into()),
+                personality: Some("rush".into()),
+                ..Cli::default()
+            }))
+        );
+        let Ok(Parsed::Run(plain)) = parse(&["--difficulty", "easy"]) else {
+            panic!("a plain launch takes --difficulty");
+        };
+        assert!(plain.starts_in_menu());
+        for bad in [
+            vec!["--difficulty"],
+            vec!["--personality", "--skip-menu"],
+            vec!["--spectate", "--difficulty", "hard"],
+            vec!["--scenario", "units200", "--personality", "rush"],
+            vec!["--headless-run", "10", "--difficulty", "hard"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
         }
     }
 

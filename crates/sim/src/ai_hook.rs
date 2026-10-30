@@ -461,9 +461,21 @@ impl<'a> SimView<'a> {
         self.rules
     }
 
-    /// Match seed (informational; the bot must not reseed anything from it).
+    /// Match seed. The bot must not seed a generator of its own from it;
+    /// its only randomness is [`SimView::ai_noise`] (M6).
     pub fn seed(&self) -> u64 {
         self.state.seed
+    }
+
+    /// The bot's noise (M6): a pure hash of the hashed seed, `player` and
+    /// `salt`, `xxh3_64("eonmark-ai-noise" ‖ seed ‖ player ‖ salt)` over
+    /// little-endian bytes. It is tick-free, so a decision salted with a
+    /// wave count or a site index is stable across plans with nothing
+    /// remembered, and it never draws from the sim's `Pcg32`, so a bot's
+    /// noise cannot shift combat's tie draws (docs/DETERMINISM.md, rule
+    /// 5).
+    pub fn ai_noise(&self, player: PlayerId, salt: u64) -> u64 {
+        ai_noise(self.state.seed, player, salt)
     }
 
     /// All players in slot order.
@@ -510,6 +522,22 @@ impl<'a> SimView<'a> {
     pub fn commands_applied(&self) -> u64 {
         self.state.commands_applied
     }
+}
+
+/// The domain tag of [`SimView::ai_noise`].
+const AI_NOISE_TAG: &[u8] = b"eonmark-ai-noise";
+
+/// [`SimView::ai_noise`] for a seed (a pure function, for tests and tools).
+pub fn ai_noise(seed: u64, player: PlayerId, salt: u64) -> u64 {
+    let mut bytes = [0u8; AI_NOISE_TAG.len() + 8 + 1 + 8];
+    let (tag, rest) = bytes.split_at_mut(AI_NOISE_TAG.len());
+    tag.copy_from_slice(AI_NOISE_TAG);
+    let (s, rest) = rest.split_at_mut(8);
+    s.copy_from_slice(&seed.to_le_bytes());
+    let (p, rest) = rest.split_at_mut(1);
+    p[0] = player.0;
+    rest.copy_from_slice(&salt.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&bytes)
 }
 
 /// A scripted opponent that runs *inside* [`crate::Sim::step`] so bot-vs-bot
@@ -637,6 +665,49 @@ mod tests {
         assert_eq!(cap, max(tower));
         assert_eq!(hp, view.building(BuildingId(1)).unwrap().hp);
         assert!(hp < cap, "the guard hit the tower: {hp} / {cap}");
+    }
+
+    /// M6: `ai_noise` is a pure function of the seed, the player and the
+    /// salt (equal to the free `ai_noise`, the same at every tick and on
+    /// every call), it differs by seed, player and salt, and a thousand
+    /// calls leave the sim's `Pcg32` (the `rng` sub-hash) and the whole
+    /// hash untouched.
+    #[test]
+    fn ai_noise_is_pure_and_leaves_the_rng_alone() {
+        use std::collections::BTreeSet;
+        let rules = Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap();
+        let mut sim = Sim::new(
+            MatchSetup::skirmish(&rules, 7),
+            rules.clone(),
+            Box::new(NoAi),
+        );
+        let (hash, rng) = (sim.hash(), sim.sub_hashes().rng);
+        let view = sim.view();
+        let who = |salt: u64| PlayerId(u8::try_from(salt % 2).unwrap());
+        let first: Vec<u64> = (0..1000u64)
+            .map(|salt| view.ai_noise(who(salt), salt))
+            .collect();
+        assert_eq!(sim.hash(), hash);
+        assert_eq!(sim.sub_hashes().rng, rng, "never draws from the Pcg32");
+        for (salt, n) in (0..1000u64).zip(&first) {
+            assert_eq!(*n, super::ai_noise(7, who(salt), salt));
+        }
+        assert_eq!(first.iter().collect::<BTreeSet<_>>().len(), 1000);
+        for _ in 0..30 {
+            sim.step(&[]);
+        }
+        let later = sim.view();
+        assert_eq!(later.ai_noise(PlayerId(0), 4), first[4], "tick-free");
+        assert_ne!(
+            later.ai_noise(PlayerId(1), 4),
+            first[4],
+            "the player matters"
+        );
+        assert_ne!(
+            super::ai_noise(8, PlayerId(0), 4),
+            first[4],
+            "the seed matters"
+        );
     }
 
     /// M5b: `check_gather` and `check_rally` answer as `Gather` and

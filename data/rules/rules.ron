@@ -3,10 +3,33 @@
 // at load by rules::Rules::ticks_from_ds. Schema: crates/rules/src/lib.rs
 // (deny_unknown_fields). Authoring guide: data/rules/README.md
 (
-  // 25: data/visuals.ron leaves rules_hash (ADR 0003); no sim change, no
-  // value changed: every fixture is re-recorded for the new rules_version
-  // and rules_hash in its header and no .hash moves.
-  rules_version: 25,
+  // 26: M6 difficulty levels (data/ai/difficulty/, in rules_hash) and
+  // SIM_VERSION 18's disclosed bot bonus (step 6d'): every fixture is
+  // re-recorded for its header; only m5_first_match's .hash moves (its two
+  // Standard seats receive the bonus from tick 4100).
+  // 27: M6 slice 2 bot behaviours (influence maps, retreat, raids, the
+  // deadline raid, counters, seat_last, defence and noise; crates/ai under
+  // SIM_VERSION 18) and the rush, boom and tower personalities: every
+  // fixture is re-recorded for its header; only m5_first_match's .hash moves.
+  // 28: M6 slice 2 tuning: Standard's build order takes a 2nd Muster Hall
+  // after arms_1 and a 3rd after Masonry (income becomes army), and Easy
+  // gets its disclosed 850 per mille Yeomen handicap; only m5_first_match's
+  // .hash moves.
+  // 29: M6 retune (M6 owner decision 12) groundwork: the difficulty files gain
+  // the `pressure` block and every personality `noise_border_top_k`, all
+  // neutral, and a siege wave's memory gains its target's last hit points;
+  // every fixture is re-recorded for its header; only m5_first_match's
+  // .hash moves (the bots' hashed memory bytes).
+  // 30: M6 retune (M6 owner decision 12): Standard and Hard press their sieges
+  // (reinforce, commit, no retreat, lure, cohesion; Standard's launch gate,
+  // Hard's assault gate), the all-ins go Hard 30:00, Easy 33:00, Standard
+  // 36:00, Easy researches Statecraft II and drops the 850 Yeomen handicap,
+  // tower adds Statecraft II, the difficulty files gain `extra_research` and
+  // `assault_ratio_permille` and the personalities lose `noise_border_top_k`.
+  // 31: review of the M6 retune: Standard retreats again as its personality
+  // does (pressure.retreat_ratio_permille 0 -> 1000; Hard still never
+  // retreats); only m5_first_match's .hash moves.
+  rules_version: 31,
   tick_rate_hz: 20,
   cmd_delay_ticks: 2,
   default_map: "plains_1v1",

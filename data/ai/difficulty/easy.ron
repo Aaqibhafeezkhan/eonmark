@@ -1,0 +1,37 @@
+// Easy (M6): a defensive bot for learning the loop. It receives a bonus
+// bundle every 30 s from 3:00 (the first one at 3:30), sends waves only after
+// the Masonry Age and only at its largest wave size (at most 14 armed units),
+// 1.5 times as far apart, holds wider borders (Statecraft II), and makes its
+// one big push, the all-in, at minute 33. No early raid and no siege
+// pressure (M6 owner decision 12). No handicap: line 2 passes without M6
+// owner decision 2's fallback (850 per mille Yeomen), which measured as a
+// stronger Easy (fewer Yeomen, more army under the pop cap).
+// Disclosed on New Game and on the game-over screen; never rubber-banded.
+// Schema: crates/rules/src/ai.rs (deny_unknown_fields). docs/design/ai.md,
+// "Difficulty table".
+(
+  id: "easy", name: "Easy",
+  income_interval_ds: 300,
+  income_from_ds: 1800,
+  income: {"grain": 20, "lumber": 20, "ore": 10},   // the same in all three files
+  wave_age_gate: Age("masonry"),
+  largest_wave_only: true,
+  max_wave_units: Some(14),
+  wave_size_permille: 1000,
+  wave_interval_permille: 1500,
+  all_in_after_ds: Some(19800),                     // 33:00, before Standard's 36:00, after Hard's 30:00
+  first_raid: None,
+  worker_target_permille: 1000,                     // no Yeomen handicap
+  extra_research: ["statecraft_2"],                 // +1 Town radius: an untouched cap game is Easy's
+  pressure: (
+    reinforce_min_units: 0,
+    commit_ds: 0,
+    retreat_ratio_permille: 1000,
+    retreat_cooldown_permille: 1000,
+    home_guard_units: 0,
+    lure_ds: 0,
+    cohesion_tiles: 0,
+    launch_ratio_permille: 0,
+    assault_ratio_permille: 0,
+  ),
+)

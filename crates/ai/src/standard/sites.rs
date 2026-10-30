@@ -12,10 +12,10 @@
 //! policy's spacing, and only then `check_build` (a full-map search), at
 //! most `site_checks_per_think` per plan.
 
-use super::ctx::Ctx;
+use super::ctx::{Ctx, salt};
 use super::facts::{kind_centre, kind_centre_tile, tiles_sq};
 use super::memory::BotMemory;
-use rules::{MapDef, Personality, Placement, Rules, Slots, Terrain};
+use rules::{MapDef, Personality, Placement, Rules, Slots, Symmetry, Terrain};
 use sim::{BuildingId, BuildingKindId, MatchSetup, PlayerId, Tile, UnitId};
 use std::collections::BTreeMap;
 
@@ -37,16 +37,18 @@ pub struct MapAnalysis {
     /// inner ring first, each ring clockwise from its north-west corner.
     pub near_town_offsets: Vec<(i32, i32)>,
     /// `Terrain` candidates per building kind with `Adjacent` slots:
-    /// footprint north-west tiles on grass within `border_scan_tiles` of
-    /// the own start with at least one adjacent tile of the kind's terrain,
-    /// best first: most adjacent tiles (up to the kind's `max`), then
-    /// nearest the own start, then the lowest tile index.
+    /// footprint north-west tiles on grass whose footprint centre lies
+    /// within `border_scan_tiles` of the own start, with at least one
+    /// adjacent tile of the kind's terrain, best first: most adjacent tiles
+    /// (up to the kind's `max`), then footprint centre nearest the own
+    /// start, then the lowest [`MapAnalysis::tie_index`] (M6: mirror-aware;
+    /// M5b measured from the north-west tile and broke ties by its index).
     pub terrain: BTreeMap<BuildingKindId, Vec<Tile>>,
     /// `Expansion` candidates: Town footprint north-west tiles on grass
     /// lying wholly inside the Seat's first border (every footprint tile
     /// closer than `town_radius_tiles` to the own start, so it is own land
     /// from the start) with the centre at least `expansion_min_tiles` from
-    /// the own start, best first by score, then the lowest tile index; at
+    /// the own start, best first by score, then the lowest `tie_index` (M6: mirror-aware); at
     /// most [`EXPANSION_CANDIDATES`]. The score is the Forest and Mountain
     /// tiles closer than `resource_radius_tiles` to the centre that lie
     /// outside the Seat's first border (what the new Town's border would
@@ -54,13 +56,21 @@ pub struct MapAnalysis {
     /// to the enemy start than the own start is.
     pub expansion: Vec<Tile>,
     /// `BorderEdge` candidates: grass tiles within `border_scan_tiles` of
-    /// the own start, nearest the enemy start first, then the lowest tile
-    /// index.
+    /// the own start, nearest the enemy start first, then the lowest
+    /// `tie_index` (M6: mirror-aware).
     pub border_edge: Vec<Tile>,
     /// The rally seed: `rally_tiles_from_seat` from the own start toward
     /// the enemy start (the rally is the first passable owned tile of the
     /// spiral around it, chosen at plan time).
     pub rally_seed: Tile,
+    /// The map's size.
+    pub size: (u16, u16),
+    /// M6: the map's symmetry when this seat's start is the mirror partner
+    /// of a lower seat's start. Every tie between candidates then breaks
+    /// by the index of the mirrored footprint ([`MapAnalysis::tie_index`])
+    /// and `NearTown` offsets are mirrored, so the two seats of a
+    /// symmetric map pick mirror images.
+    pub mirror: Option<Symmetry>,
 }
 
 fn d2(a: Tile, b: Tile) -> i64 {
@@ -71,6 +81,31 @@ fn d2(a: Tile, b: Tile) -> i64 {
 
 fn index(def: &MapDef, t: Tile) -> u32 {
     u32::from(t.y) * u32::from(def.width) + u32::from(t.x)
+}
+
+/// The north-west tile of the mirror image, under `sym` on a `size` map,
+/// of the `w` x `h` footprint at `nw`.
+pub fn mirrored_nw(sym: Symmetry, size: (u16, u16), nw: Tile, w: u16, h: u16) -> Tile {
+    let (far_x, far_y) = (nw.x + w.max(1) - 1, nw.y + h.max(1) - 1);
+    match sym {
+        Symmetry::MirrorX => {
+            let (x, _) = sym.partner(far_x, nw.y, size.0, size.1);
+            Tile::new(x, nw.y)
+        }
+        Symmetry::Rotate180 => {
+            let (x, y) = sym.partner(far_x, far_y, size.0, size.1);
+            Tile::new(x, y)
+        }
+    }
+}
+
+/// Squared distance from the centre of the `w` x `h` footprint at `nw` to
+/// the centre of tile `t`, in quarter tiles squared (doubled coordinates,
+/// so it is exact and mirror-symmetric).
+fn d2_centre(nw: Tile, w: u16, h: u16, t: Tile) -> i64 {
+    let dx = 2 * i64::from(nw.x) + i64::from(w) - 1 - 2 * i64::from(t.x);
+    let dy = 2 * i64::from(nw.y) + i64::from(h) - 1 - 2 * i64::from(t.y);
+    dx * dx + dy * dy
 }
 
 /// The tile `(x, y)` when it is on the map.
@@ -136,6 +171,22 @@ impl MapAnalysis {
             Tile::new(s.x, s.y)
         };
         let own_start = start(usize::from(me.0));
+        let size = (def.width, def.height);
+        let mirror = setup
+            .players
+            .iter()
+            .filter(|p| p.id < me)
+            .any(|p| {
+                let s = start(usize::from(p.id.0));
+                def.symmetry.partner(s.x, s.y, def.width, def.height) == (own_start.x, own_start.y)
+            })
+            .then_some(def.symmetry);
+        let tie = |nw: Tile, w: u16, h: u16| -> u32 {
+            mirror.map_or_else(
+                || index(def, nw),
+                |sym| index(def, mirrored_nw(sym, size, nw, w, h)),
+            )
+        };
         let enemy_start = setup
             .players
             .iter()
@@ -175,13 +226,15 @@ impl MapAnalysis {
             };
             let w = u16::try_from(kind.width_tiles).expect("validated <= 8");
             let h = u16::try_from(kind.height_tiles).expect("validated <= 8");
+            // Within the scan radius by footprint centre (doubled
+            // coordinates, so the scan is mirror-symmetric too).
             let mut found: Vec<(u32, i64, u32, Tile)> = tiles
                 .iter()
-                .filter(|nw| d2(**nw, own_start) <= scan * scan)
+                .filter(|nw| d2_centre(**nw, w, h, own_start) <= 4 * scan * scan)
                 .filter(|nw| footprint_on_grass(def, **nw, w, h))
                 .filter_map(|nw| {
                     let adj = adjacent_count(def, *nw, w, h, *t).min(*max);
-                    (adj > 0).then(|| (adj, d2(*nw, own_start), index(def, *nw), *nw))
+                    (adj > 0).then(|| (adj, d2_centre(*nw, w, h, own_start), tie(*nw, w, h), *nw))
                 })
                 .collect();
             found.sort_by_key(|(adj, d, i, _)| (core::cmp::Reverse(*adj), *d, *i));
@@ -241,7 +294,7 @@ impl MapAnalysis {
                 }
             }
             let gain = (home_to_enemy - d2(centre, enemy_start).isqrt()).max(0);
-            expansion.push((resources - penalty * gain, index(def, *nw), *nw));
+            expansion.push((resources - penalty * gain, tie(*nw, tw, th), *nw));
         }
         expansion.sort_by_key(|(score, i, _)| (core::cmp::Reverse(*score), *i));
         expansion.truncate(EXPANSION_CANDIDATES);
@@ -249,7 +302,7 @@ impl MapAnalysis {
         let mut border: Vec<(i64, u32, Tile)> = tiles
             .iter()
             .filter(|t| d2(**t, own_start) <= scan * scan && def.tile(t.x, t.y) == Terrain::Grass)
-            .map(|t| (d2(*t, enemy_start), index(def, *t), *t))
+            .map(|t| (d2(*t, enemy_start), tie(*t, 1, 1), *t))
             .collect();
         border.sort_by_key(|(d, i, _)| (*d, *i));
 
@@ -273,7 +326,36 @@ impl MapAnalysis {
             expansion: expansion.into_iter().map(|c| c.2).collect(),
             border_edge: border.into_iter().map(|c| c.2).collect(),
             rally_seed,
+            size,
+            mirror,
         }
+    }
+}
+
+impl MapAnalysis {
+    /// The index a tie between candidate footprints breaks by (M6): the
+    /// row-major index of the footprint's north-west tile, or, for a
+    /// mirrored seat, of its mirror image's.
+    pub fn tie_index(&self, nw: Tile, w: u16, h: u16) -> u32 {
+        let t = self
+            .mirror
+            .map_or(nw, |sym| mirrored_nw(sym, self.size, nw, w, h));
+        u32::from(t.y) * u32::from(self.size.0) + u32::from(t.x)
+    }
+
+    /// The footprint north-west tile of a `w` x `h` building at `NearTown`
+    /// offset `(dx, dy)` from a Town centre tile `c`: `c + (dx, dy)`, or,
+    /// for a mirrored seat, the offset mirrored with the footprint, so the
+    /// two seats walk mirror-image rings.
+    pub fn near_town_tile(&self, c: Tile, (dx, dy): (i32, i32), w: u16, h: u16) -> Option<Tile> {
+        let (dx, dy) = match self.mirror {
+            None => (dx, dy),
+            Some(Symmetry::MirrorX) => (-dx - (i32::from(w) - 1), dy),
+            Some(Symmetry::Rotate180) => (-dx - (i32::from(w) - 1), -dy - (i32::from(h) - 1)),
+        };
+        let x = u16::try_from(i32::from(c.x) + dx).ok()?;
+        let y = u16::try_from(i32::from(c.y) + dy).ok()?;
+        Some(Tile::new(x, y))
     }
 }
 
@@ -409,29 +491,78 @@ pub fn site_for(
             _ => mem.site = None,
         }
     }
-    let candidates: Vec<Tile> = match at {
+    let mut candidates: Vec<Tile> = match at {
         Placement::NearTown => {
             let Some(town) = near_town_anchor(ctx, kind) else {
                 return SiteSearch::NoSite;
             };
-            let Some(b) = ctx.view.building(town) else {
-                return SiteSearch::NoSite;
-            };
-            let c = kind_centre_tile(ctx.view.rules(), b.kind, b.tile);
-            ctx.map
-                .near_town_offsets
-                .iter()
-                .filter_map(|(dx, dy)| {
-                    let x = u16::try_from(i32::from(c.x) + dx).ok()?;
-                    let y = u16::try_from(i32::from(c.y) + dy).ok()?;
-                    Some(Tile::new(x, y))
-                })
-                .collect()
+            near_town_candidates(ctx, kind, town)
         }
         Placement::Terrain => ctx.map.terrain.get(&kind).cloned().unwrap_or_default(),
         Placement::Expansion => ctx.map.expansion.clone(),
         Placement::BorderEdge => ctx.map.border_edge.clone(),
     };
+    // M6: an Expansion or BorderEdge site is picked among the first
+    // `noise_site_top_k` candidates that pass the cheap tests, by the
+    // bot's noise salted with the step, so seeds differ in where the
+    // second Town and the border towers go.
+    let top_k = usize::try_from(ctx.knobs.noise_site_top_k).unwrap_or(1);
+    if top_k > 1 && matches!(at, Placement::Expansion | Placement::BorderEdge) {
+        let mut firsts: Vec<Tile> = Vec::new();
+        for t in &candidates {
+            if firsts.len() >= top_k {
+                break;
+            }
+            if fits(ctx, kind, *t, at) && spaced(ctx, kind, *t, at) {
+                firsts.push(*t);
+            }
+        }
+        if firsts.len() > 1 {
+            let n = u64::try_from(firsts.len()).expect("few");
+            let i = ctx.noise(salt::SITE + u64::from(step)) % n;
+            let pick = firsts[usize::try_from(i).expect("below the length")];
+            candidates.retain(|t| *t != pick);
+            candidates.insert(0, pick);
+        }
+    }
+    search(ctx, mem, step, kind, at, pool, candidates)
+}
+
+/// The `NearTown` candidates of a building of `kind` around `town`: the
+/// ring offsets of the map analysis from the Town's centre tile (mirrored
+/// for a mirrored seat).
+pub fn near_town_candidates(ctx: &Ctx<'_>, kind: BuildingKindId, town: BuildingId) -> Vec<Tile> {
+    let rules = ctx.view.rules();
+    let Some(b) = ctx.view.building(town) else {
+        return Vec::new();
+    };
+    let Some(def) = rules.building_kind(kind.0) else {
+        return Vec::new();
+    };
+    let w = u16::try_from(def.width_tiles).expect("validated <= 8");
+    let h = u16::try_from(def.height_tiles).expect("validated <= 8");
+    let c = kind_centre_tile(rules, b.kind, b.tile);
+    ctx.map
+        .near_town_offsets
+        .iter()
+        .filter_map(|o| ctx.map.near_town_tile(c, *o, w, h))
+        .collect()
+}
+
+/// Walk `candidates` in order for [`site_for`]: the first that passes
+/// every test is remembered for step `step` and returned.
+pub fn search(
+    ctx: &mut Ctx<'_>,
+    mem: &mut BotMemory,
+    step: u16,
+    kind: BuildingKindId,
+    at: Placement,
+    pool: &[UnitId],
+    candidates: Vec<Tile>,
+) -> SiteSearch {
+    if pool.is_empty() {
+        return SiteSearch::NoBuilder;
+    }
     for tile in candidates {
         match probe(ctx, kind, tile, at, pool) {
             Some(SiteSearch::Found { builder, tile }) => {
@@ -579,12 +710,21 @@ mod tests {
         assert_eq!(p1.rally_seed, Tile::new(91, 64));
     }
 
+    /// The `standard` knobs without the site noise (`noise_site_top_k`
+    /// 1): the best candidate always.
+    fn no_site_noise(r: &Rules) -> Personality {
+        let mut k = r.ai.personality("standard").unwrap().clone();
+        k.noise_site_top_k = 1;
+        k
+    }
+
     /// Every expansion candidate lies on own land at the standard start,
     /// at least `expansion_min_tiles` from the Seat, and the site the bot
-    /// picks is pinned (computed once, on `plains_1v1`): south of each
-    /// Seat, toward the forest beyond the first border. P1's pick (106, 81)
-    /// is not the exact mirror of P0's (18, 81), which is (107, 81): equal
-    /// scores break to the lowest tile index on both sides.
+    /// picks with no site noise is pinned (computed once, on
+    /// `plains_1v1`): south of each Seat, toward the forest beyond the
+    /// first border. M6: P1's pick is the exact mirror of P0's (18, 81),
+    /// (107, 81) (M5b broke equal scores to the lowest tile index on both
+    /// sides, so P1 took (106, 81)).
     #[test]
     fn expansion_site_is_own_buildable_and_pinned() {
         use crate::testkit::{Arena, P0, P1};
@@ -593,7 +733,8 @@ mod tests {
         setup.debug_commands = true;
         let a = Arena::frozen(setup, Vec::new());
         let town = BuildingKindId(r.town_kind());
-        for (p, pinned) in [(P0, Tile::new(18, 81)), (P1, Tile::new(106, 81))] {
+        let k = no_site_noise(&r);
+        for (p, pinned) in [(P0, Tile::new(18, 81)), (P1, Tile::new(107, 81))] {
             let map = a.map(p);
             assert_eq!(map.expansion[0], pinned, "{p:?}");
             let view = a.sim.view();
@@ -607,7 +748,7 @@ mod tests {
                 let c = Tile::new(nw.x + 1, nw.y + 1);
                 assert!(d2(c, map.own_start) >= 14 * 14);
             }
-            let mut ctx = a.ctx(p);
+            let mut ctx = Ctx::new(a.sim.view(), p, &k, a.map(p));
             let mut mem = BotMemory::default();
             let pool = view.idle_workers(p);
             let found = site_for(&mut ctx, &mut mem, 9, town, Placement::Expansion, &pool);
@@ -636,9 +777,10 @@ mod tests {
         .concat();
         let mut a = Arena::frozen(setup, grants);
         let tower = BuildingKindId(r.building_kind_by_id("watchtower").unwrap().0);
+        let k = no_site_noise(&r);
         for (p, want) in [(P0, Tile::new(43, 64)), (P1, Tile::new(84, 64))] {
             let view = a.sim.view();
-            let mut ctx = a.ctx(p);
+            let mut ctx = Ctx::new(a.sim.view(), p, &k, a.map(p));
             let mut mem = BotMemory::default();
             let pool = view.idle_workers(p);
             let found = site_for(&mut ctx, &mut mem, 16, tower, Placement::BorderEdge, &pool);
@@ -735,5 +877,48 @@ mod tests {
                 assert!(apart, "{a:?} and {b:?} touch");
             }
         }
+    }
+
+    /// M6: the two seats of `plains_1v1` (mirrored across x) build mirror
+    /// images: every candidate list of P1 is P0's, footprint by footprint
+    /// mirrored, in the same order, and the `NearTown` offsets mirror
+    /// around mirrored Town centres.
+    #[test]
+    fn sites_are_mirror_symmetric_on_plains_1v1() {
+        let r = rules();
+        let k = r.ai.personality("standard").unwrap();
+        let setup = MatchSetup::bots(&r, 1, ("standard", "standard"), ("standard", "standard"));
+        let p0 = MapAnalysis::new(&r, &setup, PlayerId(0), k);
+        let p1 = MapAnalysis::new(&r, &setup, PlayerId(1), k);
+        assert_eq!(p0.mirror, None);
+        assert_eq!(p1.mirror, Some(Symmetry::MirrorX));
+        let mirror = |t: Tile, w: u16, h: u16| mirrored_nw(Symmetry::MirrorX, p0.size, t, w, h);
+        for (kind, list) in &p0.terrain {
+            let def = r.building_kind(kind.0).unwrap();
+            let (w, h) = (
+                u16::try_from(def.width_tiles).unwrap(),
+                u16::try_from(def.height_tiles).unwrap(),
+            );
+            let want: Vec<Tile> = list.iter().map(|t| mirror(*t, w, h)).collect();
+            assert_eq!(p1.terrain[kind], want, "{}", def.id);
+        }
+        let want: Vec<Tile> = p0.expansion.iter().map(|t| mirror(*t, 3, 3)).collect();
+        assert_eq!(p1.expansion, want);
+        let want: Vec<Tile> = p0.border_edge.iter().map(|t| mirror(*t, 1, 1)).collect();
+        assert_eq!(p1.border_edge, want);
+        assert_eq!(p1.rally_seed, mirror(p0.rally_seed, 1, 1));
+        let (c0, c1) = (p0.own_start, p1.own_start);
+        assert_eq!(c1, mirror(c0, 1, 1));
+        for o in p0.near_town_offsets.iter().take(40) {
+            for (w, h) in [(1u16, 1u16), (2, 2), (3, 3)] {
+                let a = p0.near_town_tile(c0, *o, w, h).unwrap();
+                let b = p1.near_town_tile(c1, *o, w, h).unwrap();
+                assert_eq!(b, mirror(a, w, h), "{o:?} {w}x{h}");
+            }
+        }
+        assert_eq!(
+            p0.tie_index(Tile::new(18, 81), 3, 3),
+            p1.tie_index(Tile::new(107, 81), 3, 3)
+        );
     }
 }

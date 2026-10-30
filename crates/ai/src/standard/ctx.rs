@@ -2,10 +2,44 @@
 //! plan's rules from spending the same stock twice.
 
 use super::facts::Facts;
+use super::influence::{Influence, StatsCache};
 use super::sites::MapAnalysis;
-use rules::{BuildOrder, Personality};
-use sim::{BuildingKindId, Command, FxVec2, PlayerId, RejectReason, SimView, Tile, Unit, UnitId};
+use rules::{BuildOrder, FirstRaid, Personality, Pressure};
+use sim::{
+    BuildingKindId, Command, FxVec2, PlayerId, RejectReason, SimView, Tile, Unit, UnitId,
+    UnitKindId, UnitStats,
+};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The salts of the bot's noise (M6, [`Ctx::noise`]): one per decision,
+/// each combined with what makes the decision stable across plans (a wave
+/// count, a step or kind index), so no draw needs remembering.
+pub mod salt {
+    /// The wave interval after launch `n`.
+    pub const WAVE_INTERVAL: u64 = 1 << 40;
+    /// The first wave's extra wait.
+    pub const FIRST_WAVE: u64 = 2 << 40;
+    /// The upward wave-size bonus of launch `n`.
+    pub const WAVE_UNITS: u64 = 3 << 40;
+    /// A mix weight (kind index, then launch count).
+    pub const MIX: u64 = 4 << 40;
+    /// The site pick of build-order step `i`.
+    pub const SITE: u64 = 5 << 40;
+    /// The target pick of launch `n`.
+    pub const TARGET: u64 = 6 << 40;
+}
+
+/// `n` jittered by up to `permille` either way with `noise`:
+/// `n + n x ((noise mod (2p + 1)) - p) / 1000`, never negative.
+pub fn jitter(n: u32, noise: u64, permille: u32) -> u32 {
+    if permille == 0 || n == 0 {
+        return n;
+    }
+    let span = u64::from(permille) * 2 + 1;
+    let off = i64::try_from(noise % span).expect("small") - i64::from(permille);
+    let v = i64::from(n) + i64::from(n) * off / 1000;
+    u32::try_from(v.max(0)).unwrap_or(u32::MAX)
+}
 
 /// Where `u` is headed or holds: its order's goal, else its post's goal.
 /// (A unit's order becomes a post on arrival, so "has an order goal near
@@ -111,9 +145,20 @@ pub struct Ctx<'a> {
     /// later site of the same plan keeps its gap from them
     /// ([`super::sites::fits`]).
     pub planned: Vec<(i32, i32, i32, i32)>,
+    /// The difficulty's deadline raid (M6), set by the bot after
+    /// [`Ctx::new`] (`None`: no deadline raid).
+    pub first_raid: Option<FirstRaid>,
+    /// How the difficulty presses its sieges (M6 owner decision 12), set
+    /// by the bot after [`Ctx::new`] ([`Pressure::OFF`]: none).
+    pub pressure: Pressure,
+    /// Unit stats per `(owner, kind)`, resolved once per plan (M6).
+    pub stats: StatsCache,
+    /// Whether this plan built the influence maps (bench counter).
+    pub influence_built: bool,
     out: Vec<Command>,
     occupied: Option<BTreeSet<Tile>>,
     rally: Option<FxVec2>,
+    influence: Option<Influence>,
 }
 
 impl<'a> Ctx<'a> {
@@ -150,10 +195,42 @@ impl<'a> Ctx<'a> {
             probes_made: 0,
             commands_left: knobs.max_commands_per_think,
             planned: Vec::new(),
+            first_raid: None,
+            pressure: Pressure::OFF,
+            stats: StatsCache::new(),
+            influence_built: false,
             out: Vec::new(),
             occupied: None,
             rally: None,
+            influence: None,
         }
+    }
+
+    /// The plan's influence maps (M6), built on first use with the
+    /// personality's cell size and kept for the rest of the plan.
+    pub fn influence(&mut self) -> &Influence {
+        if self.influence.is_none() {
+            let built = Influence::build(
+                &self.view,
+                self.me,
+                self.knobs.influence_cell_tiles,
+                &mut self.stats,
+            );
+            self.influence = Some(built);
+            self.influence_built = true;
+        }
+        self.influence.as_ref().expect("just built")
+    }
+
+    /// `owner`'s stats for `kind`, through the plan's cache (M6).
+    pub fn unit_stats(&mut self, owner: PlayerId, kind: UnitKindId) -> UnitStats {
+        self.stats.get(&self.view, owner, kind)
+    }
+
+    /// The bot's noise for `salt` (M6): `SimView::ai_noise`, a pure hash
+    /// of the hashed seed, the player and the salt.
+    pub fn noise(&self, salt: u64) -> u64 {
+        self.view.ai_noise(self.me, salt)
     }
 
     /// The plan's tick.

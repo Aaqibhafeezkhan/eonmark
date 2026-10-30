@@ -20,7 +20,7 @@
 use crate::construction::{at_work, building_rect};
 use crate::gather;
 use crate::ids::{BuildingKindId, PlayerId};
-use crate::state::{Construction, Job, State};
+use crate::state::{Construction, Job, MatchSetup, SimEvent, State};
 use rules::Rules;
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,119 @@ pub struct RateInfo {
     /// What reaches the accumulator: `min(raw, cap)`, or `raw` when uncapped.
     /// `raw > credited` is the HUD's amber readout (M3b).
     pub credited: u32,
+}
+
+impl RateInfo {
+    /// `true` while production of this resource is discarded at the Yield
+    /// Cap (`raw > credited`): the HUD's amber readout (M3b) and
+    /// `MatchStats`' cap seconds (M6) share this one rule.
+    pub fn at_cap(&self) -> bool {
+        self.raw > self.credited
+    }
+}
+
+/// One bot seat's disclosed bonus schedule (M6, step 6d'): `bundle` is
+/// added to the seat's stockpile on the step that completes tick `n` for
+/// every `n > from_ticks` with `(n - from_ticks) % every_ticks == 0`.
+/// Derived from the header and the rules ([`bonus_table`]), never hashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BonusSeat {
+    /// The bot seat.
+    pub player: PlayerId,
+    /// The match time the schedule counts from, in ticks.
+    pub from_ticks: u32,
+    /// The interval in ticks (at least 1).
+    pub every_ticks: u32,
+    /// The bundle per resource, `resources.ron` order.
+    pub bundle: Vec<i64>,
+}
+
+/// The bonus schedule of a match (M6): one [`BonusSeat`] per AI seat, in
+/// id order, whose `bot` names a difficulty level (`rules.ai`) that pays
+/// (a non-zero interval and a non-empty bundle). Human slots and `passive`
+/// seats get nothing. A pure function of the header and the
+/// `rules_hash`-covered data, so a replay or a restore derives the same
+/// table.
+pub fn bonus_table(setup: &MatchSetup, rules: &Rules) -> Vec<BonusSeat> {
+    setup
+        .ai_seats
+        .iter()
+        .filter_map(|seat| {
+            let level = rules.ai.difficulty(&seat.bot)?;
+            if !level.pays() {
+                return None;
+            }
+            Some(BonusSeat {
+                player: seat.player,
+                from_ticks: level.income_from_ticks(rules),
+                every_ticks: level.income_interval_ticks(rules).max(1),
+                bundle: level.bundle(rules),
+            })
+        })
+        .collect()
+}
+
+/// Step 6d' (M6): pay every bonus seat whose schedule falls on the tick this
+/// step completes (`tick + 1`), in id order, skipping a surrendered seat:
+/// the bundle is added to the stockpile, then each resource is clamped to
+/// its `stockpile_cap` (Lore). Emits `BonusIncome` with what was actually
+/// credited. Integer arithmetic on the hashed stockpiles on a fixed tick
+/// schedule, so replays re-derive it with nothing recorded.
+pub(crate) fn bonus_step(
+    state: &mut State,
+    rules: &Rules,
+    bonus: &[BonusSeat],
+    tick: u32,
+    events: &mut Vec<SimEvent>,
+) {
+    let paying: Vec<PlayerId> = state
+        .players
+        .iter()
+        .filter(|p| !p.surrendered)
+        .map(|p| p.id)
+        .collect();
+    pay_bonus(&mut state.economy, &paying, rules, bonus, tick, events);
+}
+
+/// Whether `seat`'s schedule pays on the step that completes tick
+/// `completes`.
+pub fn bonus_due(seat: &BonusSeat, completes: u32) -> bool {
+    completes > seat.from_ticks
+        && (completes - seat.from_ticks).is_multiple_of(seat.every_ticks.max(1))
+}
+
+/// [`bonus_step`] over a bare economy: `paying` lists the players that may
+/// receive a bonus (those that have not surrendered).
+fn pay_bonus(
+    economy: &mut Economy,
+    paying: &[PlayerId],
+    rules: &Rules,
+    bonus: &[BonusSeat],
+    tick: u32,
+    events: &mut Vec<SimEvent>,
+) {
+    let completes = tick.saturating_add(1);
+    for seat in bonus {
+        if !bonus_due(seat, completes) || !paying.contains(&seat.player) {
+            continue;
+        }
+        let eco = economy.player_mut(seat.player);
+        let before = eco.stock.clone();
+        for (s, a) in eco.stock.iter_mut().zip(&seat.bundle) {
+            *s = s.checked_add(*a).expect("stockpile fits i64");
+        }
+        clamp_to_caps(rules, &mut eco.stock);
+        let amounts: Vec<i64> = eco
+            .stock
+            .iter()
+            .zip(&before)
+            .map(|(after, b)| after.saturating_sub(*b).max(0))
+            .collect();
+        events.push(SimEvent::BonusIncome {
+            player: seat.player,
+            amounts,
+        });
+    }
 }
 
 /// The player's income per resource this tick, `resources.ron` order.
@@ -226,6 +339,96 @@ pub(crate) fn building_cost_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn rules() -> Rules {
+        Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap()
+    }
+
+    /// M6: the HUD's amber rule and `MatchStats`' cap seconds are one
+    /// function: production above the Yield Cap, `raw > credited`.
+    #[test]
+    fn rate_info_at_cap_matches_the_hud_rule() {
+        let rate = |raw, cap: Option<u32>| RateInfo {
+            raw,
+            cap,
+            credited: cap.map_or(raw, |c| raw.min(c)),
+        };
+        assert!(rate(80, Some(70)).at_cap());
+        assert!(
+            !rate(70, Some(70)).at_cap(),
+            "exactly at the cap loses nothing"
+        );
+        assert!(!rate(10, Some(70)).at_cap());
+        assert!(!rate(500, None).at_cap(), "uncapped Lore is never amber");
+        for (raw, cap) in [
+            (0, Some(0)),
+            (1, Some(0)),
+            (99, Some(100)),
+            (101, Some(100)),
+        ] {
+            let r = rate(raw, cap);
+            assert_eq!(r.at_cap(), r.raw > r.credited, "{r:?}");
+        }
+    }
+
+    /// M6 step 6d': a hand-built schedule on a bare economy pays its
+    /// bundle on the steps that complete `from + k x every` (k >= 1) and
+    /// on no other, only to its seat, and reports what it paid.
+    #[test]
+    fn bonus_step_pays_on_schedule_from_income_from() {
+        let rules = rules();
+        let n = rules.resources.resources.len();
+        let mut eco = Economy::new(2, n);
+        let mut bundle = vec![0i64; n];
+        bundle[0] = 20;
+        bundle[1] = 7;
+        let table = [BonusSeat {
+            player: PlayerId(1),
+            from_ticks: 100,
+            every_ticks: 10,
+            bundle: bundle.clone(),
+        }];
+        let mut events = Vec::new();
+        let mut paid_at = Vec::new();
+        for tick in 0..200u32 {
+            let before = events.len();
+            pay_bonus(
+                &mut eco,
+                &[PlayerId(0), PlayerId(1)],
+                &rules,
+                &table,
+                tick,
+                &mut events,
+            );
+            if events.len() > before {
+                paid_at.push(tick + 1);
+            }
+        }
+        assert_eq!(paid_at, (110..=200).step_by(10).collect::<Vec<u32>>());
+        assert_eq!(eco.players[1].stock[0], 20 * 10);
+        assert_eq!(eco.players[1].stock[1], 7 * 10);
+        assert!(
+            eco.players[0].stock.iter().all(|s| *s == 0),
+            "seat 0 has no bonus"
+        );
+        assert!(
+            eco.players[1].acc.iter().all(|a| *a == 0),
+            "the bonus bypasses the accumulator"
+        );
+        assert!(events.iter().all(|e| *e
+            == SimEvent::BonusIncome {
+                player: PlayerId(1),
+                amounts: bundle.clone()
+            }));
+        // A seat left out of `paying` (surrendered) gets nothing.
+        let mut eco = Economy::new(2, n);
+        pay_bonus(&mut eco, &[PlayerId(0)], &rules, &table, 109, &mut events);
+        assert!(eco.players[1].stock.iter().all(|s| *s == 0));
+        assert!(
+            bonus_due(&table[0], 110) && !bonus_due(&table[0], 100) && !bonus_due(&table[0], 105)
+        );
+    }
 
     #[test]
     fn affordability_names_the_first_short_resource() {

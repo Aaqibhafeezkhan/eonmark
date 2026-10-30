@@ -78,9 +78,11 @@ fn repo_data_passes_with_three_ages_eight_kinds_and_twelve_techs() {
         stdout.contains(" techs=12 side_techs=2 factions=1 "),
         "{stdout}"
     );
-    // M5b: the bot data under data/ai.
+    // M5b: the bot data under data/ai; M6: its three difficulty levels.
     assert!(
-        stdout.contains(" factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en"),
+        stdout.contains(
+            " factions=1 personalities=4 build_orders=4 difficulties=3 maps=plains_1v1 strings=en"
+        ),
         "{stdout}"
     );
     // Art pass: the visuals counts and the Scene files found under assets/.

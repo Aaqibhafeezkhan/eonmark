@@ -51,7 +51,7 @@ when you can; the validator does not require it.
 
 | Field | Meaning | Value | Used from |
 |-------|---------|-------|-----------|
-| `rules_version` | Bump whenever golden replays are regenerated, and for any edit to a RON file under `data/rules/` or `data/ai/` except the UI strings in `data/rules/strings/` (those files are in `rules_hash`; the strings are not, see `docs/DATA_FORMAT.md`); the comment above it gives the reason for the current number | 25 | M0 |
+| `rules_version` | Bump whenever golden replays are regenerated, and for any edit to a RON file under `data/rules/` or `data/ai/` except the UI strings in `data/rules/strings/` (those files are in `rules_hash`; the strings are not, see `docs/DATA_FORMAT.md`); the comment above it gives the reason for the current number | 30 | M0 |
 | `tick_rate_hz` | Simulation ticks per second | 20 | M0 |
 | `cmd_delay_ticks` | A command issued at tick N applies at N + this | 2 | M0 |
 | `default_map` | Map for `MatchSetup::skirmish`; must exist under `data/maps/` | `"plains_1v1"` | M0 |
@@ -189,7 +189,16 @@ header-only re-record (only `m5_first_match`, new in that pull request,
 moved with the bot's code). The art pass's ADR 0003 (`rules_version` 25)
 changed no value either: `../visuals.ron` left `rules_hash`, so every
 fixture was re-recorded for its header alone and no `.hash` moved; a look
-edit needs no bump from then on.
+edit needs no bump from then on. M6 changed no value here either:
+`rules_version` 26 added `../ai/difficulty/` (the disclosed bot bonus, paid
+by step 6d' under `SIM_VERSION` 18), 27 the rush, boom and tower
+personalities and the new bot knobs, 28 the tuned Standard build
+order and Easy's Yeomen handicap, 29 the retune groundwork (the
+difficulty files' `pressure` block and `noise_border_top_k`, all neutral,
+and a siege wave's memory of its target's last hit points), 30 the retune
+itself (M6 owner decision 12: siege pressure, the all-in times, Easy's
+and `tower`'s Statecraft II) and 31 Standard's retreat restored after its
+review, all under `../ai/`; in each only `m5_first_match.hash` moved.
 
 ## resources.ron
 
@@ -567,7 +576,7 @@ fails. The data-only path is the same for every hashed RON file and
 touches no Rust:
 
 1. Edit the value, as above.
-2. Bump `rules_version` in `rules.ron` (25 to 26), update the one-line
+2. Bump `rules_version` in `rules.ron` (28 to 29), update the one-line
    reason in the comment above it and put the same reason in the commit
    message.
 3. Check the data, re-record the golden fixtures and run the sim tests:
@@ -579,8 +588,8 @@ cargo test -p sim
 ```
 
 `data-check` prints
-`OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:3 models=36`
-(the visuals counts follow `../visuals.ron`; the repository is at 25, so before the edit it prints `rules_version=25`;
+`OK rules_version=29 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=4 build_orders=4 difficulties=3 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:3 models=36`
+(the visuals counts follow `../visuals.ron`; the repository is at 28, so before the edit it prints `rules_version=28`;
 the hash is new because a file changed).
 `just rerecord` runs `scripts/rerecord_fixtures.sh`: it re-records every
 fixture under `crates/sim/tests/fixtures/` in release, writes each `.hash`

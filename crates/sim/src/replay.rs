@@ -48,9 +48,9 @@
 //! [`SubHashes`] names the subsystem. The result is exactly one
 //! [`VerifyOutcome`], whose `Display` is the string the CLI prints.
 
-use crate::ai_hook::AiController;
+use crate::ai_hook::{AiController, SimView};
 use crate::command::PlayerCommand;
-use crate::state::{MatchSetup, SIM_VERSION, Sim, SubHashes};
+use crate::state::{MatchSetup, SIM_VERSION, Sim, SimEvent, SubHashes};
 use rules::Rules;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -540,6 +540,47 @@ pub fn verify_with(
     data_dir: &Path,
     factory: Box<ControllerFactory<'_>>,
 ) -> Result<VerifyOutcome, ReplayError> {
+    run_verify(path, data_dir, factory, None)
+}
+
+/// What [`verify_observed`] hands every step: the view after it and the
+/// events it emitted.
+pub type StepObserver<'a> = dyn FnMut(&SimView<'_>, &[SimEvent]) + 'a;
+
+/// [`verify_with`] that also hands the re-simulation to `observe` (M6):
+/// once at tick 0 with no events, then after every step with the events
+/// that step emitted (drained). `sim-cli match-log` feeds `MatchStats`
+/// from it. The outcome is the one [`verify_with`] returns; nothing is
+/// observed after a version or rules mismatch.
+pub fn verify_observed(
+    path: &Path,
+    data_dir: &Path,
+    factory: Box<ControllerFactory<'_>>,
+    observe: &mut StepObserver<'_>,
+) -> Result<VerifyOutcome, ReplayError> {
+    run_verify(path, data_dir, factory, Some(observe))
+}
+
+/// Step `sim` with `cmds`, then hand the step to `observe` with the drained
+/// events, if there is an observer.
+fn step_observed(
+    sim: &mut Sim,
+    cmds: &[PlayerCommand],
+    observe: &mut Option<&mut StepObserver<'_>>,
+) {
+    sim.step(cmds);
+    if let Some(observe) = observe {
+        let events = sim.drain_events();
+        observe(&sim.view(), &events);
+    }
+}
+
+fn run_verify(
+    path: &Path,
+    data_dir: &Path,
+    factory: Box<ControllerFactory<'_>>,
+    mut observe: Option<&mut StepObserver<'_>>,
+) -> Result<VerifyOutcome, ReplayError> {
     let ReplayFile { setup, records, .. } = match open_for_check(path)? {
         Ok(file) => file,
         Err(outcome) => return Ok(outcome),
@@ -548,12 +589,24 @@ pub fn verify_with(
         Ok(sim) => sim,
         Err(outcome) => return Ok(outcome),
     };
+    if let Some(observe) = &mut observe {
+        observe(&sim.view(), &[]);
+    }
     let mut last_hash: Option<(u32, u64)> = None;
     for record in &records {
         let tick = record_tick(record);
-        advance_to(&mut sim, tick, path)?;
+        if tick < sim.tick() {
+            return Err(ReplayError::OutOfOrder {
+                path: path.to_path_buf(),
+                tick,
+                reached: sim.tick(),
+            });
+        }
+        while sim.tick() < tick {
+            step_observed(&mut sim, &[], &mut observe);
+        }
         match record {
-            Record::Tick(batch) => sim.step(&batch.cmds),
+            Record::Tick(batch) => step_observed(&mut sim, &batch.cmds, &mut observe),
             Record::Hash(rec) => {
                 if sim.hash() != rec.hash {
                     let subsystem = sim
@@ -713,21 +766,6 @@ fn record_tick(record: &Record) -> u32 {
         Record::Tick(b) => b.tick,
         Record::Hash(h) => h.tick,
     }
-}
-
-/// Step with empty command lists until `sim.tick() == tick`.
-fn advance_to(sim: &mut Sim, tick: u32, path: &Path) -> Result<(), ReplayError> {
-    if tick < sim.tick() {
-        return Err(ReplayError::OutOfOrder {
-            path: path.to_path_buf(),
-            tick,
-            reached: sim.tick(),
-        });
-    }
-    while sim.tick() < tick {
-        sim.step(&[]);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

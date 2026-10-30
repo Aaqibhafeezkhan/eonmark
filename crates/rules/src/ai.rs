@@ -14,6 +14,12 @@
 //! order that could stall for ever fail here instead of at run time: a
 //! step that cannot be reached from the steps before it must be
 //! `optional`, and an `Advance` never may be.
+//!
+//! M6 adds the difficulty levels, one file per level under
+//! `ai/difficulty/<id>.ron` ([`Difficulty`]): the disclosed bonus bundle
+//! the sim pays a bot seat (the income cheat) and the wave knobs the level
+//! scales, applied to a personality by [`resolve`]. A header's
+//! `AiSeat.bot` names a difficulty id (or `passive`).
 
 use crate::{Error, Rules, UnitClass, load_ron};
 use serde::{Deserialize, Serialize};
@@ -38,6 +44,38 @@ pub const MAX_AI_DS: u32 = 72_000;
 pub const MAX_THINK_EVERY_DS: u32 = 600;
 /// Largest `army_mix` weight and `toward_enemy_penalty`.
 pub const MAX_AI_WEIGHT: u32 = 1000;
+/// Largest amount of one resource in a difficulty's bonus bundle.
+pub const MAX_BONUS_AMOUNT: u32 = 500;
+/// Shortest non-zero bonus interval (`income_interval_ds`, 5 s).
+pub const MIN_INCOME_INTERVAL_DS: u32 = 50;
+/// Smallest `worker_target_permille` (M6).
+pub const MIN_WORKER_TARGET_PERMILLE: u32 = 500;
+/// Most `extra_research` entries of a difficulty (M6 owner decision 12).
+pub const MAX_EXTRA_RESEARCH: usize = 8;
+/// Smallest difficulty multiplier (`wave_size_permille`,
+/// `wave_interval_permille`).
+pub const MIN_DIFFICULTY_PERMILLE: u32 = 250;
+/// Largest difficulty multiplier.
+pub const MAX_DIFFICULTY_PERMILLE: u32 = 4000;
+/// Largest counter factor cap (`counter_cap_permille`) and counter weight.
+pub const MAX_COUNTER_PERMILLE: u32 = 8000;
+/// Largest jitter share (`noise_wave_interval_permille`,
+/// `noise_mix_permille`).
+pub const MAX_NOISE_PERMILLE: u32 = 500;
+/// Largest `noise_site_top_k`.
+pub const MAX_SITE_TOP_K: u32 = 8;
+/// Largest `influence_cell_tiles`.
+pub const MAX_INFLUENCE_CELL_TILES: u32 = 16;
+/// Largest `influence_radius_cells`.
+pub const MAX_INFLUENCE_RADIUS_CELLS: u32 = 8;
+/// Largest `retreat_ratio_permille` and `raid_distance_permille`.
+pub const MAX_AI_RATIO_PERMILLE: u32 = 10_000;
+/// The bot id of the bot that never acts: reserved, so no difficulty file
+/// may take it.
+pub const PASSIVE_ID: &str = "passive";
+/// The difficulty every tool defaults to (`play-bots`, New Game); its file
+/// must exist.
+pub const STANDARD_DIFFICULTY: &str = "standard";
 
 /// Everything under `data/ai/`, attached to [`crate::Rules::ai`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -47,6 +85,9 @@ pub struct AiRules {
     /// The build orders of `ai/build_orders/*.ron`, keyed by file stem
     /// (which equals each one's `id`).
     pub build_orders: BTreeMap<String, BuildOrder>,
+    /// The difficulty levels of `ai/difficulty/*.ron` (M6), keyed by file
+    /// stem (which equals each one's `id`).
+    pub difficulties: BTreeMap<String, Difficulty>,
 }
 
 impl AiRules {
@@ -59,6 +100,290 @@ impl AiRules {
     pub fn build_order(&self, id: &str) -> Option<&BuildOrder> {
         self.build_orders.get(id)
     }
+
+    /// The difficulty level with the given id, if any (M6).
+    pub fn difficulty(&self, id: &str) -> Option<&Difficulty> {
+        self.difficulties.get(id)
+    }
+}
+
+/// Which age gate a difficulty puts on a personality's waves (M6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaveAgeGate {
+    /// The personality's own `wave_requires_age`.
+    Personality,
+    /// No wave launches before the bot reaches this age (an age id).
+    Age(String),
+    /// No age gate at all.
+    Off,
+}
+
+/// A difficulty's guaranteed early raid (M6, slice 2's behaviour): by
+/// `by_ds` the bot attacks with at least `min_armed` armed units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstRaid {
+    /// The raid launches by this match time (`by_ds` below the match cap).
+    pub by_ds: u32,
+    /// Emergency production toward `min_armed` starts this long before
+    /// `by_ds` (less than `by_ds`).
+    pub prep_ds: u32,
+    /// Armed units the raid needs (at least 1).
+    pub min_armed: u32,
+    /// Most armed units it takes (`min_armed..=MAX_WAVE_UNITS`).
+    pub max_armed: u32,
+}
+
+/// How a difficulty presses its sieges (M6 owner decision 12, 2026-10-29):
+/// the behaviour the ROADMAP names for each level (Easy defensive; Standard
+/// and Hard keep a siege going until a Town falls). [`Pressure::OFF`] is
+/// the slice-2 bot: no reinforcement, no commit, the personality's retreat
+/// and no extra home guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pressure {
+    /// While a siege wave assaults or holds its target, home armed units
+    /// assembled at the rally join it once at least this many are there
+    /// (beyond the home guard), and during the all-in the joiners and the
+    /// launch go in such groups from the rally instead of one by one; 0:
+    /// never (`0..=MAX_WAVE_UNITS`).
+    pub reinforce_min_units: u32,
+    /// A siege wave whose target Town lost hit points within this long
+    /// neither retreats nor ends on `wave_max_ds`; 0: off
+    /// (`0..=MAX_AI_DS`).
+    pub commit_ds: u32,
+    /// Scales the personality's `retreat_ratio_permille` (0: the level
+    /// never retreats; 1000 keeps it), `0..=MAX_DIFFICULTY_PERMILLE`.
+    pub retreat_ratio_permille: u32,
+    /// Scales the personality's `retreat_cooldown_ds`,
+    /// `MIN_DIFFICULTY_PERMILLE..=MAX_DIFFICULTY_PERMILLE`.
+    pub retreat_cooldown_permille: u32,
+    /// Armed units every launch, reinforcement and all-in joiner leaves at
+    /// home (`0..=MAX_WAVE_UNITS`), besides the one a full pop keeps.
+    pub home_guard_units: u32,
+    /// For up to this long after its assault order a siege wave holds at
+    /// its Wain point (out of every enemy shooter's reach) while enemy
+    /// armed units stand within `siege_focus_tiles` of its target, so the
+    /// defenders come out to it and the fight is not under the Town's and
+    /// Watchtowers' fire; 0: off (`0..=MAX_AI_DS`).
+    pub lure_ds: u32,
+    /// While a siege wave assaults, its armed units more than this many
+    /// tiles nearer the goal than its rear quarter stop and wait, so
+    /// the wave arrives together instead of fast units first; 0: off
+    /// (`0..=MAX_AI_TILES`).
+    pub cohesion_tiles: u32,
+    /// A siege wave (not the all-in, not a raid) launches only when the
+    /// Lanchester strength (`sum(hp) x sum(dps)`) of the units it would
+    /// take times 1000 reaches this times the strength of the enemy armed
+    /// units standing on the enemy's own land; 0: off
+    /// (`0..=MAX_AI_RATIO_PERMILLE`).
+    pub launch_ratio_permille: u32,
+    /// A staged siege wave (not the all-in) starts its assault only when
+    /// its Lanchester strength times 1000 reaches this times that of the
+    /// enemy armed units on the enemy's own land; until then it holds at
+    /// its stage point, where reinforcements join it, and if it is still
+    /// short at `stage_max_ds` it comes home; 0: off
+    /// (`0..=MAX_AI_RATIO_PERMILLE`).
+    pub assault_ratio_permille: u32,
+}
+
+impl Pressure {
+    /// No pressure behaviour: the bot as slice 2 built it.
+    pub const OFF: Pressure = Pressure {
+        reinforce_min_units: 0,
+        commit_ds: 0,
+        retreat_ratio_permille: 1000,
+        retreat_cooldown_permille: 1000,
+        home_guard_units: 0,
+        lure_ds: 0,
+        cohesion_tiles: 0,
+        launch_ratio_permille: 0,
+        assault_ratio_permille: 0,
+    };
+}
+
+impl Default for Pressure {
+    fn default() -> Pressure {
+        Pressure::OFF
+    }
+}
+
+/// One difficulty level, `data/ai/difficulty/<id>.ron` (M6). Difficulty is
+/// a disclosed cheat plus wave timing: the sim pays a bot seat whose
+/// `AiSeat.bot` names the level the same `income` bundle every
+/// `income_interval_ds`, from `income_from_ds` on (step 6d'), [`resolve`]
+/// scales the personality's wave and retreat knobs, and (M6 owner decision
+/// 12) its [`Pressure`] sets how hard the level presses a siege. Counters,
+/// influence and noise are personality knobs, equal at every level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Difficulty {
+    /// Equals the file stem; never `passive`.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// The bonus is paid every this many deciseconds; 0 pays nothing.
+    /// Otherwise `MIN_INCOME_INTERVAL_DS..=MAX_AI_DS`, and more than
+    /// `cmd_delay_ticks` in ticks.
+    pub income_interval_ds: u32,
+    /// The first payment completes one interval after this match time
+    /// (below the match cap).
+    pub income_from_ds: u32,
+    /// The bonus bundle per resource id, each `0..=MAX_BONUS_AMOUNT`.
+    pub income: BTreeMap<String, u32>,
+    /// The age gate of the bot's waves.
+    pub wave_age_gate: WaveAgeGate,
+    /// Every wave waits for the personality's largest wave size.
+    pub largest_wave_only: bool,
+    /// Caps every wave (and `max_wave_units`) at this many armed units.
+    pub max_wave_units: Option<u32>,
+    /// Scales every `wave_sizes` row (rounded up, at least 1),
+    /// `MIN_DIFFICULTY_PERMILLE..=MAX_DIFFICULTY_PERMILLE`.
+    pub wave_size_permille: u32,
+    /// Scales `wave_interval_ds` (rounded to nearest), same range.
+    pub wave_interval_permille: u32,
+    /// Replaces the personality's `all_in_after_ds` (`None` keeps it).
+    pub all_in_after_ds: Option<u32>,
+    /// The guaranteed early raid, if any.
+    pub first_raid: Option<FirstRaid>,
+    /// Scales every `Workers` count of the bot's build order (rounded up,
+    /// at least 1), `MIN_WORKER_TARGET_PERMILLE..=1000`: the disclosed
+    /// economic handicap M6 owner decision 2 allows for Easy alone (850: 15%
+    /// fewer Yeomen); 1000 at the other levels.
+    pub worker_target_permille: u32,
+    /// Techs the level researches once its build order is through (M6
+    /// owner decision 12: a defensive level widens the border it holds),
+    /// each appended to the build order as an optional `Research` step
+    /// unless the order already researches it; at most
+    /// `MAX_EXTRA_RESEARCH`, each a tech id, each once.
+    pub extra_research: Vec<String>,
+    /// How the level presses its sieges (M6 owner decision 12).
+    pub pressure: Pressure,
+}
+
+impl Difficulty {
+    /// The bonus interval in ticks (0: no bonus).
+    pub fn income_interval_ticks(&self, rules: &Rules) -> u32 {
+        rules.ticks_from_ds(self.income_interval_ds)
+    }
+
+    /// The match time the bonus schedule counts from, in ticks.
+    pub fn income_from_ticks(&self, rules: &Rules) -> u32 {
+        rules.ticks_from_ds(self.income_from_ds)
+    }
+
+    /// The bonus bundle as a dense vector in `resources.ron` order.
+    pub fn bundle(&self, rules: &Rules) -> Vec<i64> {
+        rules.amounts(&self.income)
+    }
+
+    /// Whether the level pays any bonus at all: a non-zero interval and a
+    /// non-empty bundle.
+    pub fn pays(&self) -> bool {
+        self.income_interval_ds > 0 && self.income.values().any(|v| *v > 0)
+    }
+}
+
+/// The knobs a bot of difficulty `d` plays `p` with (M6): a pure function
+/// of the two rows, so a bot rebuilt mid-match resolves the same knobs.
+///
+/// - `max_wave_units` becomes the smaller of `p`'s and `d`'s cap;
+/// - every `wave_sizes[i].armed` is scaled by `wave_size_permille`, rounded
+///   up, at least 1, at most that cap (the rows stay non-decreasing);
+/// - `largest_wave_only` sets every row to the last (largest) row's size;
+/// - `wave_interval_ds` is scaled by `wave_interval_permille`, rounded to
+///   nearest (half up), at least 1 and at most `MAX_AI_DS`;
+/// - the age gate is `d.wave_age_gate`, the all-in time
+///   `d.all_in_after_ds` when set, and `min_siege`, `raid_max_armed` and
+///   `raid_min_armed` at most the cap.
+///
+/// - (M6 owner decision 12) `retreat_ratio_permille` and
+///   `retreat_cooldown_ds` are scaled by the level's
+///   `pressure.retreat_ratio_permille` and `retreat_cooldown_permille`,
+///   rounded to nearest (half up), at most `MAX_AI_RATIO_PERMILLE` and
+///   `MAX_AI_DS`.
+///
+/// Nothing else changes: counters, influence and noise are the
+/// personality's at every level.
+pub fn resolve(p: &Personality, d: &Difficulty) -> Personality {
+    let mut out = p.clone();
+    let cap = d
+        .max_wave_units
+        .map_or(p.max_wave_units, |m| m.min(p.max_wave_units))
+        .max(1);
+    out.max_wave_units = cap;
+    for w in &mut out.wave_sizes {
+        let scaled = (u64::from(w.armed) * u64::from(d.wave_size_permille)).div_ceil(1000);
+        let scaled = u32::try_from(scaled).unwrap_or(u32::MAX);
+        w.armed = scaled.clamp(1, cap);
+    }
+    if d.largest_wave_only
+        && let Some(last) = out.wave_sizes.last().map(|w| w.armed)
+    {
+        for w in &mut out.wave_sizes {
+            w.armed = last;
+        }
+    }
+    let interval =
+        (u64::from(p.wave_interval_ds) * u64::from(d.wave_interval_permille) + 500) / 1000;
+    out.wave_interval_ds = u32::try_from(interval)
+        .unwrap_or(MAX_AI_DS)
+        .clamp(1, MAX_AI_DS);
+    out.wave_requires_age = match &d.wave_age_gate {
+        WaveAgeGate::Personality => p.wave_requires_age.clone(),
+        WaveAgeGate::Age(age) => Some(age.clone()),
+        WaveAgeGate::Off => None,
+    };
+    if let Some(ds) = d.all_in_after_ds {
+        out.all_in_after_ds = ds;
+    }
+    out.min_siege = out.min_siege.min(cap);
+    out.raid_max_armed = out.raid_max_armed.min(cap);
+    out.raid_min_armed = out.raid_min_armed.min(out.raid_max_armed);
+    let scale = |v: u32, permille: u32, max: u32| -> u32 {
+        let scaled = (u64::from(v) * u64::from(permille) + 500) / 1000;
+        u32::try_from(scaled).unwrap_or(max).min(max)
+    };
+    out.retreat_ratio_permille = scale(
+        p.retreat_ratio_permille,
+        d.pressure.retreat_ratio_permille,
+        MAX_AI_RATIO_PERMILLE,
+    );
+    out.retreat_cooldown_ds = scale(
+        p.retreat_cooldown_ds,
+        d.pressure.retreat_cooldown_permille,
+        MAX_AI_DS,
+    );
+    out
+}
+
+/// The build order a bot of difficulty `d` plays (M6): `order` with every
+/// `Workers` count scaled by `d.worker_target_permille`, rounded up, at
+/// least 1 (the split weights stay as they are: they are shares), and (M6
+/// owner decision 12) an optional `Research` step appended for each of
+/// `d.extra_research` that the order does not research already, in the
+/// level's order. A pure function of the two rows, like [`resolve`].
+pub fn resolve_order(order: &BuildOrder, d: &Difficulty) -> BuildOrder {
+    let mut out = order.clone();
+    for step in &mut out.steps {
+        if let Step::Workers { count, .. } = step {
+            let scaled = (u64::from(*count) * u64::from(d.worker_target_permille)).div_ceil(1000);
+            *count = u32::try_from(scaled).unwrap_or(u32::MAX).max(1);
+        }
+    }
+    for tech in &d.extra_research {
+        let has = out
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Research { tech: t, .. } if t == tech));
+        if !has {
+            out.steps.push(Step::Research {
+                tech: tech.clone(),
+                optional: true,
+            });
+        }
+    }
+    out
 }
 
 /// Contents of `data/ai/personalities.ron`.
@@ -179,6 +504,27 @@ pub enum RecallWave {
     /// Whenever an own Town is threatened (docs/design/ai.md rule 6 as
     /// first written).
     Always,
+}
+
+/// How a personality's waves start (M6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WaveMode {
+    /// Every wave is a siege wave (M5b).
+    Siege,
+    /// While no siege unit is assembled at the rally, the bot sends raids
+    /// (no siege, no Supply Wain) every `raid_every_ds`; siege waves once
+    /// it has one.
+    RaidUntilSiege,
+}
+
+/// When a siege wave needs a Supply Wain to launch (M6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WainRule {
+    /// Every wave takes one (M5b).
+    Always,
+    /// Only once the enemy has a Harrying level (attrition exists only
+    /// then); Wains are trained from then on too.
+    IfEnemyHarrying,
 }
 
 /// One entry of a personality's army mix.
@@ -323,6 +669,95 @@ pub struct Personality {
     /// An assaulting wave is recalled when the threatened Town is at or
     /// below this share of its hit points.
     pub recall_wave_town_hp_permille: u32,
+    /// In the pool the `random` personality choice draws from (M6): rush,
+    /// boom and tower; the Balanced `standard` row is an explicit choice.
+    pub random: bool,
+    // M6 (docs/design/ai.md, "Personalities"): every field below is
+    // explicit in every row, and none of them is scaled by a difficulty
+    // (`resolve` leaves them alone, but caps the raid sizes).
+    /// `Siege` or `RaidUntilSiege`.
+    pub wave_mode: WaveMode,
+    /// When a siege wave needs a Supply Wain.
+    pub wain_rule: WainRule,
+    /// No wave or raid launches before this tech is researched (`None`: no
+    /// gate); the deadline raid ignores it.
+    pub wave_requires_tech: Option<String>,
+    /// A wave skips the enemy Seat while the enemy holds another complete,
+    /// uncontested Town.
+    pub seat_last: bool,
+    /// Home armed units a raid needs (`RaidUntilSiege`).
+    pub raid_min_armed: u32,
+    /// Most armed units in a raid (`raid_min_armed..=MAX_WAVE_UNITS`).
+    pub raid_max_armed: u32,
+    /// Time between two raids.
+    pub raid_every_ds: u32,
+    /// A raid comes home after this long.
+    pub raid_max_ds: u32,
+    /// A raid comes home after this long with no enemy unit within
+    /// `raid_idle_tiles` of any of its units.
+    pub raid_idle_ds: u32,
+    /// See `raid_idle_ds`.
+    pub raid_idle_tiles: u32,
+    /// Raid target score per worker at the target building.
+    pub raid_worker_weight: u32,
+    /// Raid target score lost per tile from the rally, per mille.
+    pub raid_distance_permille: u32,
+    /// A wave retreats when its own strength times 1000 is below the
+    /// enemy army's near it times this (and `retreat_loss_permille` holds);
+    /// 0 never retreats.
+    pub retreat_ratio_permille: u32,
+    /// ... and it has lost at least this share of the armed units it
+    /// launched with.
+    pub retreat_loss_permille: u32,
+    /// No retreat within this long of the assault order (a raid's
+    /// launch).
+    pub retreat_commit_ds: u32,
+    /// After a retreat the next launch waits at least this long.
+    pub retreat_cooldown_ds: u32,
+    /// No retreat while the wave's target Town is at or below this share
+    /// of its hit points.
+    pub retreat_commit_town_hp_permille: u32,
+    /// Influence map cell side.
+    pub influence_cell_tiles: u32,
+    /// Cells around a point an influence query sums (a block of `2r + 1`
+    /// cells a side).
+    pub influence_radius_cells: u32,
+    /// Siege target score per unit of `isqrt` of the enemy strength at the
+    /// target (units and shooters), against 1000 per tile of distance.
+    pub target_strength_weight: u32,
+    /// How strongly counters bend the army mix, per mille (0: off).
+    pub counter_weight_permille: u32,
+    /// The smallest counter factor, per mille (`..=1000`).
+    pub counter_floor_permille: u32,
+    /// The largest counter factor, per mille (`1000..=MAX_COUNTER_PERMILLE`).
+    pub counter_cap_permille: u32,
+    /// A `counter_kinds` entry joins the mix while its factor reaches this
+    /// (`1000..=counter_cap_permille`).
+    pub counter_join_permille: u32,
+    /// Armed kinds outside `army_mix` that join it, with their weight,
+    /// while they counter what the enemy shows.
+    pub counter_kinds: Vec<MixEntry>,
+    /// Enemy military near an own worked gathering building is a threat
+    /// too.
+    pub defend_economy: bool,
+    /// See `defend_economy`.
+    pub defend_economy_tiles: u32,
+    /// The guard attacks enemy Supply Wains among the threats first.
+    pub defend_wains_first: bool,
+    /// After a released defence, the bot adds one Watchtower near the
+    /// defended Town, up to this many in the match.
+    pub reactive_towers: u32,
+    /// The wave interval is jittered by up to this share, per mille.
+    pub noise_wave_interval_permille: u32,
+    /// Each wave needs up to this many more armed units (upward only).
+    pub noise_wave_units: u32,
+    /// The first wave waits up to this much longer.
+    pub noise_first_wave_ds: u32,
+    /// Each army-mix weight is jittered by up to this share, per mille.
+    pub noise_mix_permille: u32,
+    /// `Expansion` and `BorderEdge` sites are picked among the first this
+    /// many candidates that pass the cheap tests (1: always the best).
+    pub noise_site_top_k: u32,
 }
 
 impl Personality {
@@ -345,13 +780,10 @@ pub fn worker_kind(rules: &Rules) -> Option<(u16, &crate::UnitKind)> {
         .map(|(i, u)| (u16::try_from(i).expect("validated len"), u))
 }
 
-/// Load and validate `dir/ai/` against the rest of `rules`: every build
-/// order under `ai/build_orders/` (non-`.ron` files are ignored, files are
-/// read in path order), then `ai/personalities.ron`.
-pub(crate) fn load(dir: &Path, rules: &Rules) -> Result<AiRules, Error> {
-    let orders_dir = dir.join("ai").join("build_orders");
-    let entries = std::fs::read_dir(&orders_dir).map_err(|source| Error::Io {
-        path: orders_dir.clone(),
+/// The `.ron` files of `dir`, in path order (other files are ignored).
+fn ron_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let entries = std::fs::read_dir(dir).map_err(|source| Error::Io {
+        path: dir.to_path_buf(),
         source,
     })?;
     let mut paths: Vec<PathBuf> = entries
@@ -360,32 +792,271 @@ pub(crate) fn load(dir: &Path, rules: &Rules) -> Result<AiRules, Error> {
         .filter(|p| p.extension().is_some_and(|e| e == "ron"))
         .collect();
     paths.sort();
+    Ok(paths)
+}
+
+/// The file stem of `path`, which a keyed file's `id` must equal.
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `id` must equal the file stem of `path`.
+fn check_stem(path: &Path, id: &str) -> Check {
+    let stem = stem_of(path);
+    if id != stem {
+        return Err(Error::invalid(
+            path,
+            "id",
+            format!("{id:?} must equal the file stem {stem:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Load and validate `dir/ai/` against the rest of `rules`: every build
+/// order under `ai/build_orders/` (non-`.ron` files are ignored, files are
+/// read in path order), then `ai/personalities.ron`, then (M6) every
+/// difficulty level under `ai/difficulty/`, which must include
+/// `standard`.
+pub(crate) fn load(dir: &Path, rules: &Rules) -> Result<AiRules, Error> {
     let mut build_orders = BTreeMap::new();
-    for path in paths {
+    for path in ron_files(&dir.join("ai").join("build_orders"))? {
         let order: BuildOrder = load_ron(&path)?;
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if order.id != stem {
-            return Err(Error::invalid(
-                &path,
-                "id",
-                format!("{:?} must equal the file stem {stem:?}", order.id),
-            ));
-        }
+        check_stem(&path, &order.id)?;
         check_build_order(&path, &order, rules)?;
-        build_orders.insert(stem, order);
+        build_orders.insert(stem_of(&path), order);
     }
     let personalities_path = dir.join("ai").join("personalities.ron");
     let file: Personalities = load_ron(&personalities_path)?;
-    let ai = AiRules {
+    let mut ai = AiRules {
         personalities: file.personalities,
         build_orders,
+        difficulties: BTreeMap::new(),
     };
     check_personalities(&personalities_path, &ai, rules)?;
+    let difficulty_dir = dir.join("ai").join("difficulty");
+    for path in ron_files(&difficulty_dir)? {
+        let level: Difficulty = load_ron(&path)?;
+        check_stem(&path, &level.id)?;
+        check_difficulty(&path, &level, rules)?;
+        ai.difficulties.insert(stem_of(&path), level);
+    }
+    if !ai.difficulties.contains_key(STANDARD_DIFFICULTY) {
+        return Err(Error::invalid(
+            &difficulty_dir.join(format!("{STANDARD_DIFFICULTY}.ron")),
+            "id",
+            format!(
+                "no {STANDARD_DIFFICULTY:?} difficulty (found: {}); every tool defaults to it",
+                ai.difficulties
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     Ok(ai)
+}
+
+/// One difficulty level: identity, the bonus bundle and its schedule, the
+/// multipliers, the age gate and the first raid (M6).
+fn check_difficulty(path: &Path, d: &Difficulty, rules: &Rules) -> Check {
+    if d.id == PASSIVE_ID {
+        return Err(Error::invalid(
+            path,
+            "id",
+            format!("{PASSIVE_ID:?} is reserved for the bot that never acts"),
+        ));
+    }
+    if d.name.is_empty() {
+        return Err(Error::invalid(path, "name", "must not be empty"));
+    }
+    for (resource, amount) in &d.income {
+        let at = format!("income.{resource}");
+        if rules.resource_index(resource).is_none() {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{resource:?} is not a resource id in resources.ron"),
+            ));
+        }
+        in_range(path, &at, *amount, 0, MAX_BONUS_AMOUNT)?;
+    }
+    if d.income_interval_ds != 0 {
+        in_range(
+            path,
+            "income_interval_ds",
+            d.income_interval_ds,
+            MIN_INCOME_INTERVAL_DS,
+            MAX_AI_DS,
+        )?;
+        if d.income_interval_ticks(rules) <= rules.cmd_delay_ticks {
+            return Err(Error::invalid(
+                path,
+                "income_interval_ds",
+                format!(
+                    "{} ticks must be more than cmd_delay_ticks ({}) in rules.ron",
+                    d.income_interval_ticks(rules),
+                    rules.cmd_delay_ticks
+                ),
+            ));
+        }
+    }
+    let below_cap = |field: &str, ds: u32| -> Check {
+        if ds >= rules.match_cap_ds {
+            return Err(Error::invalid(
+                path,
+                field,
+                format!(
+                    "{ds} is not below match_cap_ds ({}) in rules.ron",
+                    rules.match_cap_ds
+                ),
+            ));
+        }
+        Ok(())
+    };
+    below_cap("income_from_ds", d.income_from_ds)?;
+    for (name, v) in [
+        ("wave_size_permille", d.wave_size_permille),
+        ("wave_interval_permille", d.wave_interval_permille),
+    ] {
+        in_range(
+            path,
+            name,
+            v,
+            MIN_DIFFICULTY_PERMILLE,
+            MAX_DIFFICULTY_PERMILLE,
+        )?;
+    }
+    if let Some(n) = d.max_wave_units {
+        in_range(path, "max_wave_units", n, 1, MAX_WAVE_UNITS)?;
+    }
+    in_range(
+        path,
+        "worker_target_permille",
+        d.worker_target_permille,
+        MIN_WORKER_TARGET_PERMILLE,
+        1000,
+    )?;
+    if d.extra_research.len() > MAX_EXTRA_RESEARCH {
+        return Err(Error::invalid(
+            path,
+            "extra_research",
+            format!(
+                "{} techs; a level adds at most {MAX_EXTRA_RESEARCH}",
+                d.extra_research.len()
+            ),
+        ));
+    }
+    for (i, tech) in d.extra_research.iter().enumerate() {
+        let at = format!("extra_research[{i}]");
+        if rules.tech_by_id(tech).is_none() {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{tech:?} is not a tech id in techs.ron"),
+            ));
+        }
+        if d.extra_research[..i].contains(tech) {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{tech:?} is listed twice"),
+            ));
+        }
+    }
+    let pr = &d.pressure;
+    in_range(
+        path,
+        "pressure.reinforce_min_units",
+        pr.reinforce_min_units,
+        0,
+        MAX_WAVE_UNITS,
+    )?;
+    in_range(path, "pressure.commit_ds", pr.commit_ds, 0, MAX_AI_DS)?;
+    in_range(
+        path,
+        "pressure.retreat_ratio_permille",
+        pr.retreat_ratio_permille,
+        0,
+        MAX_DIFFICULTY_PERMILLE,
+    )?;
+    in_range(
+        path,
+        "pressure.retreat_cooldown_permille",
+        pr.retreat_cooldown_permille,
+        MIN_DIFFICULTY_PERMILLE,
+        MAX_DIFFICULTY_PERMILLE,
+    )?;
+    in_range(
+        path,
+        "pressure.home_guard_units",
+        pr.home_guard_units,
+        0,
+        MAX_WAVE_UNITS,
+    )?;
+    in_range(path, "pressure.lure_ds", pr.lure_ds, 0, MAX_AI_DS)?;
+    in_range(
+        path,
+        "pressure.cohesion_tiles",
+        pr.cohesion_tiles,
+        0,
+        MAX_AI_TILES,
+    )?;
+    in_range(
+        path,
+        "pressure.launch_ratio_permille",
+        pr.launch_ratio_permille,
+        0,
+        MAX_AI_RATIO_PERMILLE,
+    )?;
+    in_range(
+        path,
+        "pressure.assault_ratio_permille",
+        pr.assault_ratio_permille,
+        0,
+        MAX_AI_RATIO_PERMILLE,
+    )?;
+    if let Some(ds) = d.all_in_after_ds {
+        in_range(path, "all_in_after_ds", ds, 0, MAX_AI_DS)?;
+    }
+    if let WaveAgeGate::Age(age) = &d.wave_age_gate
+        && rules.age_index(age).is_none()
+    {
+        return Err(Error::invalid(
+            path,
+            "wave_age_gate",
+            format!("{age:?} is not an age id in ages.ron"),
+        ));
+    }
+    if let Some(raid) = &d.first_raid {
+        in_range(
+            path,
+            "first_raid.min_armed",
+            raid.min_armed,
+            1,
+            MAX_WAVE_UNITS,
+        )?;
+        in_range(
+            path,
+            "first_raid.max_armed",
+            raid.max_armed,
+            raid.min_armed,
+            MAX_WAVE_UNITS,
+        )?;
+        below_cap("first_raid.by_ds", raid.by_ds)?;
+        if raid.prep_ds >= raid.by_ds {
+            return Err(Error::invalid(
+                path,
+                "first_raid.prep_ds",
+                format!("{} must be less than by_ds ({})", raid.prep_ds, raid.by_ds),
+            ));
+        }
+    }
+    Ok(())
 }
 
 type Check = Result<(), Error>;
@@ -424,6 +1095,7 @@ fn check_build_order(path: &Path, order: &BuildOrder, rules: &Rules) -> Check {
     let mut built: BTreeSet<&str> = BTreeSet::from([town.id.as_str()]);
     let mut researched: BTreeSet<&str> = BTreeSet::new();
     let mut towns: u32 = 1;
+    let mut advanced = false;
     for (i, step) in order.steps.iter().enumerate() {
         let field = |name: &str| format!("steps[{i}].{name}");
         let unreachable = |name: &str, why: String| {
@@ -668,6 +1340,17 @@ fn check_build_order(path: &Path, order: &BuildOrder, rules: &Rules) -> Check {
                         ),
                     ));
                 }
+                // M6: a difficulty's deadline raid trains armed units before
+                // the first Advance, so a trainer of an armed kind of the
+                // start age must stand by then.
+                if !advanced && !armed_trainer_built(rules, &built, &researched, age) {
+                    return Err(Error::invalid(
+                        path,
+                        &field("age"),
+                        "no earlier non-optional step builds a trainer of an armed kind (such as a Muster Hall); every build order builds one before its first Advance",
+                    ));
+                }
+                advanced = true;
                 age = index;
             }
             Step::Military => {}
@@ -677,6 +1360,26 @@ fn check_build_order(path: &Path, order: &BuildOrder, rules: &Rules) -> Check {
         }
     }
     Ok(())
+}
+
+/// Whether a building kind in `built` trains an armed, non-civilian unit
+/// kind unlocked by `age` whose `requires_tech`, if any, is `researched`.
+fn armed_trainer_built(
+    rules: &Rules,
+    built: &BTreeSet<&str>,
+    researched: &BTreeSet<&str>,
+    age: u8,
+) -> bool {
+    rules.units.iter().enumerate().any(|(i, u)| {
+        let index = u16::try_from(i).expect("validated len");
+        u.class != UnitClass::Civilian
+            && u.attack.is_some()
+            && built.contains(u.trainer.as_str())
+            && rules.age_of_unit(index) <= age
+            && u.requires_tech
+                .as_ref()
+                .is_none_or(|t| researched.contains(t.as_str()))
+    })
 }
 
 /// The personality rows: ids, build orders, ranges and cross-checks.
@@ -911,7 +1614,190 @@ fn check_personalities(path: &Path, ai: &AiRules, rules: &Rules) -> Check {
                 format!("{age:?} is not an age id in ages.ron"),
             ));
         }
+        check_m6_knobs(path, &f, p, rules)?;
     }
+    Ok(())
+}
+
+/// The M6 knobs of one personality row (`f` names its fields).
+fn check_m6_knobs(
+    path: &Path,
+    f: &dyn Fn(&str) -> String,
+    p: &Personality,
+    rules: &Rules,
+) -> Check {
+    if let Some(tech) = &p.wave_requires_tech
+        && rules.tech_by_id(tech).is_none()
+    {
+        return Err(Error::invalid(
+            path,
+            &f("wave_requires_tech"),
+            format!("{tech:?} is not a tech id in techs.ron"),
+        ));
+    }
+    in_range(
+        path,
+        &f("raid_min_armed"),
+        p.raid_min_armed,
+        1,
+        MAX_WAVE_UNITS,
+    )?;
+    in_range(
+        path,
+        &f("raid_max_armed"),
+        p.raid_max_armed,
+        p.raid_min_armed,
+        MAX_WAVE_UNITS,
+    )?;
+    for (name, v, lo) in [
+        ("raid_every_ds", p.raid_every_ds, 1),
+        ("raid_max_ds", p.raid_max_ds, 1),
+        ("raid_idle_ds", p.raid_idle_ds, 1),
+        ("retreat_commit_ds", p.retreat_commit_ds, 0),
+        ("retreat_cooldown_ds", p.retreat_cooldown_ds, 0),
+        ("noise_first_wave_ds", p.noise_first_wave_ds, 0),
+    ] {
+        in_range(path, &f(name), v, lo, MAX_AI_DS)?;
+    }
+    for (name, v) in [
+        ("raid_idle_tiles", p.raid_idle_tiles),
+        ("defend_economy_tiles", p.defend_economy_tiles),
+    ] {
+        in_range(path, &f(name), v, 1, MAX_AI_TILES)?;
+    }
+    in_range(
+        path,
+        &f("raid_worker_weight"),
+        p.raid_worker_weight,
+        0,
+        MAX_AI_WEIGHT,
+    )?;
+    in_range(
+        path,
+        &f("target_strength_weight"),
+        p.target_strength_weight,
+        0,
+        MAX_AI_WEIGHT,
+    )?;
+    for (name, v) in [
+        ("raid_distance_permille", p.raid_distance_permille),
+        ("retreat_ratio_permille", p.retreat_ratio_permille),
+    ] {
+        in_range(path, &f(name), v, 0, MAX_AI_RATIO_PERMILLE)?;
+    }
+    for (name, v) in [
+        ("retreat_loss_permille", p.retreat_loss_permille),
+        (
+            "retreat_commit_town_hp_permille",
+            p.retreat_commit_town_hp_permille,
+        ),
+    ] {
+        in_range(path, &f(name), v, 0, 1000)?;
+    }
+    in_range(
+        path,
+        &f("influence_cell_tiles"),
+        p.influence_cell_tiles,
+        1,
+        MAX_INFLUENCE_CELL_TILES,
+    )?;
+    in_range(
+        path,
+        &f("influence_radius_cells"),
+        p.influence_radius_cells,
+        0,
+        MAX_INFLUENCE_RADIUS_CELLS,
+    )?;
+    in_range(
+        path,
+        &f("counter_weight_permille"),
+        p.counter_weight_permille,
+        0,
+        MAX_COUNTER_PERMILLE,
+    )?;
+    in_range(
+        path,
+        &f("counter_floor_permille"),
+        p.counter_floor_permille,
+        0,
+        1000,
+    )?;
+    in_range(
+        path,
+        &f("counter_cap_permille"),
+        p.counter_cap_permille,
+        1000,
+        MAX_COUNTER_PERMILLE,
+    )?;
+    in_range(
+        path,
+        &f("counter_join_permille"),
+        p.counter_join_permille,
+        1000,
+        p.counter_cap_permille,
+    )?;
+    let mut kinds = BTreeSet::new();
+    for (j, e) in p.counter_kinds.iter().enumerate() {
+        let at = f(&format!("counter_kinds[{j}].kind"));
+        let Some(def) = rules.unit_kind_by_id(&e.kind) else {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{:?} is not a unit kind id in units.ron", e.kind),
+            ));
+        };
+        if def.class == UnitClass::Civilian || def.attack.is_none() {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{:?} is not an armed, non-civilian kind", e.kind),
+            ));
+        }
+        if !kinds.insert(e.kind.as_str()) {
+            return Err(Error::invalid(
+                path,
+                &at,
+                format!("{:?} is listed twice", e.kind),
+            ));
+        }
+        in_range(
+            path,
+            &f(&format!("counter_kinds[{j}].weight")),
+            e.weight,
+            1,
+            MAX_AI_WEIGHT,
+        )?;
+    }
+    in_range(
+        path,
+        &f("reactive_towers"),
+        p.reactive_towers,
+        0,
+        MAX_AI_CAP,
+    )?;
+    for (name, v) in [
+        (
+            "noise_wave_interval_permille",
+            p.noise_wave_interval_permille,
+        ),
+        ("noise_mix_permille", p.noise_mix_permille),
+    ] {
+        in_range(path, &f(name), v, 0, MAX_NOISE_PERMILLE)?;
+    }
+    in_range(
+        path,
+        &f("noise_wave_units"),
+        p.noise_wave_units,
+        0,
+        MAX_WAVE_UNITS,
+    )?;
+    in_range(
+        path,
+        &f("noise_site_top_k"),
+        p.noise_site_top_k,
+        1,
+        MAX_SITE_TOP_K,
+    )?;
     Ok(())
 }
 
@@ -956,19 +1842,53 @@ mod tests {
 
     const BO: &str = "ai/build_orders/standard.ron";
     const PE: &str = "ai/personalities.ron";
+    const EASY: &str = "ai/difficulty/easy.ron";
+    const HARD: &str = "ai/difficulty/hard.ron";
 
+    /// M6: the four personalities (standard first, then the `random`
+    /// pool rush, boom and tower) and their build orders; the M5b
+    /// `standard` row and build order are as they were.
     #[test]
-    fn repo_ai_data_loads_one_personality_and_one_build_order() {
+    fn repo_ai_data_loads_four_personalities_and_build_orders() {
         let rules = Rules::load(data_dir()).unwrap();
-        assert_eq!(rules.ai.personalities.len(), 1);
-        assert_eq!(rules.ai.build_orders.len(), 1);
+        assert_eq!(
+            rules
+                .ai
+                .personalities
+                .iter()
+                .map(|p| (p.id.as_str(), p.build_order.as_str(), p.random))
+                .collect::<Vec<_>>(),
+            [
+                ("standard", "standard", false),
+                ("rush", "rush", true),
+                ("boom", "boom", true),
+                ("tower", "tower", true)
+            ]
+        );
+        assert_eq!(
+            rules
+                .ai
+                .build_orders
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["boom", "rush", "standard", "tower"]
+        );
+        let rush = rules.ai.personality("rush").unwrap();
+        assert_eq!(
+            (rush.wave_mode, rush.wain_rule, rush.seat_last),
+            (WaveMode::RaidUntilSiege, WainRule::IfEnemyHarrying, false)
+        );
+        let tower = rules.ai.personality("tower").unwrap();
+        assert_eq!(tower.wave_requires_tech.as_deref(), Some("harrying_1"));
+        assert!(tower.defend_wains_first && tower.reactive_towers > 0);
         let p = rules.ai.personality("standard").unwrap();
         assert_eq!(p.build_order, "standard");
         assert_eq!(p.think_every_ticks(&rules), 10);
         assert_eq!(p.recall_wave, RecallWave::WhileStaging);
         assert_eq!(p.wave_requires_age.as_deref(), Some("masonry"));
         let order = rules.ai.build_order("standard").unwrap();
-        assert_eq!(order.steps.len(), 37);
+        assert_eq!(order.steps.len(), 38);
         assert_eq!(
             order.steps[0],
             Step::Workers {
@@ -982,10 +1902,16 @@ mod tests {
             worker_kind(&rules).map(|(i, u)| (i, u.id.as_str())),
             Some((0, "yeoman"))
         );
-        assert!(rules.ai.personality("rush").is_none());
+        let standard = rules.ai.personality("standard").unwrap();
+        assert_eq!(
+            (standard.wave_mode, standard.wain_rule, standard.seat_last),
+            (WaveMode::Siege, WainRule::Always, true)
+        );
     }
 
-    /// `data/ai` is in `rules_hash`: a knob edit changes the hash.
+    /// `data/ai` is in `rules_hash`: a knob edit changes the hash, and so
+    /// (M6) does a difficulty edit, the line-4 flip's one-line edit of
+    /// `hard.ron` included.
     #[test]
     fn ai_data_is_in_the_rules_hash() {
         let repo = Rules::load(data_dir()).unwrap();
@@ -994,6 +1920,320 @@ mod tests {
         let mut cleared = repo.clone();
         cleared.ai = AiRules::default();
         assert_ne!(repo.rules_hash(), cleared.rules_hash());
+        let flipped = load_edited(
+            "hash-flip",
+            &[(HARD, "income_interval_ds: 200,", "income_interval_ds: 300,")],
+        )
+        .unwrap();
+        assert_ne!(repo.rules_hash(), flipped.rules_hash());
+        assert_eq!(
+            flipped.ai.difficulty("hard").unwrap().income_interval_ds,
+            300
+        );
+        let mut no_levels = repo.clone();
+        no_levels.ai.difficulties.remove("easy");
+        assert_ne!(repo.rules_hash(), no_levels.rules_hash());
+    }
+
+    /// M6: the three shipped levels, their schedules and the knobs they
+    /// scale. The bundle is the same at every level, so the interval alone
+    /// sizes the cheat.
+    #[test]
+    fn repo_difficulties_are_easy_standard_hard() {
+        let rules = Rules::load(data_dir()).unwrap();
+        assert_eq!(
+            rules
+                .ai
+                .difficulties
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["easy", "hard", "standard"]
+        );
+        let level = |id: &str| rules.ai.difficulty(id).unwrap();
+        let (easy, standard, hard) = (level("easy"), level("standard"), level("hard"));
+        assert_eq!(
+            [easy, standard, hard].map(|d| d.income_interval_ticks(&rules)),
+            [600, 500, 400]
+        );
+        // From 3:00; the first payment completes one interval later.
+        for d in [easy, standard, hard] {
+            assert_eq!(d.income_from_ticks(&rules), 3600);
+            assert!(d.pays());
+            assert_eq!(d.bundle(&rules), standard.bundle(&rules));
+        }
+        let bundle = standard.bundle(&rules);
+        let grain = rules.resource_index("grain").unwrap();
+        let lore = rules.resource_index("lore").unwrap();
+        assert_eq!(bundle[grain], 20);
+        assert_eq!(bundle[lore], 0);
+        assert_eq!(easy.wave_age_gate, WaveAgeGate::Age("masonry".into()));
+        assert_eq!(standard.wave_age_gate, WaveAgeGate::Personality);
+        assert_eq!(hard.wave_age_gate, WaveAgeGate::Off);
+        assert!(easy.largest_wave_only && easy.first_raid.is_none());
+        assert_eq!(hard.first_raid.map(|r| r.by_ds), Some(6000));
+        assert_eq!(standard.first_raid.map(|r| r.by_ds), Some(9000));
+        assert!(rules.ai.difficulty("passive").is_none());
+    }
+
+    /// M6: `resolve` scales the wave sizes once (rounded up, at least 1,
+    /// capped), the interval (rounded to nearest), sets the age gate and
+    /// the all-in time, and `largest_wave_only` flattens the rows; it
+    /// leaves every other knob alone. Standard resolves to the
+    /// personality with its all-in at 36:00 (M6 owner decision 12); it
+    /// retreats as the personality does, and Hard never retreats.
+    #[test]
+    fn resolve_scales_sizes_and_intervals_once_and_caps_largest_only() {
+        let rules = Rules::load(data_dir()).unwrap();
+        let p = rules.ai.personality("standard").unwrap();
+        let level = |id: &str| rules.ai.difficulty(id).unwrap();
+        let mut want = p.clone();
+        want.all_in_after_ds = 21600;
+        assert_eq!(resolve(p, level("standard")), want);
+        assert_eq!(resolve(p, level("hard")).retreat_ratio_permille, 0);
+        let sizes = |k: &Personality| k.wave_sizes.iter().map(|w| w.armed).collect::<Vec<_>>();
+        let easy = resolve(p, level("easy"));
+        assert_eq!(sizes(&easy), [14, 14, 14, 14]);
+        assert_eq!(easy.max_wave_units, 14);
+        assert_eq!(easy.wave_interval_ds, 2700);
+        assert_eq!(easy.wave_requires_age.as_deref(), Some("masonry"));
+        assert_eq!(easy.all_in_after_ds, 19800);
+        let hard = resolve(p, level("hard"));
+        assert_eq!(sizes(&hard), sizes(p));
+        assert_eq!(hard.wave_interval_ds, 1440);
+        assert_eq!(hard.wave_requires_age, None);
+        assert_eq!(hard.all_in_after_ds, p.all_in_after_ds);
+        // Rounding: sizes up, at least 1, under the cap; the interval to
+        // nearest, half up (the level's all-in and pressure off, so nothing
+        // else moves).
+        let mut d = level("standard").clone();
+        d.all_in_after_ds = None;
+        d.pressure = Pressure::OFF;
+        d.wave_size_permille = 250;
+        d.wave_interval_permille = 333;
+        d.max_wave_units = Some(3);
+        let mut q = p.clone();
+        q.wave_sizes[0].armed = 1;
+        q.wave_interval_ds = 1500;
+        q.min_siege = 5;
+        let r = resolve(&q, &d);
+        assert_eq!(
+            sizes(&r),
+            [1, 3, 3, 3],
+            "1 -> 1, 12 -> 3, 16 -> 4 capped, 24 -> 6 capped"
+        );
+        assert_eq!(r.wave_interval_ds, 500, "1500 x 333 / 1000 = 499.5 -> 500");
+        assert_eq!((r.max_wave_units, r.min_siege), (3, 3));
+        // M6: the raid sizes are capped too.
+        assert_eq!((r.raid_min_armed, r.raid_max_armed), (3, 3));
+        // Nothing else moves.
+        let mut same = r.clone();
+        same.wave_sizes = q.wave_sizes.clone();
+        same.wave_interval_ds = q.wave_interval_ds;
+        same.max_wave_units = q.max_wave_units;
+        same.min_siege = q.min_siege;
+        same.raid_min_armed = q.raid_min_armed;
+        same.raid_max_armed = q.raid_max_armed;
+        assert_eq!(same, q);
+    }
+
+    /// M6: a disclosed Yeomen handicap (M6 owner decision 2's fallback,
+    /// `worker_target_permille` 850) scales every `Workers` count of the
+    /// shipped Standard build order, rounded up (15% fewer Yeomen), and
+    /// leaves the splits and every other step alone; at 1000 (every shipped
+    /// level since the M6 retune: line 2 passes without the fallback) the
+    /// order's steps are unchanged, and a count never drops below 1.
+    #[test]
+    fn resolve_order_scales_worker_counts_by_the_easy_handicap() {
+        let rules = Rules::load(data_dir()).unwrap();
+        let order = rules.ai.build_order("standard").unwrap();
+        let level = |id: &str| rules.ai.difficulty(id).unwrap();
+        let counts = |o: &BuildOrder| {
+            o.steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Workers { count, .. } => Some(*count),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(counts(order), [7, 9, 11, 14, 17, 20, 23]);
+        let mut handicap = level("easy").clone();
+        handicap.worker_target_permille = 850;
+        handicap.extra_research.clear();
+        let easy = resolve_order(order, &handicap);
+        assert_eq!(counts(&easy), [6, 8, 10, 12, 15, 17, 20]);
+        assert_eq!(easy.id, order.id);
+        assert_eq!(easy.steps.len(), order.steps.len());
+        for (got, was) in easy.steps.iter().zip(&order.steps) {
+            match (got, was) {
+                (Step::Workers { split: a, .. }, Step::Workers { split: b, .. }) => {
+                    assert_eq!(a, b, "the split weights stay");
+                }
+                _ => assert_eq!(got, was, "a non-Workers step stays"),
+            }
+        }
+        for id in ["standard", "hard"] {
+            assert_eq!(level(id).worker_target_permille, 1000, "{id}");
+            assert_eq!(&resolve_order(order, level(id)), order, "{id}");
+        }
+        // Shipped Easy: no Yeomen handicap; its Statecraft II is appended.
+        assert_eq!(level("easy").worker_target_permille, 1000);
+        let shipped_easy = resolve_order(order, level("easy"));
+        assert_eq!(counts(&shipped_easy), counts(order));
+        assert_eq!(&shipped_easy.steps[..order.steps.len()], &order.steps[..]);
+        let one = BuildOrder {
+            id: "one".into(),
+            steps: vec![Step::Workers {
+                count: 1,
+                split: BTreeMap::from([("grain".to_string(), 1)]),
+            }],
+        };
+        let mut floor = level("easy").clone();
+        floor.worker_target_permille = MIN_WORKER_TARGET_PERMILLE;
+        assert_eq!(counts(&resolve_order(&one, &floor)), [1]);
+    }
+
+    /// M6 owner decision 12: a level's pressure scales the personality's
+    /// retreat ratio and cooldown (rounded to nearest, half up; 0 never
+    /// retreats) and touches no other knob.
+    #[test]
+    fn pressure_scales_the_retreat_knobs_only() {
+        let rules = Rules::load(data_dir()).unwrap();
+        let p = rules.ai.personality("standard").unwrap();
+        let mut d = rules.ai.difficulty("standard").unwrap().clone();
+        d.wave_age_gate = WaveAgeGate::Personality;
+        d.largest_wave_only = false;
+        d.max_wave_units = None;
+        d.wave_size_permille = 1000;
+        d.wave_interval_permille = 1000;
+        d.all_in_after_ds = None;
+        d.pressure = Pressure::OFF;
+        assert_eq!(&resolve(p, &d), p, "no pressure: the personality itself");
+        d.pressure.retreat_ratio_permille = 500;
+        d.pressure.retreat_cooldown_permille = 333;
+        let r = resolve(p, &d);
+        assert_eq!(
+            r.retreat_ratio_permille,
+            (p.retreat_ratio_permille * 500 + 500) / 1000
+        );
+        assert_eq!(
+            r.retreat_cooldown_ds,
+            (p.retreat_cooldown_ds * 333 + 500) / 1000
+        );
+        let mut same = r.clone();
+        same.retreat_ratio_permille = p.retreat_ratio_permille;
+        same.retreat_cooldown_ds = p.retreat_cooldown_ds;
+        assert_eq!(&same, p, "nothing else moves");
+        d.pressure.retreat_ratio_permille = 0;
+        assert_eq!(resolve(p, &d).retreat_ratio_permille, 0, "never retreats");
+    }
+
+    /// M6 owner decision 12 (mirrored sites must not make cap games exact
+    /// copies): the research a level or a build order adds is what keeps
+    /// two seats from building mirror images, so it is pinned here. Easy's
+    /// resolved `standard` order differs from Standard's and Hard's (its
+    /// Statecraft II), and the `tower` order researches Statecraft II
+    /// itself (as `boom` does); Standard and Hard resolve the `standard`
+    /// order identically,
+    /// the known limit (an untouched Standard-vs-Hard or Standard mirror cap
+    /// game is still decided by site noise; docs/design/ai.md, "Difficulty
+    /// table (as retuned)").
+    #[test]
+    fn the_research_that_breaks_mirrored_cap_games_is_pinned() {
+        let rules = Rules::load(data_dir()).unwrap();
+        let order = rules.ai.build_order("standard").unwrap();
+        let resolved = |id: &str| resolve_order(order, rules.ai.difficulty(id).unwrap());
+        let statecraft_2 = |o: &BuildOrder| {
+            o.steps
+                .iter()
+                .any(|s| matches!(s, Step::Research { tech, .. } if tech == "statecraft_2"))
+        };
+        let (easy, standard, hard) = (resolved("easy"), resolved("standard"), resolved("hard"));
+        assert!(statecraft_2(&easy), "Easy researches Statecraft II");
+        assert!(!statecraft_2(&standard) && !statecraft_2(&hard));
+        assert_ne!(easy, standard, "Easy vs Standard");
+        assert_ne!(easy, hard, "Hard vs Easy (the flip)");
+        assert_eq!(
+            standard, hard,
+            "Standard vs Hard: the same order (the known limit)"
+        );
+        // Since the retune `tower` researches Statecraft II too (boom has
+        // since slice 2), so a tower seat's untouched cap game is not a
+        // mirror of a rush or Balanced seat's.
+        let has = |id: &str| statecraft_2(rules.ai.build_order(id).unwrap());
+        assert!(has("tower"), "tower researches Statecraft II");
+        assert!(has("boom"));
+        assert!(!has("standard") && !has("rush"));
+    }
+
+    /// M6 owner decision 12: `extra_research` appends one optional
+    /// `Research` step per tech the build order does not research yet, in
+    /// the level's order, and leaves every other step alone.
+    #[test]
+    fn extra_research_appends_optional_steps_once() {
+        let rules = Rules::load(data_dir()).unwrap();
+        let order = rules.ai.build_order("standard").unwrap();
+        let mut d = rules.ai.difficulty("standard").unwrap().clone();
+        d.worker_target_permille = 1000;
+        d.extra_research = Vec::new();
+        assert_eq!(&resolve_order(order, &d), order);
+        d.extra_research = vec!["statecraft_2".into(), "arms_1".into(), "letters_2".into()];
+        let o = resolve_order(order, &d);
+        let n = order.steps.len();
+        assert_eq!(o.steps[..n], order.steps[..], "the order itself stays");
+        assert_eq!(
+            o.steps[n..],
+            [
+                Step::Research {
+                    tech: "statecraft_2".into(),
+                    optional: true
+                },
+                Step::Research {
+                    tech: "letters_2".into(),
+                    optional: true
+                },
+            ],
+            "arms_1 is researched already"
+        );
+    }
+
+    /// M6: `passive` is reserved for the bot that never acts, a `standard`
+    /// level must exist, and non-`.ron` files under `ai/difficulty/` are
+    /// ignored.
+    #[test]
+    fn difficulty_files_reserve_passive_and_require_standard() {
+        let dir = std::env::temp_dir().join(format!(
+            "eonmark-ai-rules-difficulty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy_dir(&data_dir(), &dir);
+        let levels = dir.join("ai").join("difficulty");
+        std::fs::write(levels.join("NOTES.md"), "not a level").unwrap();
+        assert_eq!(Rules::load(&dir).unwrap().ai.difficulties.len(), 3);
+        let hard = std::fs::read_to_string(levels.join("hard.ron")).unwrap();
+        std::fs::write(
+            levels.join("passive.ron"),
+            hard.replacen("id: \"hard\"", "id: \"passive\"", 1),
+        )
+        .unwrap();
+        let err = Rules::load(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("passive.ron") && err.contains("reserved"),
+            "{err}"
+        );
+        std::fs::remove_file(levels.join("passive.ron")).unwrap();
+        std::fs::remove_file(levels.join("standard.ron")).unwrap();
+        let err = Rules::load(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("standard.ron") && err.contains("no \"standard\" difficulty"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&levels).unwrap();
+        let err = Rules::load(&dir).unwrap_err().to_string();
+        assert!(err.contains("difficulty"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Non-`.ron` files under `ai/build_orders/` are ignored, and a second
@@ -1019,7 +2259,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["standard", "tiny"]
+            ["boom", "rush", "standard", "tiny", "tower"]
         );
         std::fs::write(orders.join("empty.ron"), "(id: \"empty\", steps: [])").unwrap();
         let err = Rules::load(&dir).unwrap_err().to_string();
@@ -1115,7 +2355,7 @@ mod tests {
             (
                 "age",
                 &[(BO, "Advance(age: \"masonry\")", "Advance(age: \"bronze\")")],
-                &["steps[18].age", "age id"],
+                &["steps[19].age", "age id"],
             ),
             (
                 "wait",
@@ -1175,12 +2415,12 @@ mod tests {
                     (BO, "Advance(age: \"masonry\"),", "Wait(until_ds: 0),"),
                     (BO, "Advance(age: \"charter\"),", "Wait(until_ds: 0),"),
                 ],
-                &["steps[19].kind", "\"engine_yard\"", "masonry", "optional"],
+                &["steps[21].kind", "\"engine_yard\"", "masonry", "optional"],
             ),
             (
                 "advance-techs",
                 &[(BO, "Research(tech: \"trade_1\"),", "Wait(until_ds: 0),")],
-                &["steps[18].age", "needs 2 techs", "research 1"],
+                &["steps[19].age", "needs 2 techs", "research 1"],
             ),
             (
                 "trainer",
@@ -1214,7 +2454,7 @@ mod tests {
                     "Research(tech: \"letters_1\")",
                     "Research(tech: \"letters_2\")",
                 )],
-                &["steps[27].tech", "needs \"letters_1\" first"],
+                &["steps[29].tech", "needs \"letters_1\" first"],
             ),
             (
                 "per-town",
@@ -1223,12 +2463,12 @@ mod tests {
                     "Build(kind: \"croft\", count: 8, at: NearTown, optional: true)",
                     "Build(kind: \"croft\", count: 8, at: NearTown)",
                 )],
-                &["steps[25].count", "max_per_town"],
+                &["steps[27].count", "max_per_town"],
             ),
             (
                 "ages-go-up",
                 &[(BO, "Advance(age: \"charter\")", "Advance(age: \"masonry\")")],
-                &["steps[30].age", "must go up"],
+                &["steps[32].age", "must go up"],
             ),
             // Personalities.
             (
@@ -1238,8 +2478,8 @@ mod tests {
             ),
             (
                 "p-build-order",
-                &[(PE, "build_order: \"standard\"", "build_order: \"rush\"")],
-                &["personalities[0].build_order", "\"rush\""],
+                &[(PE, "build_order: \"standard\"", "build_order: \"zerg\"")],
+                &["personalities[0].build_order", "\"zerg\""],
             ),
             (
                 "p-cadence",
@@ -1466,6 +2706,373 @@ mod tests {
                 "p-recall",
                 &[(PE, "recall_wave: WhileStaging", "recall_wave: Sometimes")],
                 &["personalities.ron", "Sometimes"],
+            ),
+            // M6: the knobs of slice 2.
+            (
+                "p-tech",
+                &[(
+                    PE,
+                    "wave_requires_tech: None,",
+                    "wave_requires_tech: Some(\"arms_9\"),",
+                )],
+                &["personalities[0].wave_requires_tech", "tech id"],
+            ),
+            (
+                "p-raid-min",
+                &[(PE, "raid_min_armed: 6,", "raid_min_armed: 0,")],
+                &["personalities[0].raid_min_armed", "1..=64"],
+            ),
+            (
+                "p-raid-max",
+                &[(PE, "raid_max_armed: 10,", "raid_max_armed: 5,")],
+                &["personalities[0].raid_max_armed", "6..=64"],
+            ),
+            (
+                "p-raid-every",
+                &[(PE, "raid_every_ds: 1200,", "raid_every_ds: 0,")],
+                &["personalities[0].raid_every_ds", "1..=72000"],
+            ),
+            (
+                "p-raid-tiles",
+                &[(PE, "raid_idle_tiles: 10,", "raid_idle_tiles: 65,")],
+                &["personalities[0].raid_idle_tiles", "1..=64"],
+            ),
+            (
+                "p-raid-weight",
+                &[(PE, "raid_worker_weight: 100,", "raid_worker_weight: 1001,")],
+                &["personalities[0].raid_worker_weight", "0..=1000"],
+            ),
+            (
+                "p-retreat-ratio",
+                &[(
+                    PE,
+                    "retreat_ratio_permille: 650,",
+                    "retreat_ratio_permille: 10001,",
+                )],
+                &["personalities[0].retreat_ratio_permille", "0..=10000"],
+            ),
+            (
+                "p-retreat-loss",
+                &[(
+                    PE,
+                    "retreat_loss_permille: 300,",
+                    "retreat_loss_permille: 1001,",
+                )],
+                &["personalities[0].retreat_loss_permille", "0..=1000"],
+            ),
+            (
+                "p-cell",
+                &[(PE, "influence_cell_tiles: 4,", "influence_cell_tiles: 0,")],
+                &["personalities[0].influence_cell_tiles", "1..=16"],
+            ),
+            (
+                "p-cells",
+                &[(
+                    PE,
+                    "influence_radius_cells: 1,",
+                    "influence_radius_cells: 9,",
+                )],
+                &["personalities[0].influence_radius_cells", "0..=8"],
+            ),
+            (
+                "p-counter-floor",
+                &[(
+                    PE,
+                    "counter_floor_permille: 250,",
+                    "counter_floor_permille: 1001,",
+                )],
+                &["personalities[0].counter_floor_permille", "0..=1000"],
+            ),
+            (
+                "p-counter-cap",
+                &[(
+                    PE,
+                    "counter_cap_permille: 4000,",
+                    "counter_cap_permille: 999,",
+                )],
+                &["personalities[0].counter_cap_permille", "1000..=8000"],
+            ),
+            (
+                "p-counter-join",
+                &[(
+                    PE,
+                    "counter_join_permille: 1500,",
+                    "counter_join_permille: 4001,",
+                )],
+                &["personalities[0].counter_join_permille", "1000..=4000"],
+            ),
+            (
+                "p-counter-kind",
+                &[(
+                    PE,
+                    "(kind: \"outrider\", weight: 2)",
+                    "(kind: \"supply_wain\", weight: 2)",
+                )],
+                &[
+                    "personalities[0].counter_kinds[0].kind",
+                    "armed, non-civilian",
+                ],
+            ),
+            (
+                "p-counter-weight",
+                &[(
+                    PE,
+                    "(kind: \"outrider\", weight: 2)",
+                    "(kind: \"outrider\", weight: 0)",
+                )],
+                &["personalities[0].counter_kinds[0].weight", "1..=1000"],
+            ),
+            (
+                "p-economy-tiles",
+                &[(PE, "defend_economy_tiles: 8,", "defend_economy_tiles: 0,")],
+                &["personalities[0].defend_economy_tiles", "1..=64"],
+            ),
+            (
+                "p-towers",
+                &[(PE, "reactive_towers: 0,", "reactive_towers: 65,")],
+                &["personalities[0].reactive_towers", "0..=64"],
+            ),
+            (
+                "p-noise",
+                &[(PE, "noise_mix_permille: 200,", "noise_mix_permille: 501,")],
+                &["personalities[0].noise_mix_permille", "0..=500"],
+            ),
+            (
+                "p-top-k",
+                &[(PE, "noise_site_top_k: 2,", "noise_site_top_k: 0,")],
+                &["personalities[0].noise_site_top_k", "1..=8"],
+            ),
+            (
+                "p-mode",
+                &[(PE, "wave_mode: Siege,", "wave_mode: Sometimes,")],
+                &["personalities.ron", "Sometimes"],
+            ),
+            (
+                "p-random-missing",
+                &[(PE, "      random: false,\n", "")],
+                &["personalities.ron", "random"],
+            ),
+            (
+                "d-workers",
+                &[(
+                    EASY,
+                    "worker_target_permille: ",
+                    "worker_target_permille: 1",
+                )],
+                &["easy.ron", "worker_target_permille", "500..=1000"],
+            ),
+            (
+                "d-research-id",
+                &[(EASY, "extra_research: [", "extra_research: [\"nope\", ")],
+                &["easy.ron", "extra_research[0]", "nope"],
+            ),
+            (
+                "d-research-twice",
+                &[(
+                    EASY,
+                    "extra_research: [",
+                    "extra_research: [\"arms_1\", \"arms_1\", ",
+                )],
+                &["easy.ron", "extra_research[1]", "twice"],
+            ),
+            // M6 owner decision 12: the pressure block's ranges (the
+            // trailing `//` comments out the shipped value).
+            (
+                "d-reinforce",
+                &[(EASY, "reinforce_min_units: ", "reinforce_min_units: 65, //")],
+                &["easy.ron", "pressure.reinforce_min_units", "0..=64"],
+            ),
+            (
+                "d-commit",
+                &[(EASY, "commit_ds: ", "commit_ds: 72001, //")],
+                &["easy.ron", "pressure.commit_ds", "0..=72000"],
+            ),
+            (
+                "d-retreat",
+                &[(
+                    HARD,
+                    "retreat_ratio_permille: ",
+                    "retreat_ratio_permille: 4001, //",
+                )],
+                &["hard.ron", "pressure.retreat_ratio_permille", "0..=4000"],
+            ),
+            (
+                "d-cooldown",
+                &[(
+                    HARD,
+                    "retreat_cooldown_permille: ",
+                    "retreat_cooldown_permille: 249, //",
+                )],
+                &[
+                    "hard.ron",
+                    "pressure.retreat_cooldown_permille",
+                    "250..=4000",
+                ],
+            ),
+            (
+                "d-guard",
+                &[(EASY, "home_guard_units: ", "home_guard_units: 65, //")],
+                &["easy.ron", "pressure.home_guard_units", "0..=64"],
+            ),
+            (
+                "d-lure",
+                &[(HARD, "lure_ds: ", "lure_ds: 72001, //")],
+                &["hard.ron", "pressure.lure_ds", "0..=72000"],
+            ),
+            (
+                "d-cohesion",
+                &[(HARD, "cohesion_tiles: ", "cohesion_tiles: 65, //")],
+                &["hard.ron", "pressure.cohesion_tiles", "0..=64"],
+            ),
+            (
+                "d-launch",
+                &[(
+                    HARD,
+                    "launch_ratio_permille: ",
+                    "launch_ratio_permille: 10001, //",
+                )],
+                &["hard.ron", "pressure.launch_ratio_permille", "0..=10000"],
+            ),
+            (
+                "d-assault",
+                &[(
+                    HARD,
+                    "assault_ratio_permille: ",
+                    "assault_ratio_permille: 10001, //",
+                )],
+                &["hard.ron", "pressure.assault_ratio_permille", "0..=10000"],
+            ),
+            // M6: a trainer of an armed kind before the first Advance.
+            (
+                "armed-trainer",
+                &[
+                    (
+                        BO,
+                        "Build(kind: \"muster_hall\", count: 1, at: NearTown)",
+                        "Build(kind: \"muster_hall\", count: 1, at: NearTown, optional: true)",
+                    ),
+                    (
+                        BO,
+                        "Build(kind: \"muster_hall\", count: 2, at: NearTown)",
+                        "Build(kind: \"muster_hall\", count: 2, at: NearTown, optional: true)",
+                    ),
+                ],
+                &["standard.ron", "steps[19].age", "trainer of an armed kind"],
+            ),
+            // M6: difficulty levels.
+            (
+                "d-id",
+                &[(HARD, "id: \"hard\"", "id: \"harder\"")],
+                &["hard.ron", "id", "file stem"],
+            ),
+            (
+                "d-name",
+                &[(HARD, "name: \"Hard\"", "name: \"\"")],
+                &["hard.ron", "name", "empty"],
+            ),
+            (
+                "d-income-id",
+                &[(HARD, "\"ore\": 10", "\"iron\": 10")],
+                &["hard.ron", "income.iron", "resource id"],
+            ),
+            (
+                "d-income-max",
+                &[(HARD, "\"grain\": 20", "\"grain\": 501")],
+                &["hard.ron", "income.grain", "0..=500"],
+            ),
+            (
+                "d-interval-short",
+                &[(HARD, "income_interval_ds: 200,", "income_interval_ds: 49,")],
+                &["hard.ron", "income_interval_ds", "50..=72000"],
+            ),
+            (
+                "d-interval-long",
+                &[(
+                    HARD,
+                    "income_interval_ds: 200,",
+                    "income_interval_ds: 72001,",
+                )],
+                &["hard.ron", "income_interval_ds", "50..=72000"],
+            ),
+            (
+                "d-from",
+                &[(HARD, "income_from_ds: 1800,", "income_from_ds: 27000,")],
+                &["hard.ron", "income_from_ds", "match_cap_ds"],
+            ),
+            (
+                "d-size-permille",
+                &[(
+                    HARD,
+                    "wave_size_permille: 1000,",
+                    "wave_size_permille: 249,",
+                )],
+                &["hard.ron", "wave_size_permille", "250..=4000"],
+            ),
+            (
+                "d-interval-permille",
+                &[(
+                    HARD,
+                    "wave_interval_permille: 800,",
+                    "wave_interval_permille: 4001,",
+                )],
+                &["hard.ron", "wave_interval_permille", "250..=4000"],
+            ),
+            (
+                "d-max-units",
+                &[(
+                    EASY,
+                    "max_wave_units: Some(14),",
+                    "max_wave_units: Some(65),",
+                )],
+                &["easy.ron", "max_wave_units", "1..=64"],
+            ),
+            (
+                "d-all-in",
+                &[(
+                    EASY,
+                    "all_in_after_ds: Some(19800),",
+                    "all_in_after_ds: Some(72001),",
+                )],
+                &["easy.ron", "all_in_after_ds", "0..=72000"],
+            ),
+            (
+                "d-age",
+                &[(EASY, "Age(\"masonry\")", "Age(\"bronze\")")],
+                &["easy.ron", "wave_age_gate", "age id"],
+            ),
+            (
+                "d-gate",
+                &[(HARD, "wave_age_gate: Off,", "wave_age_gate: Never,")],
+                &["hard.ron", "Never"],
+            ),
+            (
+                "d-raid-min",
+                &[(HARD, "min_armed: 6,", "min_armed: 0,")],
+                &["hard.ron", "first_raid.min_armed", "1..=64"],
+            ),
+            (
+                "d-raid-max",
+                &[(HARD, "max_armed: 10)", "max_armed: 5)")],
+                &["hard.ron", "first_raid.max_armed", "6..=64"],
+            ),
+            (
+                "d-raid-by",
+                &[(HARD, "by_ds: 6000,", "by_ds: 27000,")],
+                &["hard.ron", "first_raid.by_ds", "match_cap_ds"],
+            ),
+            (
+                "d-raid-prep",
+                &[(HARD, "prep_ds: 1500,", "prep_ds: 6000,")],
+                &["hard.ron", "first_raid.prep_ds", "less than by_ds"],
+            ),
+            (
+                "d-unknown-field",
+                &[(
+                    HARD,
+                    "largest_wave_only: false,",
+                    "largest_wave_only: false, cheat: true,",
+                )],
+                &["hard.ron", "cheat"],
             ),
         ];
         for (name, edits, words) in cases {

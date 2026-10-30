@@ -19,11 +19,15 @@
     Build(kind: "muster_hall", count: 1, at: NearTown),
     Military,                                   // production starts; latched
     Research(tech: "arms_1"),                   // age tech 1; pop 25 -> 50
+    // M6: a second Muster Hall now and a third after Masonry, so income
+    // (the level's bonus included) becomes army instead of a stockpile.
+    Build(kind: "muster_hall", count: 2, at: NearTown),
     Build(kind: "croft", count: 5, at: NearTown),
     Workers(count: 14, split: {"grain": 5, "lumber": 6, "ore": 3}),
     Research(tech: "trade_1"),                  // age tech 2; Yield Cap up
     Build(kind: "watchtower", count: 1, at: BorderEdge, optional: true),
     Advance(age: "masonry"),
+    Build(kind: "muster_hall", count: 3, at: NearTown),
     Build(kind: "engine_yard", count: 1, at: NearTown),
     Train(kind: "mangonel", count: 1),          // the first wave's siege, saved up for
     Build(kind: "scriptorium", count: 2, at: NearTown), // Lore for the Charter techs
@@ -37,11 +41,10 @@
     Research(tech: "statecraft_1"),
     Advance(age: "charter"),                    // 6 counting techs before it
     Research(tech: "arms_3"),
-    // After the Charter: more Lumber and Ore, and a second Muster Hall, so
-    // the waves grow (pop 100 with Arms III).
+    // After the Charter: more Lumber and Ore, so the waves grow (pop 100
+    // with Arms III).
     Build(kind: "lumber_yard", count: 3, at: Terrain),
     Workers(count: 20, split: {"grain": 8, "lumber": 8, "ore": 4}),
-    Build(kind: "muster_hall", count: 2, at: NearTown),
     Build(kind: "ore_pit", count: 2, at: Terrain),
     Workers(count: 23, split: {"grain": 8, "lumber": 10, "ore": 5}),
   ],

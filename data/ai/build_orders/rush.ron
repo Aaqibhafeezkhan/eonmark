@@ -1,0 +1,46 @@
+// Rush (M6): a Muster Hall as the fourth step and army production from the
+// fifth, so Skirmisher and Bowman raids start around minute 5; Masonry
+// after Arms I and Trade I, then small siege waves. Schema:
+// crates/rules/src/ai.rs (deny_unknown_fields). Knobs: personalities.ron.
+(
+  id: "rush",
+  steps: [
+    Workers(count: 7, split: {"grain": 4, "lumber": 3}),
+    Build(kind: "croft", count: 2, at: NearTown),
+    Build(kind: "lumber_yard", count: 1, at: Terrain),
+    Build(kind: "muster_hall", count: 1, at: NearTown),
+    Military,                                   // production starts; latched
+    Workers(count: 9, split: {"grain": 5, "lumber": 4}),
+    Build(kind: "scriptorium", count: 1, at: NearTown),
+    Build(kind: "croft", count: 3, at: NearTown),
+    Train(kind: "scribe", count: 2),
+    Build(kind: "ore_pit", count: 1, at: Terrain),
+    Workers(count: 11, split: {"grain": 5, "lumber": 4, "ore": 2}),
+    Research(tech: "arms_1"),                   // age tech 1; pop 25 -> 50
+    Build(kind: "croft", count: 4, at: NearTown),
+    Build(kind: "lumber_yard", count: 2, at: Terrain),
+    Workers(count: 13, split: {"grain": 6, "lumber": 5, "ore": 2}),
+    Research(tech: "trade_1"),                  // age tech 2
+    Advance(age: "masonry"),
+    Build(kind: "engine_yard", count: 1, at: NearTown),
+    Train(kind: "mangonel", count: 1),
+    Build(kind: "town", count: 2, at: Expansion, optional: true),
+    Train(kind: "scribe", count: 3),
+    Research(tech: "arms_2"),
+    Build(kind: "croft", count: 5, at: NearTown),
+    Workers(count: 16, split: {"grain": 7, "lumber": 6, "ore": 3}),
+    Build(kind: "muster_hall", count: 2, at: NearTown),
+    Build(kind: "scriptorium", count: 2, at: NearTown),
+    Train(kind: "scribe", count: 6),
+    Research(tech: "trade_2"),
+    Research(tech: "letters_1"),
+    Research(tech: "statecraft_1"),
+    Advance(age: "charter"),                    // 6 counting techs before it
+    Research(tech: "arms_3"),
+    Build(kind: "croft", count: 8, at: NearTown, optional: true),  // needs the 2nd Town
+    Build(kind: "lumber_yard", count: 3, at: Terrain),
+    Workers(count: 20, split: {"grain": 8, "lumber": 8, "ore": 4}),
+    Build(kind: "ore_pit", count: 2, at: Terrain),
+    Workers(count: 23, split: {"grain": 8, "lumber": 10, "ore": 5}),
+  ],
+)

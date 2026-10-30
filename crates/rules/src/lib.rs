@@ -48,7 +48,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use ages::{Age, Ages, Unlocks};
-pub use ai::{AiRules, BuildOrder, MixEntry, Personality, Placement, RecallWave, Step, WaveSize};
+pub use ai::{
+    AiRules, BuildOrder, Difficulty, FirstRaid, MixEntry, Personality, Placement, Pressure,
+    RecallWave, Step, WainRule, WaveAgeGate, WaveMode, WaveSize,
+};
 pub use attack::{Attack, Prefer};
 pub use buildings::{BuildingKind, Buildings, GatherSpec, Slots};
 pub use factions::{Faction, Factions};
@@ -3377,14 +3380,11 @@ mod tests {
             msg.contains("rules/ages.ron: ages[2].techs_required: ") && msg.contains("unlock 8"),
             "{msg}"
         );
-        // The shipped build order researches 6 counting techs before its
-        // Charter Advance, so a 9-tech gate makes that Advance unreachable
-        // (M5b's build-order check); this copy ends the order before it.
-        let charter = (
-            "ai/build_orders/standard.ron",
-            "    Advance(age: \"charter\"),                    // 6 counting techs before it\n    Research(tech: \"arms_3\"),\n",
-            "",
-        );
+        // The shipped build orders research 6 or 7 counting techs before
+        // their Charter Advance, so a 9-tech gate makes that Advance
+        // unreachable (M5b's build-order check); these copies drop the
+        // Advance and the Charter-only steps right after it.
+        let charter = |order: &'static str, after: &'static str| (order, after, "");
         let r = loads_after_edits(
             "h-gate-9-counting",
             &[
@@ -3394,7 +3394,22 @@ mod tests {
                     "      counts_toward_age: false,",
                     "      counts_toward_age: true,",
                 ),
-                charter,
+                charter(
+                    "ai/build_orders/standard.ron",
+                    "    Advance(age: \"charter\"),                    // 6 counting techs before it\n    Research(tech: \"arms_3\"),\n",
+                ),
+                charter(
+                    "ai/build_orders/rush.ron",
+                    "    Advance(age: \"charter\"),                    // 6 counting techs before it\n    Research(tech: \"arms_3\"),\n",
+                ),
+                charter(
+                    "ai/build_orders/boom.ron",
+                    "    Advance(age: \"charter\"),\n    Research(tech: \"arms_3\"),\n",
+                ),
+                charter(
+                    "ai/build_orders/tower.ron",
+                    "    Advance(age: \"charter\"),                    // 6 counting techs before it\n    Research(tech: \"harrying_2\", optional: true),\n    Research(tech: \"arms_3\"),\n",
+                ),
             ],
         );
         assert_eq!(r.ages[2].techs_required, 9);

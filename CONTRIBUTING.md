@@ -118,7 +118,7 @@ $ git status --short
 
 Only `economy_second_town` changes its final hash: it is the only fixture with a worked Croft. A test that hard-codes a number the data controls fails this walkthrough; read the value from `Rules` instead.
 
-Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`), which is in `rules_hash` too, and since the art pass it ends with the `visuals.ron` counts and the number of glTF files its Scenes name (`visuals=units:8 buildings:8 terrain:<n> models=<n>`; each file must exist under `assets/`, `--no-assets` skips that check), so with the repository at `rules_version` 25 and the bump to 26 of step 2, step 3 now prints a line of the form `OK rules_version=26 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=1 build_orders=1 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:3 models=36` (before the bump it prints `rules_version=25`; `models` counts the distinct glTF files, 36 since art slice 4). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
+Since M4a's rules data (`rules_version` 13) the `OK` line also counts the ages, techs and factions, since M3b it names the checked UI strings, since M5a's rules data (`rules_version` 18) `techs` counts the techs that count toward an age and `side_techs` the Watchtower's Harrying I and II, and since M5b (`rules_version` 21) it counts the bot data under `data/ai/` (`personalities`, `build_orders`, and from M6 `difficulties`), which is in `rules_hash` too, and since the art pass it ends with the `visuals.ron` counts and the number of glTF files its Scenes name (`visuals=units:8 buildings:8 terrain:<n> models=<n>`; each file must exist under `assets/`, `--no-assets` skips that check), so with the repository at `rules_version` 30 and the bump to 31 of step 2, step 3 now prints a line of the form `OK rules_version=31 rules_hash=0x<16 hex> resources=4 units=8 buildings=8 ages=3 techs=12 side_techs=2 factions=1 personalities=4 build_orders=4 difficulties=3 maps=plains_1v1 strings=en visuals=units:8 buildings:8 terrain:3 models=36` (before the bump it prints `rules_version=30`; `models` counts the distinct glTF files, 36 since art slice 4). An edit under `data/ai/` takes the same path: bump `rules_version`, `just rerecord`, run the tests.
 
 ### A build order or personality (`data/ai/`)
 
@@ -163,6 +163,40 @@ check_first_wave: 5/5 rows pass (side a)
 ```
 
 `m5_first_match` moved (`0x3d2552033d51b4a2` at tick 26012 to `0x3de3fdc31c07b2ad` at tick 27636), as it must when the Standard bot's build order changes; `move_500` and `capture_seat` kept their hashes (`0x02e11c8e91350d52`, `0xbd9f9df3f98fcc23`), since no bot plays in them.
+
+### A difficulty (`data/ai/difficulty/`)
+
+A difficulty level (M6) is one file `data/ai/difficulty/<id>.ron` whose `id` is the file stem (`passive` is reserved, and `standard` must exist since every tool defaults to it). It holds the disclosed bonus the sim pays a bot seat at that level (the same bundle every `income_interval_ds` from `income_from_ds`; step 6d') the wave knobs `rules::ai::resolve` applies to the seat's personality, and (since the M6 retune) the siege `pressure` the bot reads and the `extra_research` appended to its build order; the field reference is [data/ai/README.md](data/ai/README.md). The id is what the replay header's `AiSeat.bot`, `play-bots --a/--b` and the game's `--difficulty` name. The path is the data-only one, with the difficulty checks of ROADMAP M6 lines 2 and 4 as the comparison:
+
+```bash
+# 1. Edit the level, for example Hard's interval in data/ai/difficulty/hard.ron
+#    (income_interval_ds: 200 -> 300), or copy a file to add a level.
+# 2. Bump rules_version in data/rules/rules.ron with its one-line reason.
+# 3. Validate (the bundle names resource ids, 0 to 500 each; the interval is 0
+#    or 50 to 72000 ds; a first_raid has min_armed <= max_armed and
+#    prep_ds < by_ds).
+cargo run -p sim-cli -- data-check data
+# 4. Re-record: a .hash changes only where a seated bot's level changed
+#    (today m5_first_match, two Standard seats at the standard level).
+just rerecord
+# 5. Run the bot's tests and the sim's.
+cargo test -p ai && cargo test -p sim
+# 6. Check the ordering (Standard beats Easy, Hard beats Standard) and the
+#    flip, and read each side's bonus_* and income_* columns: the bonus share
+#    is bonus_x / (bonus_x + income_x) (income_x excludes the bonus), pooled
+#    over the run, at most 200 per mille for Standard over the Standard
+#    mirror (the run the ceiling is defined on) and 300 for Hard against
+#    Standard; report the largest single seat too (M6 owner decision 14
+#    reads the ceiling pooled: docs/design/ai.md).
+cargo run -p sim-cli --release -- play-bots --a standard --b standard --seeds 1..20 --jobs 4 > s_s.csv
+cargo run -p sim-cli --release -- play-bots --a easy --b standard --seeds 1..20 --jobs 4 > e_s.csv
+scripts/check_ordering.sh e_s.csv b 15
+cargo run -p sim-cli --release -- play-bots --a standard --b hard --seeds 1..20 --jobs 4 > s_h.csv
+scripts/check_ordering.sh s_h.csv b 15
+scripts/check_difficulty_flip.sh
+```
+
+The bonus is disclosed, so a change to it also changes the New Game caption and the game-over line (`data/rules/strings/en.ron`, outside `rules_hash`). A change that needs a new field is a Rust change in `crates/rules/src/ai.rs`, and one that changes what the sim pays (step 6d') or how the bot reads a level is also a `SIM_VERSION` bump.
 
 ### Adding or swapping a model (`data/visuals.ron`, `assets/`)
 
@@ -222,7 +256,7 @@ The full rules and the reasoning are in [docs/DETERMINISM.md](docs/DETERMINISM.m
 2. No `f32`, `f64`, `HashMap`, `HashSet`, `Instant` or `SystemTime`, and no `rand::random` or `rand::thread_rng`, anywhere in `crates/sim`, `crates/rules` or `crates/ai`. Each crate has a `clippy.toml` that bans them, and CI runs clippy with `-D warnings`.
 3. No `bevy`, `glam`, `wgpu` or `winit` in `sim`, `rules`, `ai` or `sim-cli`. CI greps `cargo tree -p sim -e normal` for them.
 4. Ids are monotonic and never reused. Every sort uses a total order with an id tiebreak.
-5. All randomness comes from the one `Pcg32` inside `Sim`, which is part of the hash.
+5. All randomness the sim draws comes from the one `Pcg32` inside `Sim`, which is part of the hash. The bot's noise (M6) is `SimView::ai_noise`, a pure hash of the seed, the player and a salt, never a generator and never the `Pcg32`.
 6. No trigonometry. Units store direction vectors, and distances are compared squared through `dist_sq_i64`.
 7. Every gameplay number comes from `data/`.
 

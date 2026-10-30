@@ -1,0 +1,47 @@
+// Boom (M6): a second Town at once, Statecraft I and a third Town, Trade I
+// and Letters I, one early Muster Hall (production waits for the Masonry
+// Age unless the bot must defend), then Trade II and large siege waves.
+// Schema: crates/rules/src/ai.rs (deny_unknown_fields). Knobs:
+// personalities.ron.
+(
+  id: "boom",
+  steps: [
+    Workers(count: 7, split: {"grain": 3, "lumber": 4}),
+    Build(kind: "croft", count: 2, at: NearTown),
+    Build(kind: "lumber_yard", count: 1, at: Terrain),
+    Build(kind: "town", count: 2, at: Expansion, optional: true),   // second Town
+    Workers(count: 10, split: {"grain": 4, "lumber": 6}),
+    Build(kind: "scriptorium", count: 1, at: NearTown),
+    Train(kind: "scribe", count: 3),
+    Build(kind: "croft", count: 4, at: NearTown),
+    Build(kind: "lumber_yard", count: 2, at: Terrain),
+    Research(tech: "statecraft_1"),             // age tech 1; a third Town
+    Workers(count: 13, split: {"grain": 5, "lumber": 6, "ore": 2}),
+    Build(kind: "ore_pit", count: 1, at: Terrain),
+    Research(tech: "trade_1"),                  // age tech 2
+    Build(kind: "town", count: 3, at: Expansion, optional: true),   // third Town
+    Build(kind: "muster_hall", count: 1, at: NearTown),            // the early Muster Hall
+    Research(tech: "arms_1"),                   // pop 25 -> 50
+    Workers(count: 17, split: {"grain": 7, "lumber": 7, "ore": 3}),
+    Build(kind: "croft", count: 7, at: NearTown, optional: true),  // needs the 2nd Town
+    Research(tech: "letters_1"),
+    Advance(age: "masonry"),
+    Research(tech: "trade_2"),
+    Build(kind: "scriptorium", count: 2, at: NearTown),
+    Train(kind: "scribe", count: 6),
+    Build(kind: "engine_yard", count: 1, at: NearTown),
+    Military,                                   // production starts; latched
+    Train(kind: "mangonel", count: 2),
+    Build(kind: "muster_hall", count: 2, at: NearTown),
+    Research(tech: "arms_2"),
+    Workers(count: 21, split: {"grain": 9, "lumber": 8, "ore": 4}),
+    Build(kind: "lumber_yard", count: 3, at: Terrain),
+    Build(kind: "ore_pit", count: 2, at: Terrain),
+    Research(tech: "statecraft_2"),
+    Advance(age: "charter"),
+    Research(tech: "arms_3"),
+    Workers(count: 25, split: {"grain": 10, "lumber": 10, "ore": 5}),
+    Build(kind: "muster_hall", count: 3, at: NearTown),
+    Build(kind: "croft", count: 10, at: NearTown, optional: true),
+  ],
+)

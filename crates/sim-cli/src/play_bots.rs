@@ -7,8 +7,13 @@
 //! games go on), and is stepped by `ai::harness::BotMatch` until the match
 //! is decided or `--max-ticks`. The CSV holds no wall time, so two runs of
 //! the same seeds print the same bytes; timings go to stderr.
+//!
+//! M6: `--a`/`--b` take `passive` or any difficulty id; when both
+//! personality lists have more than one entry the games walk the ordered
+//! distinct pairs (`--mirrors` adds the same-id pairs), and `random`
+//! resolves per seed and seat ([`ai::resolve_personality`]).
 
-use ai::harness::{BotMatch, CSV_HEADER, GameRow, Winner, exit_code};
+use ai::harness::{BotMatch, CSV_HEADER, GameRow, Winner, exit_code, seats_of};
 use clap::Args;
 use rules::Rules;
 use sim::{AiController, AiMemory, Command, MatchSetup, Outcome, PlayerId, SimView};
@@ -69,19 +74,26 @@ pub struct PlayBotsArgs {
     /// Seeds to play: `A..B` (inclusive) or a single `N`.
     #[arg(long, value_parser = parse_seeds)]
     pub seeds: Seeds,
-    /// Bot of player A (`PlayerId(0)`): `passive` or `standard`.
+    /// Bot of player A (`PlayerId(0)`): `passive` or a difficulty id
+    /// (`easy`, `standard`, `hard`).
     #[arg(long, default_value = ai::BOT_STANDARD)]
     pub a: String,
-    /// Bot of player B (`PlayerId(1)`): `passive` or `standard`.
+    /// Bot of player B (`PlayerId(1)`), as for A.
     #[arg(long, default_value = ai::BOT_STANDARD)]
     pub b: String,
-    /// Personalities of A, comma-separated, cycled over the seeds in order
-    /// (default `standard`; none for `passive`).
+    /// Personalities of A, comma-separated (default `standard`; none for
+    /// `passive`; `random` draws per seed). A single list cycles over the
+    /// seeds; when both lists have several entries the games walk the
+    /// ordered distinct pairs.
     #[arg(long, value_delimiter = ',')]
     pub personality_a: Vec<String>,
     /// Personalities of B, as for A.
     #[arg(long, value_delimiter = ',')]
     pub personality_b: Vec<String>,
+    /// With two lists of several entries, also play the same-id pairs
+    /// (mirrors).
+    #[arg(long)]
+    pub mirrors: bool,
     /// Stop a game here if it is still undecided (default: the 45-minute
     /// cap, which decides every game; a game stopped earlier is `none`).
     #[arg(long)]
@@ -212,7 +224,10 @@ pub fn play_all(
                     let played =
                         catch_unwind(AssertUnwindSafe(|| play(setup, rules, max_ticks, factory)))
                             .unwrap_or_else(|payload| Played {
-                                row: GameRow::panicked(setup.seed),
+                                row: GameRow {
+                                    seats: seats_of(setup),
+                                    ..GameRow::panicked(setup.seed)
+                                },
                                 ticks: 0,
                                 wall_s: 0.0,
                                 step_ms_mean: 0.0,
@@ -283,21 +298,72 @@ fn personalities(side: &str, bot: &str, given: &[String]) -> Result<Vec<String>,
     Ok(given.to_vec())
 }
 
+/// The `(a, b)` personality pairs a run walks, repeated over the seeds in
+/// order (M6). When both lists have more than one entry: the ordered
+/// pairs with B outer and A inner, in list order, skipping same-id pairs
+/// unless `mirrors` (so `rush,boom,tower` on both sides walks (boom,rush),
+/// (tower,rush), (rush,boom), (tower,boom), (rush,tower), (boom,tower), and
+/// every pairing appears from both seats). `None` otherwise: each list
+/// then cycles on its own over the seeds, as in M5b ([`pair_at`]).
+pub fn pairs(pa: &[String], pb: &[String], mirrors: bool) -> Option<Vec<(String, String)>> {
+    if pa.len() < 2 || pb.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for b in pb {
+        for a in pa {
+            if mirrors || a != b {
+                out.push((a.clone(), b.clone()));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The personalities of game `i` (0-based, in seed order): the `i`-th of
+/// the walked pairs, or each list cycled on its own.
+fn pair_at(
+    i: usize,
+    pa: &[String],
+    pb: &[String],
+    walked: Option<&[(String, String)]>,
+) -> (String, String) {
+    match walked {
+        Some(walk) => walk[i % walk.len()].clone(),
+        None => (pa[i % pa.len()].clone(), pb[i % pb.len()].clone()),
+    }
+}
+
+/// `random` resolved for `player` at `seed` ([`ai::resolve_personality`]);
+/// any other id is itself.
+fn resolve(rules: &Rules, id: &str, seed: u64, player: PlayerId) -> Result<String, String> {
+    if id == ai::RANDOM_PERSONALITY {
+        return ai::resolve_personality(rules, seed, player);
+    }
+    Ok(id.to_string())
+}
+
 /// The setups of a run: `MatchSetup::bots` per seed, each side's
-/// personalities cycled over the seeds in order. Every setup's bots are
-/// built once here, so an unknown bot or personality is a usage error
-/// before any game runs.
+/// personality from [`pairs`] (or each list cycled), `random` resolved
+/// into the header. Every setup's bots are built once here, so an unknown
+/// bot or personality, or a `random` with no pool, is a usage error before
+/// any game runs.
 pub fn setups(args: &PlayBotsArgs, rules: &Rules) -> Result<Vec<MatchSetup>, String> {
     let pa = personalities("a", &args.a, &args.personality_a)?;
     let pb = personalities("b", &args.b, &args.personality_b)?;
+    let walked = pairs(&pa, &pb, args.mirrors);
+    if walked.as_ref().is_some_and(Vec::is_empty) {
+        return Err(
+            "--personality-a and --personality-b name no distinct pair; pass --mirrors to play mirrors"
+                .to_string(),
+        );
+    }
     let mut out = Vec::new();
     for (i, seed) in args.seeds.list().into_iter().enumerate() {
-        let setup = MatchSetup::bots(
-            rules,
-            seed,
-            (&args.a, &pa[i % pa.len()]),
-            (&args.b, &pb[i % pb.len()]),
-        );
+        let (a, b) = pair_at(i, &pa, &pb, walked.as_deref());
+        let a = resolve(rules, &a, seed, PlayerId(0))?;
+        let b = resolve(rules, &b, seed, PlayerId(1))?;
+        let setup = MatchSetup::bots(rules, seed, (&args.a, &a), (&args.b, &b));
         ai::controller_for(&setup, rules).map_err(|e| e.to_string())?;
         out.push(setup);
     }
@@ -375,8 +441,168 @@ mod tests {
     fn csv_header_is_exact() {
         assert_eq!(
             CSV_HEADER,
-            "seed,winner,outcome,tick,final_hash,age_reached_tick,first_attack_tick,reason,first_attack_units,first_attack_wains,second_town_tick,tower_tick,bo_done_tick_a,age_reached_tick_b,first_attack_tick_b,first_attack_units_b,first_attack_wains_b,territory_a,territory_b,units_lost_a,units_lost_b,min_enemy_town_hp_permille_a,min_enemy_town_hp_permille_b,rejected_a,rejected_b,second_town_tick_b,tower_tick_b,bo_done_tick_b"
+            "seed,winner,outcome,tick,final_hash,age_reached_tick,first_attack_tick,reason,first_attack_units,first_attack_wains,second_town_tick,tower_tick,bo_done_tick_a,age_reached_tick_b,first_attack_tick_b,first_attack_units_b,first_attack_wains_b,territory_a,territory_b,units_lost_a,units_lost_b,min_enemy_town_hp_permille_a,min_enemy_town_hp_permille_b,rejected_a,rejected_b,second_town_tick_b,tower_tick_b,bo_done_tick_b,bot_a,personality_a,bot_b,personality_b,waves_a,waves_b,raids_a,raids_b,retreats_a,retreats_b,wiped_a,wiped_b,towns_taken_a,towns_taken_b,bonus_a,bonus_b,income_a,income_b,cap_s_a,cap_s_b,first_contact_tick,max_quiet_ticks,first_on_land_tick_a,first_on_land_tick_b,min_own_town_hp_permille_a,min_own_town_hp_permille_b"
         );
+    }
+
+    fn list(ids: &str) -> Vec<String> {
+        ids.split(',').map(str::to_string).collect()
+    }
+
+    fn pair_list(p: &[(String, String)]) -> Vec<(&str, &str)> {
+        p.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+
+    /// M6: two lists of several entries walk the ordered distinct pairs, B
+    /// outer and A inner, so 20 seeds give the first two pairs 4 games and
+    /// the rest 3, and every pairing is played from both seats.
+    #[test]
+    fn distinct_pairs_walk_a_fastest_and_skip_mirrors() {
+        let three = list("rush,boom,tower");
+        let walk = pairs(&three, &three, false).unwrap();
+        assert_eq!(
+            pair_list(&walk),
+            [
+                ("boom", "rush"),
+                ("tower", "rush"),
+                ("rush", "boom"),
+                ("tower", "boom"),
+                ("rush", "tower"),
+                ("boom", "tower")
+            ]
+        );
+        let games: Vec<(String, String)> = (0..20)
+            .map(|i| pair_at(i, &three, &three, Some(&walk)))
+            .collect();
+        for (k, pair) in walk.iter().enumerate() {
+            let n = games.iter().filter(|g| *g == pair).count();
+            assert_eq!(n, if k < 2 { 4 } else { 3 }, "{pair:?}");
+            let swapped = (pair.1.clone(), pair.0.clone());
+            assert!(games.contains(&swapped), "{pair:?} from the other seat");
+        }
+        assert!(games.iter().all(|(a, b)| a != b), "no mirror");
+        // Through the flags: seeds 1..6 play the six pairs in order.
+        let rules = Rules::load(data()).unwrap();
+        let mut rules_three = rules.clone();
+        for id in ["rush", "boom", "tower"] {
+            let mut p = rules.ai.personality("standard").unwrap().clone();
+            p.id = id.to_string();
+            rules_three.ai.personalities.push(p);
+        }
+        let s = setups(
+            &args("--seeds 1..6 --personality-a rush,boom,tower --personality-b rush,boom,tower"),
+            &rules_three,
+        )
+        .unwrap();
+        let got: Vec<(&str, &str)> = s
+            .iter()
+            .map(|x| {
+                (
+                    x.ai_seats[0].personality.as_str(),
+                    x.ai_seats[1].personality.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(got, pair_list(&walk));
+        // Two lists naming one id only have no distinct pair.
+        let err = setups(
+            &args("--seeds 1 --personality-a standard,standard --personality-b standard,standard"),
+            &rules,
+        )
+        .unwrap_err();
+        assert!(err.contains("--mirrors"), "{err}");
+    }
+
+    /// M6: `--mirrors` walks all nine ordered pairs, A inner.
+    #[test]
+    fn mirrors_flag_walks_all_nine() {
+        let three = list("rush,boom,tower");
+        let walk = pairs(&three, &three, true).unwrap();
+        assert_eq!(walk.len(), 9);
+        assert_eq!(
+            pair_list(&walk[..4]),
+            [
+                ("rush", "rush"),
+                ("boom", "rush"),
+                ("tower", "rush"),
+                ("rush", "boom")
+            ]
+        );
+        assert!(args("--seeds 1 --mirrors").mirrors);
+        let rules = Rules::load(data()).unwrap();
+        let s = setups(
+            &args("--seeds 1..2 --personality-a standard,standard --personality-b standard,standard --mirrors"),
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(s.len(), 2);
+    }
+
+    /// M6: when either list has one entry the lists cycle on their own, as
+    /// in M5b, `--mirrors` or not.
+    #[test]
+    fn single_lists_cycle_as_before() {
+        let one = list("standard");
+        let two = list("x,y");
+        assert_eq!(pairs(&one, &two, false), None);
+        assert_eq!(pairs(&two, &one, true), None);
+        let games: Vec<(String, String)> = (0..4).map(|i| pair_at(i, &two, &one, None)).collect();
+        assert_eq!(
+            pair_list(&games),
+            [
+                ("x", "standard"),
+                ("y", "standard"),
+                ("x", "standard"),
+                ("y", "standard")
+            ]
+        );
+        let rules = Rules::load(data()).unwrap();
+        let s = setups(&args("--seeds 1..3 --a passive --b hard"), &rules).unwrap();
+        assert!(s.iter().all(|x| x.ai_seats[0].bot == "passive"
+            && x.ai_seats[0].personality.is_empty()
+            && x.ai_seats[1].bot == "hard"
+            && x.ai_seats[1].personality == "standard"));
+    }
+
+    /// M6: `random` resolves per seed and seat into the header; with no
+    /// personality in the pool it is a usage error.
+    #[test]
+    fn random_resolves_into_the_header_or_is_a_usage_error() {
+        let rules = Rules::load(data()).unwrap();
+        // The shipped pool (M6 slice 2): rush, boom and tower.
+        let s = setups(&args("--seeds 1..12 --personality-b random"), &rules).unwrap();
+        let shipped: Vec<&str> = s
+            .iter()
+            .map(|x| x.ai_seats[1].personality.as_str())
+            .collect();
+        for id in ["rush", "boom", "tower"] {
+            assert!(shipped.contains(&id), "{shipped:?}");
+        }
+        let mut empty = rules.clone();
+        for p in &mut empty.ai.personalities {
+            p.random = false;
+        }
+        let err = setups(&args("--seeds 1 --personality-b random"), &empty).unwrap_err();
+        assert!(err.contains("random: true"), "{err}");
+        let mut pooled = empty.clone();
+        for id in ["p", "q"] {
+            let mut p = rules.ai.personality("standard").unwrap().clone();
+            p.id = id.to_string();
+            p.random = true;
+            pooled.ai.personalities.push(p);
+        }
+        let s = setups(&args("--seeds 1..12 --personality-b random"), &pooled).unwrap();
+        let picks: Vec<&str> = s
+            .iter()
+            .map(|x| x.ai_seats[1].personality.as_str())
+            .collect();
+        assert!(picks.contains(&"p") && picks.contains(&"q"), "{picks:?}");
+        for (x, pick) in s.iter().zip(&picks) {
+            assert_eq!(
+                ai::resolve_personality(&pooled, x.seed, PlayerId(1)).unwrap(),
+                *pick
+            );
+        }
     }
 
     #[test]
@@ -413,8 +639,12 @@ mod tests {
     fn unknown_bots_and_personalities_are_usage_errors() {
         let rules = Rules::load(data()).unwrap();
         let err = |line: &str| setups(&args(line), &rules).unwrap_err();
-        assert!(err("--seeds 1 --a hard").contains("unknown bot \"hard\""));
-        assert!(err("--seeds 1 --personality-b rush").contains("no personality \"rush\""));
+        assert!(
+            err("--seeds 1 --a nightmare")
+                .contains("unknown bot \"nightmare\" (known: passive, easy, hard, standard)")
+        );
+        assert!(err("--seeds 1 --personality-b zerg").contains("no personality \"zerg\""));
+        assert!(err("--seeds 1 --b hard --personality-b zerg").contains("no personality \"zerg\""));
         assert!(err("--seeds 1 --a passive --personality-a standard").contains("takes none"));
         let ok = setups(
             &args("--seeds 1..4 --personality-a standard,standard"),

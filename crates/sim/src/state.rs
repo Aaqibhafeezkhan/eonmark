@@ -207,7 +207,22 @@ use std::collections::{BTreeMap, BTreeSet};
 /// memory and every other bot's is hidden; `Command::DebugAdvanceAge`.
 /// From 17 on, a `crates/ai` change that can alter a bot decision bumps
 /// this number (and, through the fixture policy, `rules_version`).
-pub const SIM_VERSION: u32 = 17;
+///
+/// 18: M6 difficulty levels (PR 1, slices 1 and 2). Step 6d' pays every
+/// bot seat whose `AiSeat.bot` names a difficulty level
+/// (`data/ai/difficulty/<id>.ron`) its disclosed bonus bundle every
+/// `income_interval_ds` from `income_from_ds`, clamped to the stockpile
+/// caps, with the appended `SimEvent::BonusIncome`; the schedule is
+/// derived from the header and the rules and rebuilt in `rebuild_derived`.
+/// `SimView::ai_noise` (a pure hash, never the `Pcg32`). In `crates/ai`
+/// the Standard bot plays the knobs `rules::ai::resolve` derives from its
+/// personality and difficulty; slice 2's bot behaviours and the M6 retune
+/// (`rules_version` 29 to 31: the difficulty files' `pressure` block and
+/// `extra_research`, the `Wave` target-hit-points memory in the hashed
+/// `BotMemory`, rally-group reinforcement, commit, the lure, cohesion and
+/// the launch and assault gates; since 30 every shipped level, `standard`
+/// included, moves the all-in time) ship under the same number.
+pub const SIM_VERSION: u32 = 18;
 
 /// Who drives a player slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -942,6 +957,15 @@ pub enum SimEvent {
         /// The result, as `Sim::result` returns it from now on.
         result: MatchResult,
     },
+    /// A bot seat received its difficulty's disclosed bonus bundle (step
+    /// 6d', M6).
+    BonusIncome {
+        /// The bot seat.
+        player: PlayerId,
+        /// What reached the stockpile per resource, `resources.ron` order
+        /// (the bundle, less any stockpile cap clamp).
+        amounts: Vec<i64>,
+    },
 }
 
 /// Per-subsystem hashes for localising a divergence. Field order is the
@@ -1078,6 +1102,9 @@ pub struct Sim {
     grid: SpatialGrid,
     /// Derived from the rules alone: built here and in `rebuild_derived`.
     combat_tables: combat::CombatTables,
+    /// The bonus schedule of the bot seats (M6): derived from the header
+    /// and the rules, built here and in `rebuild_derived`, unhashed.
+    bonus: Vec<economy::BonusSeat>,
     /// Whether the (derived) path cache is in use; survives restore.
     path_cache_enabled: bool,
     /// Not hashed; drained by the caller.
@@ -1156,6 +1183,7 @@ impl Sim {
         }
         let grid = SpatialGrid::new(&state.map);
         let combat_tables = combat::CombatTables::new(&rules);
+        let bonus = economy::bonus_table(&setup, &rules);
         Self {
             setup,
             rules,
@@ -1163,6 +1191,7 @@ impl Sim {
             state,
             grid,
             combat_tables,
+            bonus,
             path_cache_enabled: true,
             events: Vec::new(),
         }
@@ -1336,11 +1365,19 @@ impl Sim {
         let flips = annexation::step(&mut self.state, &self.rules, &mut self.events);
 
         // 6. Economy and Towns: construction, training, jobs and idle
-        //    seeking, income; then the match outcome.
+        //    seeking, income, the bot seats' disclosed bonus (6d', M6);
+        //    then the match outcome.
         construction::step(&mut self.state, &self.rules, tick, &mut self.events);
         training::step(&mut self.state, &self.rules, tick, &mut self.events);
         economy::jobs_step(&mut self.state, &self.rules, tick);
         economy::income_step(&mut self.state, &self.rules);
+        economy::bonus_step(
+            &mut self.state,
+            &self.rules,
+            &self.bonus,
+            tick,
+            &mut self.events,
+        );
         victory::step(&mut self.state, &self.rules, tick, &flips, &mut self.events);
 
         self.state.tick += 1;
@@ -1911,14 +1948,15 @@ impl Sim {
     }
 
     /// Rebuild every unhashed derived structure from `state` and the rules:
-    /// map components, spatial grid, the combat tables and the path cache
-    /// (empty, with its capacity and the sim's enabled flag re-applied since
-    /// `serde(skip)` reset it).
+    /// map components, spatial grid, the combat tables, the bonus schedule
+    /// (M6, from the header) and the path cache (empty, with its capacity
+    /// and the sim's enabled flag re-applied since `serde(skip)` reset it).
     fn rebuild_derived(&mut self) {
         self.state.map.rebuild_components();
         self.grid = SpatialGrid::new(&self.state.map);
         self.grid.rebuild(&self.state.units);
         self.combat_tables = combat::CombatTables::new(&self.rules);
+        self.bonus = economy::bonus_table(&self.setup, &self.rules);
         self.state.pathing.cache =
             crate::pathing::PathCache::new(self.rules.path_cache_entries, self.path_cache_enabled);
         self.events.clear();
@@ -2387,5 +2425,148 @@ mod tests {
         }
         assert_eq!(rejections(&mut sim), [(seq, RejectReason::FinalAge)]);
         assert_eq!(sim.view().age(PlayerId(0)), last);
+    }
+
+    /// M6 rules for the bonus tests: `hard` pays from tick 0 every 10
+    /// ticks (`income_from_ds` 0, `income_interval_ds` 5), in memory.
+    fn bonus_rules(lore: Option<u32>) -> Rules {
+        let mut r = Rules::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data")).unwrap();
+        let hard = r.ai.difficulties.get_mut("hard").unwrap();
+        hard.income_from_ds = 0;
+        hard.income_interval_ds = 5;
+        if let Some(lore) = lore {
+            hard.income.insert("lore".into(), lore);
+        }
+        assert_eq!(
+            r.ai.difficulty("hard").unwrap().income_interval_ticks(&r),
+            10
+        );
+        r
+    }
+
+    fn bonus_events(events: &[SimEvent]) -> Vec<(PlayerId, Vec<i64>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::BonusIncome { player, amounts } => Some((*player, amounts.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M6: only a seat whose `bot` names a paying difficulty receives the
+    /// bonus; a `passive` seat (and every human slot) gets nothing, and the
+    /// paid seat's stockpile is exactly the control's plus the bundles.
+    #[test]
+    fn bonus_pays_named_seats_only() {
+        let r = bonus_rules(None);
+        let bundle = r.ai.difficulty("hard").unwrap().bundle(&r);
+        let paid = MatchSetup::bots(&r, 1, ("hard", "standard"), ("passive", ""));
+        let control = MatchSetup::bots(&r, 1, ("passive", ""), ("passive", ""));
+        let mut a = Sim::new(paid, r.clone(), Box::new(NoAi));
+        let mut b = Sim::new(control, r.clone(), Box::new(NoAi));
+        assert_eq!(a.bonus.len(), 1);
+        assert!(b.bonus.is_empty());
+        let mut events = Vec::new();
+        for _ in 0..25 {
+            a.step(&[]);
+            b.step(&[]);
+            events.extend(a.drain_events());
+        }
+        let paid = bonus_events(&events);
+        assert_eq!(
+            paid,
+            [(PlayerId(0), bundle.clone()), (PlayerId(0), bundle.clone())],
+            "ticks 10 and 20"
+        );
+        let (sa, sb) = (
+            a.view().economy(PlayerId(0)).stock.clone(),
+            b.view().economy(PlayerId(0)).stock.clone(),
+        );
+        for ((x, y), g) in sa.iter().zip(&sb).zip(&bundle) {
+            assert_eq!(*x, y + 2 * g);
+        }
+        assert_eq!(a.view().economy(PlayerId(1)), b.view().economy(PlayerId(1)));
+        let vs_human = MatchSetup::vs_bot(&r, 1, "hard", "standard");
+        assert_eq!(
+            economy::bonus_table(&vs_human, &r).len(),
+            1,
+            "the bot slot only"
+        );
+        assert_eq!(economy::bonus_table(&vs_human, &r)[0].player, PlayerId(1));
+        let mut silent = r.clone();
+        silent
+            .ai
+            .difficulties
+            .get_mut("hard")
+            .unwrap()
+            .income_interval_ds = 0;
+        assert!(
+            economy::bonus_table(&vs_human, &silent).is_empty(),
+            "interval 0 pays nothing"
+        );
+    }
+
+    /// M6: a surrendered seat is skipped, and Lore is clamped at its
+    /// stockpile cap with `BonusIncome` reporting what was credited.
+    #[test]
+    fn bonus_skips_a_surrendered_seat_and_clamps_lore() {
+        let r = bonus_rules(Some(500));
+        let lore = r.resource_index("lore").unwrap();
+        let cap = i64::from(r.resources.resources[lore].stockpile_cap.unwrap());
+        let setup = MatchSetup::bots(&r, 2, ("hard", "standard"), ("hard", "standard"));
+        let mut sim = Sim::new(setup, r, Box::new(NoAi));
+        let lore_at_start = sim.view().economy(PlayerId(0)).stock[lore];
+        sim.step(&[PlayerCommand::new(PlayerId(1), 0, Command::Surrender)]);
+        let mut events = sim.drain_events();
+        for _ in 1..25 {
+            sim.step(&[]);
+            events.extend(sim.drain_events());
+        }
+        assert!(sim.view().player(PlayerId(1)).unwrap().surrendered);
+        let paid = bonus_events(&events);
+        assert!(paid.iter().all(|(p, _)| *p == PlayerId(0)), "{paid:?}");
+        assert_eq!(paid.len(), 2);
+        assert_eq!(paid[0].1[lore], 500.min(cap - lore_at_start));
+        assert!(paid[1].1[lore] < 500, "the second bundle is clamped");
+        assert_eq!(sim.view().economy(PlayerId(0)).stock[lore], cap);
+        let credited: i64 = paid.iter().map(|(_, a)| a[lore]).sum();
+        assert!(credited <= cap - lore_at_start);
+    }
+
+    /// M6: the schedule comes from the header, so a sim restored mid
+    /// interval pays on the same ticks as the uninterrupted run.
+    #[test]
+    fn bonus_schedule_survives_restore_mid_interval() {
+        let r = bonus_rules(None);
+        let setup = MatchSetup::bots(&r, 3, ("hard", "standard"), ("easy", "standard"));
+        let mut a = Sim::new(setup.clone(), r.clone(), Box::new(NoAi));
+        for _ in 0..15 {
+            a.step(&[]);
+        }
+        a.drain_events();
+        let snap = a.snapshot();
+        let mut b = Sim::new(setup, r, Box::new(NoAi));
+        b.restore(&snap).unwrap();
+        assert_eq!(a.bonus, b.bonus);
+        let (mut ea, mut eb) = (Vec::new(), Vec::new());
+        for _ in 15..40 {
+            a.step(&[]);
+            b.step(&[]);
+            assert_eq!(a.hash(), b.hash());
+            ea.extend(a.drain_events());
+            eb.extend(b.drain_events());
+        }
+        let pa = bonus_events(&ea);
+        assert_eq!(pa, bonus_events(&eb));
+        assert_eq!(
+            pa.iter().filter(|(p, _)| *p == PlayerId(0)).count(),
+            3,
+            "hard at ticks 20, 30 and 40"
+        );
+        assert!(
+            pa.iter().all(|(p, _)| *p == PlayerId(0)),
+            "easy (every 600 ticks from 3600) pays nothing yet"
+        );
     }
 }

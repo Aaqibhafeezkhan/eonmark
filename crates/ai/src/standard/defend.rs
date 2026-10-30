@@ -32,7 +32,7 @@
 
 use super::army::home_armed;
 use super::ctx::{Ctx, on_station};
-use super::facts::{kind_centre, tiles_sq};
+use super::facts::{kind_centre, tiles_sq, visible_enemies};
 use super::memory::{BotMemory, Defend, WavePhase};
 use super::waves::launch_due;
 use rules::{RecallWave, UnitClass};
@@ -49,32 +49,58 @@ pub const SIEGE_GUARDS: usize = 4;
 /// non-civilian unit in the radius counts, own land or not.
 pub fn threats(ctx: &Ctx<'_>) -> Vec<(BuildingId, Vec<UnitId>, u32)> {
     let rules = ctx.view.rules();
+    let view = ctx.view;
     let r2 = tiles_sq(ctx.knobs.defend_radius_tiles);
     let military = |u: &sim::Unit| {
         rules
             .unit_kind(u.kind.0)
             .is_some_and(|k| k.class != UnitClass::Civilian)
     };
+    // M6: with `defend_economy`, the centres of own worked gathering
+    // buildings, by the Town they are attributed to.
+    let e2 = tiles_sq(ctx.knobs.defend_economy_tiles);
+    let mut worked: BTreeMap<BuildingId, Vec<FxVec2>> = BTreeMap::new();
+    if ctx.knobs.defend_economy {
+        for node in ctx.facts.nodes.iter().flatten().filter(|n| n.taken > 0) {
+            if let Some(t) = view.building(node.id).and_then(|b| b.town) {
+                worked.entry(t).or_default().push(node.centre);
+            }
+        }
+    }
     ctx.facts
         .towns
         .iter()
         .filter_map(|t| {
-            let b = ctx.view.building(*t)?;
+            let b = view.building(*t)?;
             let c = kind_centre(rules, b.kind, b.tile);
+            let nodes = worked.get(t).map_or(&[][..], Vec::as_slice);
+            let near_node = |u: &sim::Unit| nodes.iter().any(|n| u.pos.dist_sq_i64(*n) <= e2);
             let near = |u: &&sim::Unit| u.pos.dist_sq_i64(c) <= r2;
             let units: Vec<&sim::Unit> = if ctx.facts.contested.contains(t) {
-                ctx.view
-                    .units()
-                    .filter(|u| u.owner != ctx.me && military(u))
-                    .filter(near)
+                visible_enemies(&view, ctx.me)
+                    .filter(|u| military(u))
+                    .filter(|u| near(u) || near_node(u))
                     .collect()
             } else {
-                ctx.facts
+                let mut on_land: Vec<&sim::Unit> = ctx
+                    .facts
                     .threats
                     .iter()
-                    .filter_map(|id| ctx.view.unit(*id))
+                    .filter_map(|id| view.unit(*id))
                     .filter(near)
-                    .collect()
+                    .collect();
+                if !nodes.is_empty() {
+                    // Raiders at a worked building count, own land or not.
+                    on_land.extend(
+                        visible_enemies(&view, ctx.me)
+                            .filter(|u| military(u) && near_node(u))
+                            .filter(|u| {
+                                !(u.pos.dist_sq_i64(c) <= r2 && ctx.facts.threats.contains(&u.id))
+                            }),
+                    );
+                    on_land.sort_by_key(|u| u.id);
+                }
+                on_land
             };
             let pop = units.iter().fold(0u32, |p, u| {
                 p.saturating_add(rules.unit_kind(u.kind.0).map_or(1, |k| k.pop))
@@ -211,18 +237,25 @@ pub fn step(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
     let view = ctx.view;
     let pos = |id: UnitId| view.unit(id).map(|u| u.pos);
     // Siege first: each enemy siege unit gets its nearest free guards.
+    // M6: with `defend_wains_first`, enemy Supply Wains among the threats
+    // come before it, so the attacker's attrition cover goes first.
     let mut busy: BTreeSet<UnitId> = BTreeSet::new();
     let mut attacks: BTreeMap<UnitId, Vec<UnitId>> = BTreeMap::new();
-    for e in &enemies {
+    let kind_of = |e: UnitId| ctx.view.unit(e).and_then(|u| rules.unit_kind(u.kind.0));
+    let wains_first = ctx.knobs.defend_wains_first;
+    let mut marked: Vec<UnitId> = enemies
+        .iter()
+        .copied()
+        .filter(|e| wains_first && kind_of(*e).is_some_and(|k| k.supplies))
+        .collect();
+    marked.extend(
+        enemies
+            .iter()
+            .copied()
+            .filter(|e| kind_of(*e).is_some_and(|k| k.class == UnitClass::Siege)),
+    );
+    for e in &marked {
         let Some(ep) = pos(*e) else { continue };
-        let siege = ctx
-            .view
-            .unit(*e)
-            .and_then(|u| rules.unit_kind(u.kind.0))
-            .is_some_and(|k| k.class == UnitClass::Siege);
-        if !siege {
-            continue;
-        }
         let mut near: Vec<(i64, UnitId)> = guard
             .iter()
             .filter(|g| !busy.contains(g))
@@ -351,6 +384,9 @@ fn release(ctx: &mut Ctx<'_>, mem: &mut BotMemory) {
     }
     mem.defend = None;
     mem.defends = mem.defends.saturating_add(1);
+    if u32::from(mem.extra_towers) < ctx.knobs.reactive_towers {
+        mem.last_defended = Some(d.town);
+    }
     let rally = ctx.rally();
     let tol = ctx.knobs.goal_tolerance_tiles;
     let back: Vec<UnitId> = home_armed(ctx, mem)
@@ -499,6 +535,9 @@ mod tests {
                     last_threat: tick - 10,
                     since: tick - latch_age,
                 }),
+                // M6: past the first wave's noise wait (its own test is
+                // in waves.rs).
+                next_wave_at: 1,
                 ..BotMemory::default()
             };
             let mut ctx = a.ctx(P0);
@@ -644,6 +683,7 @@ mod tests {
     }
 
     fn wave(units: Vec<UnitId>, target: BuildingId, phase: WavePhase) -> Wave {
+        let launched_units = u16::try_from(units.len()).unwrap();
         Wave {
             units,
             wain: None,
@@ -652,6 +692,11 @@ mod tests {
             phase,
             launched_at: 0,
             phase_at: 0,
+            kind: crate::standard::memory::WaveKind::Siege,
+            launched_units,
+            last_contact_at: 0,
+            target_hp: 0,
+            progress_at: 0,
         }
     }
 
@@ -893,5 +938,160 @@ mod tests {
             }),
             "{cmds:?}"
         );
+    }
+
+    /// M6: with `defend_economy`, enemy military within
+    /// `defend_economy_tiles` of an own worked gathering building is a
+    /// threat to the Town it belongs to, though it stands outside
+    /// `defend_radius_tiles` of the Town; without it, it is not.
+    #[test]
+    fn defend_economy_answers_a_raid_on_a_lumber_yard() {
+        let r = crate::testkit::rules();
+        let mut a = Arena::frozen(
+            standard_vs_passive(&r),
+            vec![
+                place(&r, P0, "croft", 24, 82),
+                spawn(&r, P0, "yeoman", 24, 80, 1),
+            ],
+        );
+        let croft = a.buildings_of(P0, "croft")[0];
+        let yeoman = *a.units_of(P0, "yeoman").last().unwrap();
+        a.issue(
+            P0,
+            vec![Command::Gather {
+                units: vec![yeoman],
+                node: croft,
+            }],
+        );
+        a.issue(P0, vec![spawn(&r, P1, "skirmisher", 26, 88, 2)]);
+        let raiders = a.units_of(P1, "skirmisher");
+        let seat = a.seat(P0);
+        let ctx = a.ctx(P0);
+        assert!(ctx.knobs.defend_economy);
+        let centre = a
+            .sim
+            .view()
+            .building(seat)
+            .map(|b| kind_centre(&r, b.kind, b.tile))
+            .unwrap();
+        for u in &raiders {
+            let p = a.sim.view().unit(*u).unwrap().pos;
+            assert!(p.dist_sq_i64(centre) > tiles_sq(ctx.knobs.defend_radius_tiles));
+        }
+        let found = threats(&ctx);
+        assert_eq!(found, vec![(seat, raiders.clone(), 2)]);
+        assert_eq!(engaged(&found), Some(seat));
+        let mut off = ctx.knobs.clone();
+        off.defend_economy = false;
+        let ctx = crate::standard::Ctx::new(a.sim.view(), P0, &off, a.map(P0));
+        assert_eq!(engaged(&threats(&ctx)), None, "without the rule");
+    }
+
+    /// M6: with `defend_wains_first` the guards nearest an enemy Supply
+    /// Wain among the threats attack it explicitly; without it the Wain
+    /// gets no explicit attack.
+    #[test]
+    fn tower_guards_attack_wains_first() {
+        let r = crate::testkit::rules();
+        let a = Arena::frozen(
+            standard_vs_passive(&r),
+            vec![
+                spawn(&r, P0, "skirmisher", 30, 64, 6),
+                spawn(&r, P1, "supply_wain", 33, 58, 1),
+                spawn(&r, P1, "skirmisher", 33, 70, 2),
+            ],
+        );
+        let wain = a.units_of(P1, "supply_wain")[0];
+        let tower = r.ai.personality("tower").unwrap();
+        assert!(tower.defend_wains_first);
+        let mut k = r.ai.personality("standard").unwrap().clone();
+        k.defend_wains_first = true;
+        let mut ctx = crate::standard::Ctx::new(a.sim.view(), P0, &k, a.map(P0));
+        let mut mem = BotMemory::default();
+        step(&mut ctx, &mut mem);
+        let cmds = ctx.into_commands();
+        let on_wain: Vec<&Command> = cmds
+            .iter()
+            .filter(
+                |c| matches!(c, Command::Attack { target, .. } if *target == TargetId::Unit(wain)),
+            )
+            .collect();
+        assert_eq!(on_wain.len(), 1, "{cmds:?}");
+        let Command::Attack { units, .. } = on_wain[0] else {
+            unreachable!()
+        };
+        assert_eq!(units.len(), SIEGE_GUARDS);
+        k.defend_wains_first = false;
+        let mut ctx = crate::standard::Ctx::new(a.sim.view(), P0, &k, a.map(P0));
+        let mut mem = BotMemory::default();
+        step(&mut ctx, &mut mem);
+        assert!(
+            !ctx.into_commands().iter().any(
+                |c| matches!(c, Command::Attack { target, .. } if *target == TargetId::Unit(wain))
+            ),
+            "without the rule"
+        );
+    }
+
+    /// M6: a released defence with `reactive_towers` left marks the
+    /// defended Town, and the plan's build-order rule then places one
+    /// Watchtower near it (counting it); a personality with none places
+    /// nothing.
+    #[test]
+    fn reactive_tower_after_a_defence() {
+        let r = crate::testkit::rules();
+        let a = Arena::frozen(standard_vs_passive(&r), grant_all(&r, P0, 200));
+        let seat = a.seat(P0);
+        let tick = a.sim.tick();
+        let mut k = r.ai.personality("standard").unwrap().clone();
+        k.reactive_towers = 1;
+        let released = BotMemory {
+            defend: Some(Defend {
+                town: seat,
+                last_threat: 0,
+                since: 0,
+            }),
+            ..BotMemory::default()
+        };
+        assert!(tick >= a.sim.rules().ticks_from_ds(k.defend_release_ds) || tick > 0);
+        let mut a = a;
+        a.run(400);
+        let mut ctx = crate::standard::Ctx::new(a.sim.view(), P0, &k, a.map(P0));
+        let mut mem = released.clone();
+        step(&mut ctx, &mut mem);
+        assert_eq!((mem.defend, mem.last_defended), (None, Some(seat)));
+        crate::standard::build_order::reactive_tower(&mut ctx, &mut mem);
+        let tower = sim::BuildingKindId(r.building_kind_by_id("watchtower").unwrap().0);
+        let cmds = ctx.into_commands();
+        let built: Vec<Tile> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::Build { kind, tile, .. } if *kind == tower => Some(*tile),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(built.len(), 1, "{cmds:?}");
+        let c = a
+            .sim
+            .view()
+            .building(seat)
+            .map(|b| kind_centre(&r, b.kind, b.tile))
+            .unwrap();
+        let at = a.sim.view().map().center_of(built[0]);
+        assert!(at.dist_sq_i64(c) <= tiles_sq(k.near_town_max_tiles + 1));
+        assert_eq!((mem.extra_towers, mem.last_defended), (1, None));
+        // Once the allowance is spent, a release marks nothing.
+        let mut ctx = crate::standard::Ctx::new(a.sim.view(), P0, &k, a.map(P0));
+        let mut mem = BotMemory {
+            extra_towers: 1,
+            ..released.clone()
+        };
+        step(&mut ctx, &mut mem);
+        assert_eq!(mem.last_defended, None);
+        // The standard personality has none.
+        let mut ctx = a.ctx(P0);
+        let mut mem = released;
+        step(&mut ctx, &mut mem);
+        assert_eq!(mem.last_defended, None);
     }
 }
